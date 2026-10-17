@@ -8,6 +8,7 @@ Shape conventions used throughout TinyServe:
 """
 
 import torch
+import torch.nn.functional as F
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -88,3 +89,27 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     a_new = a * c - b * s
     b_new = b * c + a * s
     return torch.cat([a_new, b_new], dim=-1).to(x.dtype)
+
+
+def swiglu_mlp(
+    x: torch.Tensor, gate_w: torch.Tensor, up_w: torch.Tensor, down_w: torch.Tensor
+) -> torch.Tensor:
+    """The feed-forward block of every Qwen3 layer (SwiGLU, Shazeer 2020).
+
+        y = down( silu(gate(x)) * up(x) )
+
+    where ``gate(x)`` means the linear layer ``x @ gate_w.T`` (no bias).
+    ``silu(z) = z * sigmoid(z)``. The ``*`` is element-wise: ``up(x)`` says how much,
+    ``silu(gate(x))`` says how much of it to let through (a learned "gate").
+
+    Args:
+        x: ``[T, hidden]``.
+        gate_w, up_w: ``[intermediate, hidden]`` (stored [out, in], like every Linear).
+        down_w: ``[hidden, intermediate]``.
+
+    Returns:
+        ``[T, hidden]``, same dtype as x.
+    """
+    gate = F.linear(x, gate_w)  # TODO(you) 1: which weight makes the gate?
+    up = F.linear(x, up_w)  # TODO(you) 2: which weight makes "up"?
+    return F.linear(F.silu(gate) * up, down_w)  # TODO(you) 3: apply F.silu to the gate
