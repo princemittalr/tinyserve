@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M0, scaffolding.** Nothing works yet. See [PROGRESS.md](PROGRESS.md).
+> Status: **M1, forward pass.** Config parsing works; no inference yet. See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -36,7 +36,8 @@ None yet. Every number here will come from a logged run with date and hardware.
 ## Limitations
 
 - Single GPU only. No tensor parallelism, no quantization, not for deployment.
-- Nothing is implemented yet.
+- Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
+- No inference yet.
 
 ## Prior art
 
