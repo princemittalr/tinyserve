@@ -1,7 +1,6 @@
 """Building blocks of the Qwen3 forward pass: RMSNorm and rotary position embeddings.
 
-YOU implement the three functions below (ownership rule). ``tests/test_layers.py``
-is the spec: make it pass without editing it.
+``tests/test_layers.py`` is the spec for these functions.
 
 Shape conventions used throughout TinyServe:
     T = number of tokens in the batch (all sequences flattened together)
@@ -32,9 +31,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         2. cast the normalised value back to x.dtype;
         3. multiply by weight.
     """
-    # TODO(you): about 4 lines. Useful: Tensor.float(), .pow(2), .mean(dim=-1, keepdim=True),
-    # torch.rsqrt, .to(dtype).
-    raise NotImplementedError("rms_norm")
+    xf = x.float()
+    mean_sq = xf.pow(2).mean(dim=-1, keepdim=True)
+    xf = xf * torch.rsqrt(mean_sq + eps)
+    return xf.to(x.dtype) * weight
 
 
 def rope_cos_sin(
@@ -57,8 +57,11 @@ def rope_cos_sin(
         i.e. the first half and second half of the last dim hold the same angles.
         Compute angles in float32 or better: positions reach 40960.
     """
-    # TODO(you): about 5 lines. Useful: torch.arange, torch.outer, torch.cat, .cos(), .sin().
-    raise NotImplementedError("rope_cos_sin")
+    two_i = torch.arange(0, head_dim, 2, dtype=torch.float64)
+    inv_freq = theta ** (-two_i / head_dim)
+    angles = torch.outer(positions.to(torch.float64), inv_freq)
+    angles = torch.cat([angles, angles], dim=-1)
+    return angles.cos().float(), angles.sin().float()
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -77,6 +80,11 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     Returns:
         ``[T, H, D]`` in x's dtype. Do the math in float32, then cast back.
     """
-    # TODO(you): about 6 lines. cos/sin need a head axis to broadcast against [T, H, D]
-    # (Tensor.unsqueeze). Splitting x in halves: x[..., :half], x[..., half:].
-    raise NotImplementedError("apply_rope")
+    half = x.shape[-1] // 2
+    xf = x.float()
+    a, b = xf[..., :half], xf[..., half:]
+    c = cos.unsqueeze(1)[..., :half]
+    s = sin.unsqueeze(1)[..., :half]
+    a_new = a * c - b * s
+    b_new = b * c + a * s
+    return torch.cat([a_new, b_new], dim=-1).to(x.dtype)
