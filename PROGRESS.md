@@ -5,7 +5,7 @@
 | Milestone | Status |
 |---|---|
 | M0 Repo scaffold | done (2026-10-17) |
-| M1 Forward pass, token-identical to HF | in progress (step 2 done) |
+| M1 Forward pass, token-identical to HF | in progress (step 3: implementing RMSNorm and RoPE) |
 | M2 Paged KV cache and allocator | not started |
 | M3 Continuous batching and benchmark harness | not started |
 | M4 Triton paged-attention kernel | not started |
@@ -19,7 +19,8 @@
 - M0 step 2: pre-commit hook, `.gitattributes`, CI on 3.14, first push to GitHub.
 - M0 step 3: CI `fail-fast: false`. Verified CI goes red on a failing test (canary PR #1, closed).
 - M1 step 1: `ModelConfig` parsed from config.json, unsupported features rejected. Verified on the real Qwen3-0.6B config.json.
-- M1 step 2: torch added; strict safetensors loader, synthetic-checkpoint tests, `scripts/inspect_weights.py`.
+- M1 step 2: torch added; strict safetensors loader, synthetic-checkpoint tests, `scripts/inspect_weights.py`. Real checkpoint (2026-10-17, laptop): 310 tensors, 596,049,920 parameters (440,467,456 without the embedding), all finite in fp16; largest |weight| 192.0.
+- M1 step 3: spec tests and skeletons for `rms_norm`, `rope_cos_sin`, `apply_rope` in `layers.py`; implementation written by me.
 
 ## Design decisions
 
@@ -36,6 +37,9 @@
 - No `transformers` at runtime: config.json is plain JSON, read with the standard library. huggingface_hub is only the download client.
 - Weights default to fp16: Turing tensor cores do fp16, not bf16. bf16->fp16 can overflow, so the loader checks for inf/nan.
 - Strict loader (missing, unexpected or misshapen tensor = error): a silent mismatch would surface much later as wrong tokens.
+- RMSNorm and RoPE do their math in fp32 and cast back: fp16 squares overflow past 255, and RoPE angles reach 40960 rad.
+- RoPE uses the rotate-half layout (pair i with i + D/2): it is what Qwen3 was trained with; interleaved pairs give wrong tokens.
+- RoPE takes explicit positions per token: in a continuous batch every sequence is at a different position.
 - CI installs CPU-only torch: no GPU there, and the default Linux wheel pulls ~3 GB of CUDA libraries.
 
 ## Environment
@@ -51,5 +55,5 @@ None yet.
 
 - Resolved 2026-10-17: torch 2.14.1 on PyPI has a cp314 win_amd64 wheel.
 - Dev tools use `>=` ranges, so CI may get a newer ruff than the laptop. Pin exact versions if that ever breaks CI.
-- Tensor names in the loader are unverified until `test_real_checkpoint.py` passes on the real files.
+- Resolved 2026-10-17: tensor names and shapes verified, `test_real_checkpoint.py` passes on the real files.
 - Kaggle's preinstalled torch/CUDA version vs. the T4 (sm_75): check in the first GPU step.
