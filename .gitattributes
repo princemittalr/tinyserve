@@ -1,0 +1,4 @@
+# Store text files with LF in git, whatever OS edits them.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.safetensors binary

@@ -17,8 +17,9 @@ Target model: Qwen3-0.6B. Written to be read and understood, not to compete with
 ## Quickstart (development)
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
+pre-commit install          # run ruff and mypy on every commit
 ruff check . && ruff format --check . && mypy && pytest
 ```
 
@@ -28,7 +29,8 @@ None yet. Every number here will come from a logged run with date and hardware.
 
 ## How it's tested
 
-- CPU tests run in GitHub Actions on every push; the job fails if any test fails.
+- CPU tests run in GitHub Actions on Python 3.11, 3.12 and 3.14 on every push; the job fails if
+  any test fails. The same lint and type checks run locally as a pre-commit hook.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
