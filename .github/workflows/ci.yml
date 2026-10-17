@@ -9,6 +9,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     strategy:
+      # Run every Python version to the end, so a failure shows which versions break.
+      fail-fast: false
       matrix:
         # 3.11/3.12: what Kaggle and Colab run. 3.14: what the laptop runs.
         python-version: ["3.11", "3.12", "3.14"]
