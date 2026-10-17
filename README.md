@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M1, forward pass.** Config parsing works; no inference yet. See [PROGRESS.md](PROGRESS.md).
+> Status: **M1, forward pass.** Config parsing and checkpoint loading work; no inference yet. See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -31,12 +31,16 @@ None yet. Every number here will come from a logged run with date and hardware.
 
 - CPU tests run in GitHub Actions on Python 3.11, 3.12 and 3.14 on every push; the job fails if
   any test fails. The same lint and type checks run locally as a pre-commit hook.
+- The weight loader is tested on small synthetic checkpoints (missing, unexpected, misshapen
+  and fp16-overflowing tensors). `tests/test_real_checkpoint.py` checks the real Qwen3-0.6B
+  files when `TINYSERVE_MODEL_DIR` is set.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
 
 - Single GPU only. No tensor parallelism, no quantization, not for deployment.
 - Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
+- Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
 - No inference yet.
 
 ## Prior art

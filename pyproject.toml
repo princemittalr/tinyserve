@@ -9,7 +9,12 @@ description = "A from-scratch LLM inference engine for small GPUs (T4)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "torch>=2.9",
+    "safetensors>=0.4",
+    "numpy>=1.26",  # safetensors.torch needs it to write bf16 tensors
+    "huggingface_hub>=0.24",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -34,7 +39,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
@@ -42,9 +47,4 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests"]
-
-# torch is not installed until M1; remove this override once it is a dependency.
-[[tool.mypy.overrides]]
-module = ["torch", "torch.*"]
-ignore_missing_imports = true
+files = ["src", "tests", "scripts"]
