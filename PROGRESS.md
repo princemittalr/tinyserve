@@ -32,7 +32,8 @@
 - M2 step 4: `Qwen3.forward_paged` (runs only the new tokens; writes their k/v to the cache, reads history through the block table) and `greedy_generate_paged`, written by the mentor (wiring, no new algorithm). 15 tests: logits and greedy tokens identical to the M1 no-cache path for block sizes 1/4/16, blocks returned after generation and after OutOfBlocksError, stale data in reused blocks has no effect. `generate.py` and `compare_hf.py` use the cache by default (`--no-cache` / `--engine m1` for the old path).
 - M2 closed: allocator and block-table property tests pass (no double hand-out, double free rejected, no leaked blocks); greedy tokens with the paged cache match HF on all 120 prompts (see Benchmark results).
 - M3 step 1: `Batch` / `build_batch` (`batch.py`) flatten many sequences' new tokens into one `[T]` batch, and `Qwen3.forward_batch` runs them in one pass, returning only each sequence's last-token logits. Written by the mentor (wiring, no new algorithm). 8 tests: a mixed prefill + decode batch, chunked prefill (Hypothesis) and 8 lockstep greedy steps all match M1's no-cache path; batch order does not matter.
-- M3 step 2: `Sequence` state (`sequence.py`, written by the mentor) and the continuous-batching `Scheduler` (`scheduler.py`, 9 blanks; the answers were given by the mentor with the step): FCFS admission under max_num_seqs, a token budget and free blocks; preemption by recompute when the cache is full. 15 tests: admission limits, no queue-jumping, newest-first eviction, a Hypothesis test over random workloads (every request finishes with the right output, no leaked blocks, no livelock), and the tiny model run through the scheduler matches M1 greedy with and without preemptions.
+- M3 step 2: `Sequence` state (`sequence.py`, written by the mentor) and the continuous-batching `Scheduler` (`scheduler.py`, 9 blanks; the mentor gave the answers and then the full file): FCFS admission under max_num_seqs, a token budget and free blocks; preemption by recompute when the cache is full. 15 tests: admission limits, no queue-jumping, newest-first eviction, a Hypothesis test over random workloads (every request finishes with the right output, no leaked blocks, no livelock), and the tiny model run through the scheduler matches M1 greedy with and without preemptions.
+- M3 step 3: `Engine` (`engine.py`, written by the mentor; serving-loop plumbing): each step runs `schedule()`, one `forward_batch` and `update()`, and records when every output token came out (TTFT, TPOT) plus KV-cache utilization per step. 8 tests: outputs match M1 greedy with a roomy cache, one sequence at a time, and a tight cache that forces preemptions; requests can join mid-run; finished requests leave at once; EOS; timing bookkeeping. `compare_hf.py --engine batched` runs every prompt through the engine at once.
 
 ## Design decisions
 
@@ -82,6 +83,8 @@
 - A preempted sequence goes to the front of the waiting queue: it arrived before everything behind it.
 - Admission is strict FCFS and stops at the first request that doesn't fit: no skipping ahead, so long requests are not starved by short ones.
 - Requests whose longest possible length exceeds the batch token budget or the whole cache are rejected at `add()`: after a preemption they could never be re-admitted.
+- The engine records one timestamp per output token, not just per request: TTFT, TPOT and their percentiles all come from the same raw data.
+- The engine's clock is injectable: timing tests use a fake counter instead of sleeping or asserting on real time.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
