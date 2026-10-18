@@ -13,6 +13,10 @@ Usage:
     python scripts/compare_hf.py --engine batched # M3: all prompts at once through Engine
     python scripts/compare_hf.py --engine batched --device cuda --attention triton
                                                   # M4: fp16 on the T4 with the kernel
+    python scripts/compare_hf.py --engine batched --prefix-cache --max-num-seqs 4 \
+        --prompts benchmarks/prompts/m5_shared_prefix.txt
+                                                  # M5: prompts sharing a long prefix, few
+                                                  # in flight so later ones hit the cache
 """
 
 import argparse
@@ -70,6 +74,8 @@ def main() -> None:
                         help="default: float32 on cpu, float16 on cuda")  # fmt: skip
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch",
                         help="batched engine's decode attention (M4 kernel: triton)")  # fmt: skip
+    parser.add_argument("--prefix-cache", action="store_true",
+                        help="batched engine with the M5 radix prefix cache")  # fmt: skip
     parser.add_argument("--out", type=Path, default=None, help="default: results/<m2|m1>_...")
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -77,6 +83,7 @@ def main() -> None:
     if args.out is None:
         milestone = {"m1": "m1", "paged": "m2", "batched": "m3"}[args.engine]
         milestone = "m4" if args.attention == "triton" else milestone
+        milestone = "m5" if args.prefix_cache else milestone
         suffix = "" if device.type == "cpu" else f"_{device.type}"
         args.out = Path(f"results/{milestone}_hf_compare{suffix}.json")
 
@@ -98,21 +105,25 @@ def main() -> None:
 
     ours_out: list[list[int]] = []
     batched_secs = None
+    cached = (0, 0)  # (prefix-cached, admitted) prompt tokens; batched engine only
     if args.engine == "batched":
         # Every prompt in one Engine run; the cache gets room for max_num_seqs of them.
         engine = Engine(
             ours,
             KVCache(cfg, num_blocks * args.max_num_seqs, args.block_size, dtype, device),
             max_num_seqs=args.max_num_seqs,
+            prefix_cache=args.prefix_cache,
         )
         t0 = time.perf_counter()
         ours_out = engine.generate(
             [tok.encode(p).ids for p in prompts], args.max_new_tokens, frozenset(eos)
         )
         batched_secs = round(time.perf_counter() - t0, 1)
-        preempted = engine.scheduler.num_preemptions
+        s = engine.scheduler
+        cached = (s.num_cached_tokens, s.num_admitted_tokens)
         print(f"batched engine: {len(prompts)} prompts in {batched_secs} s, "
-              f"{engine.num_steps} steps, {preempted} preemptions")  # fmt: skip
+              f"{engine.num_steps} steps, {s.num_preemptions} preemptions, "
+              f"{cached[0]} of {cached[1]} prompt tokens from the prefix cache")  # fmt: skip
 
     rows, max_prefill_diff, start = [], 0.0, time.perf_counter()
     for n, text in enumerate(prompts, 1):
@@ -170,7 +181,9 @@ def main() -> None:
         "seconds": round(time.perf_counter() - start, 1),
     }
     if batched_secs is not None:
-        summary |= {"max_num_seqs": args.max_num_seqs, "batched_engine_seconds": batched_secs}
+        summary |= {"max_num_seqs": args.max_num_seqs, "batched_engine_seconds": batched_secs,
+                    "prefix_cache": args.prefix_cache, "prefix_cached_tokens": cached[0],
+                    "admitted_prompt_tokens": cached[1]}  # fmt: skip
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps({"summary": summary, "rows": rows}, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

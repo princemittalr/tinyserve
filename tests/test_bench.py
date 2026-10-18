@@ -14,6 +14,7 @@ from tinyserve.bench import (
     num_requests_for,
     percentile,
     run_closed_loop,
+    shared_prefix_prompts,
     synthetic_prompts,
 )
 from tinyserve.engine import Engine
@@ -108,3 +109,30 @@ def test_num_requests_defaults_to_four_waves_and_at_least_sixteen() -> None:
     assert num_requests_for(1) == 16
     assert num_requests_for(32) == 128
     assert num_requests_for(64, requested=10) == 10
+
+
+def test_shared_prefix_prompts_share_their_group_prefix() -> None:
+    p = shared_prefix_prompts(7, num_prefixes=3, prefix_len=5, suffix_len=2, vocab_size=64)
+    assert len(p) == 7 and all(len(x) == 7 for x in p)
+    assert p[0][:5] == p[3][:5] == p[6][:5]
+    assert p[0][:5] != p[1][:5] != p[2][:5]
+    assert len({tuple(x[5:]) for x in p}) == 7  # every request has its own suffix
+    assert p == shared_prefix_prompts(7, 3, 5, 2, vocab_size=64)
+    with pytest.raises(ValueError):
+        shared_prefix_prompts(4, 0, 5, 2, vocab_size=64)
+
+
+@pytest.mark.parametrize("concurrency", [1, 3])
+def test_prefix_cache_changes_the_work_not_the_outputs(concurrency: int) -> None:
+    prompts = shared_prefix_prompts(8, 2, prefix_len=10, suffix_len=3, vocab_size=CFG.vocab_size)
+    runs = {}
+    for on in (False, True):
+        cache = KVCache(CFG, 64, 4, dtype=torch.float32)
+        e = Engine(tiny_model(), cache, concurrency, prefix_cache=on)
+        r = run_closed_loop(e, prompts, max_new_tokens=4, concurrency=concurrency)
+        runs[on] = (r, [e.seqs[i].output for i in sorted(e.seqs)])
+    assert runs[False][0].prefix_hit_rate == 0
+    # 2 prefixes of 10 tokens = 2 whole blocks of 4 each; the first request of each prefix
+    # misses, and every later one can reuse 8 of its 13 prompt tokens.
+    assert runs[True][0].prefix_hit_rate > 0
+    assert runs[True][1] == runs[False][1]

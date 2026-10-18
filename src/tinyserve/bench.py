@@ -9,6 +9,7 @@ Reported per run:
     TTFT p50/p99   time to first token: arrival -> first output token (queueing + prefill)
     TPOT p50/p99   time per output token after the first, averaged per request
     KV utilization fraction of KV-cache blocks in use, sampled every step (mean, max)
+    prefix hit     fraction of admitted prompt tokens served by the prefix cache (M5)
 """
 
 import math
@@ -32,6 +33,27 @@ def synthetic_prompts(num: int, length: int, vocab_size: int, seed: int = 0) -> 
     g = torch.Generator().manual_seed(seed)
     ids: list[list[int]] = torch.randint(0, high, (num, length), generator=g).tolist()
     return ids
+
+
+def shared_prefix_prompts(
+    num: int,
+    num_prefixes: int,
+    prefix_len: int,
+    suffix_len: int,
+    vocab_size: int,
+    seed: int = 0,
+) -> list[list[int]]:
+    """``num`` prompts that share one of ``num_prefixes`` long prefixes (M5 workload).
+
+    Prompt i is ``prefix[i % num_prefixes] + its own random suffix``: like requests that
+    send the same system prompt or document with a different question. Same for a given
+    seed, so the runs with and without the prefix cache see identical inputs.
+    """
+    if num_prefixes <= 0:
+        raise ValueError(f"num_prefixes must be positive, got {num_prefixes}")
+    prefixes = synthetic_prompts(num_prefixes, prefix_len, vocab_size, seed)
+    suffixes = synthetic_prompts(num, suffix_len, vocab_size, seed + 1)
+    return [prefixes[i % num_prefixes] + suffixes[i] for i in range(num)]
 
 
 def num_requests_for(concurrency: int, requested: int | None = None) -> int:
@@ -65,6 +87,7 @@ class BenchResult:
     tpot_p99_ms: float | None
     kv_util_mean: float
     kv_util_max: float
+    prefix_hit_rate: float  # cached prompt tokens / admitted prompt tokens; 0 if cache off
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -93,6 +116,7 @@ def run_closed_loop(
     ttft = [t.ttft * 1e3 for t in times]
     tpot = [x * 1e3 for t in times if (x := t.tpot) is not None]
     util = engine.kv_utilization
+    s = engine.scheduler
     return BenchResult(
         concurrency=concurrency,
         num_requests=len(ids),
@@ -107,4 +131,5 @@ def run_closed_loop(
         tpot_p99_ms=percentile(tpot, 99) if tpot else None,
         kv_util_mean=sum(util) / len(util),
         kv_util_max=max(util),
+        prefix_hit_rate=s.num_cached_tokens / s.num_admitted_tokens,
     )

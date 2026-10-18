@@ -81,6 +81,24 @@ def test_second_request_reuses_the_first_ones_prompt_blocks() -> None:
     check_no_leak(s)
 
 
+def test_a_prompt_is_cached_as_soon_as_its_prefill_ran() -> None:
+    # b arrives while a is still decoding: a's prompt blocks are already in the cache,
+    # shared by a (still running) and the cache.
+    s = sched(block_size=4, prefix_cache=True)
+    a = s.add(0, [1, 2, 3, 4, 5, 6, 7, 8, 9], 10)
+    step(s)
+    assert s.cache is not None and s.cache.num_cached_blocks == 2
+    assert all(s.allocator.ref_count(blk) == 2 for blk in a.table.blocks[:2])
+    b = s.add(1, [1, 2, 3, 4, 5, 6, 7, 8, 40], 3)
+    s.schedule()
+    assert b.num_scheduled == 1 and s.num_cached_tokens == 8
+    assert b.table.blocks[:2] == a.table.blocks[:2]
+    run_all(s)
+    assert a.output == fake_greedy(a.prompt, 10)
+    assert b.output == fake_greedy(b.prompt, 3)
+    check_no_leak(s)
+
+
 def test_output_tokens_are_cached_too() -> None:
     # A follow-up turn of a chat repeats the whole earlier exchange: prompt + answer.
     s = sched(block_size=2, prefix_cache=True)

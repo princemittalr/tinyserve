@@ -24,8 +24,9 @@ are KV-cache blocks for them. One step of the engine is:
 With ``prefix_cache=True`` (M5) the scheduler also owns a ``RadixCache``:
   - admission first looks up the sequence's tokens in the cache and adopts the matched
     blocks, so only the tokens after the cached prefix are prefilled;
-  - a sequence that finishes or is preempted puts its full blocks into the cache, so a
-    later request with the same prefix (or the preempted sequence itself) can reuse them;
+  - a sequence puts its full blocks into the cache right after its prefill, and again
+    when it finishes or is preempted, so a later request with the same prefix (or the
+    preempted sequence itself) can reuse them, even while this one is still decoding;
   - when blocks run short, cached blocks nobody is using are evicted (LRU) before any
     running sequence is preempted.
 
@@ -213,9 +214,12 @@ class Scheduler:
         finished = []
         for seq, tok in zip(seqs, next_tokens, strict=True):
             seq.output.append(tok)
+            if seq.num_scheduled > 1 or seq.is_done():
+                # Cache right after a prefill, not only at the end: requests that arrive
+                # while this one is still decoding can then reuse its prompt (M5 step 4).
+                self._cache_blocks(seq)
             # TODO(you) 8: has this sequence hit EOS or max_new_tokens? (a Sequence method)
             if seq.is_done():
-                self._cache_blocks(seq)
                 # TODO(you) 9: free its blocks.
                 seq.table.release()
                 seq.status = SeqStatus.FINISHED
