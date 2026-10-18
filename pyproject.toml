@@ -51,3 +51,18 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 python_version = "3.11"
 strict = true
 files = ["src", "tests", "scripts"]
+
+[[tool.mypy.overrides]]
+# Triton has no type information, and it is not installed on Windows: treat it as untyped
+# everywhere so mypy gives the same answer on the laptop and in CI.
+module = ["triton", "triton.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# Triton reads a kernel's parameter annotations itself (tl.constexpr), so kernel
+# parameters carry no ordinary type hints. Only this module relaxes those rules.
+module = ["tinyserve.triton_attention"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false

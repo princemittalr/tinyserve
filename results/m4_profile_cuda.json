@@ -1,0 +1,57 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4, CUDA 12.8",
+  "torch": "2.11.0+cu128",
+  "dtype": "float16",
+  "args": {
+    "model_dir": "checkpoints/Qwen3-0.6B",
+    "device": "cuda",
+    "dtype": "None",
+    "concurrency": "1,8,32,64",
+    "profile_concurrency": "64",
+    "context_len": "192",
+    "block_size": "16",
+    "iters": "5",
+    "trace": "None",
+    "out": "None"
+  },
+  "timings": [
+    {
+      "concurrency": 1,
+      "build_ms": 0.1706829998511239,
+      "forward_ms": 41.24804499997481,
+      "no_attention_ms": 28.15517599992745,
+      "attention_share": 0.31741792853589434
+    },
+    {
+      "concurrency": 8,
+      "build_ms": 0.8528229996045411,
+      "forward_ms": 113.08011400024043,
+      "no_attention_ms": 29.242940000131057,
+      "attention_share": 0.7413962635369391
+    },
+    {
+      "concurrency": 32,
+      "build_ms": 3.0379899999388726,
+      "forward_ms": 377.33378199982326,
+      "no_attention_ms": 35.25649700031863,
+      "attention_share": 0.9065641649855375
+    },
+    {
+      "concurrency": 64,
+      "build_ms": 6.11268199963888,
+      "forward_ms": 713.5696850000386,
+      "no_attention_ms": 42.5324200000432,
+      "attention_share": 0.9403948613651645
+    }
+  ],
+  "profile": {
+    "concurrency": 64,
+    "aten_calls": 227499,
+    "kernel_launches": 30603,
+    "gpu_kernel_ms": 241.80156400000155,
+    "wall_ms": 1353.5944339996604,
+    "gpu_busy": 0.1786366417638965
+  },
+  "top_ops": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                            aten::copy_         8.47%      88.049ms        18.52%     192.566ms      14.943us     126.830ms        52.45%     126.830ms       9.842us         12887  \nvoid at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      72.036ms        29.79%      72.036ms      12.984us          5548  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      43.843ms        18.13%      43.843ms      12.233us          3584  \n                                              aten::bmm        10.03%     104.339ms        13.72%     142.691ms      39.813us      35.783ms        14.80%      35.800ms       9.989us          3584  \n                                            aten::index         5.67%      58.939ms         9.68%     100.674ms      28.074us      21.127ms         8.74%      21.127ms       5.891us          3586  \nvoid at::native::vectorized_gather_kernel<16, long>(...         0.00%       0.000us         0.00%       0.000us       0.000us      21.127ms         8.74%      21.127ms       5.891us          3586  \nstd::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us      20.458ms         8.46%      20.458ms      11.416us          1792  \nstd::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us      15.325ms         6.34%      15.325ms       8.552us          1792  \n                                               aten::mm         0.46%       4.792ms         0.69%       7.190ms      36.496us      11.717ms         4.85%      11.717ms      59.476us           197  \n                                         aten::_softmax         1.59%      16.577ms         2.68%      27.880ms      15.558us       9.043ms         3.74%       9.043ms       5.046us          1792  \nvoid (anonymous namespace)::softmax_warp_forward<flo...         0.00%       0.000us         0.00%       0.000us       0.000us       9.043ms         3.74%       9.043ms       5.046us          1792  \n                                           aten::arange         2.82%      29.314ms        12.10%     125.825ms      17.549us       8.911ms         3.69%      17.822ms       2.486us          7170  \nvoid (anonymous namespace)::elementwise_kernel_with_...         0.00%       0.000us         0.00%       0.000us       0.000us       8.909ms         3.68%       8.909ms       2.486us          3584  \n                                               aten::gt         2.09%      21.729ms         3.28%      34.120ms      19.040us       8.197ms         3.39%       8.197ms       4.574us          1792  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       8.197ms         3.39%       8.197ms       4.574us          1792  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 1.040s\nSelf CUDA time total: 241.802ms\n"
+}

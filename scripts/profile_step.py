@@ -99,7 +99,7 @@ def main() -> None:
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":
         activities.append(ProfilerActivity.CUDA)
-    with profile(activities=activities) as prof:
+    with profile(activities=activities, acc_events=True) as prof:
         wall = time_ms(lambda: model.forward_batch(batch, cache), device, warmup=0, iters=1)
     summary = profile_summary(prof, wall)
     print(f"\nprofiled one forward at C={c}: {wall:.1f} ms wall (slower under the profiler), "

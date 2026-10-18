@@ -68,7 +68,7 @@ def test_profile_summary_on_cpu_counts_ops_and_no_kernels() -> None:
     def aten_calls(num_seqs: int) -> float:
         tables = decode_tables(BlockAllocator(cache.num_blocks), 4, num_seqs, 6)
         batch = build_batch([([0], t) for t in tables])
-        with profile(activities=[ProfilerActivity.CPU]) as prof:
+        with profile(activities=[ProfilerActivity.CPU], acc_events=True) as prof:
             m.forward_batch(batch, cache)
         s = profile_summary(prof, wall_ms=1.0)
         assert s["kernel_launches"] == 0

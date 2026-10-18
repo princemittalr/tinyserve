@@ -103,3 +103,33 @@ def paged_gqa_attention(
     probs = torch.softmax(scores, dim=-1)
     out = torch.einsum("hij,jhd->ihd", probs, v.float())
     return out.to(q.dtype)
+
+
+def paged_decode_attention_ref(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """The reference for the M4 Triton kernel: same arguments, same result.
+
+    One decode query per sequence. Turns each block-table row into that sequence's slots
+    and runs ``paged_gqa_attention`` on it, one sequence at a time (the slow path that
+    ``forward_batch`` uses in M3).
+
+    Args:
+        q: ``[B, Hq, D]``, one new query per sequence.
+        block_tables: ``[B, max_blocks]``; row b lists sequence b's blocks in order.
+        context_lens: ``[B]``, tokens of each sequence including the new one.
+        Others as in ``paged_gqa_attention``.
+    """
+    outs = []
+    for b, n in enumerate(context_lens.tolist()):
+        pos = torch.arange(n, device=q.device)
+        blocks = block_tables[b].to(torch.int64)[pos // block_size]
+        slots = blocks * block_size + pos % block_size
+        outs.append(paged_gqa_attention(q[b : b + 1], k_cache, v_cache, slots, scale))
+    return torch.cat(outs)
