@@ -32,6 +32,7 @@
 - M2 step 4: `Qwen3.forward_paged` (runs only the new tokens; writes their k/v to the cache, reads history through the block table) and `greedy_generate_paged`, written by the mentor (wiring, no new algorithm). 15 tests: logits and greedy tokens identical to the M1 no-cache path for block sizes 1/4/16, blocks returned after generation and after OutOfBlocksError, stale data in reused blocks has no effect. `generate.py` and `compare_hf.py` use the cache by default (`--no-cache` / `--engine m1` for the old path).
 - M2 closed: allocator and block-table property tests pass (no double hand-out, double free rejected, no leaked blocks); greedy tokens with the paged cache match HF on all 120 prompts (see Benchmark results).
 - M3 step 1: `Batch` / `build_batch` (`batch.py`) flatten many sequences' new tokens into one `[T]` batch, and `Qwen3.forward_batch` runs them in one pass, returning only each sequence's last-token logits. Written by the mentor (wiring, no new algorithm). 8 tests: a mixed prefill + decode batch, chunked prefill (Hypothesis) and 8 lockstep greedy steps all match M1's no-cache path; batch order does not matter.
+- M3 step 2: `Sequence` state (`sequence.py`, written by the mentor) and the continuous-batching `Scheduler` (`scheduler.py`, 9 blanks; the answers were given by the mentor with the step): FCFS admission under max_num_seqs, a token budget and free blocks; preemption by recompute when the cache is full. 15 tests: admission limits, no queue-jumping, newest-first eviction, a Hypothesis test over random workloads (every request finishes with the right output, no leaked blocks, no livelock), and the tiny model run through the scheduler matches M1 greedy with and without preemptions.
 
 ## Design decisions
 
@@ -74,6 +75,13 @@
 - Batched forward flattens new tokens with no padding (sequence after sequence, `[T]`): linear layers and the MLP run on all rows at once and no compute goes to padding; only attention splits by sequence.
 - `forward_batch` computes the output head only for each sequence's last new token: the 151,936 x 1,024 head is the largest matmul, and the other prefill rows are never sampled.
 - All new tokens' k/v are written to the cache in one scatter per layer before attention: a sequence only ever reads its own slots, so writing everyone's first is safe.
+- Scheduler re-plans before every step (continuous batching, Orca): finished sequences leave and waiting ones join at once, instead of a static batch waiting for its slowest member.
+- Running sequences get their next slot before any new sequence is admitted: work already in progress is never starved by new arrivals.
+- Preemption evicts the newest running sequence: the oldest always keeps its blocks, so it always makes progress and preemption cannot livelock.
+- Preemption by recompute (free the blocks, re-run prompt + output as one prefill), not swapping k/v to CPU: no extra memory or copy path; the cost is repeated prefill work.
+- A preempted sequence goes to the front of the waiting queue: it arrived before everything behind it.
+- Admission is strict FCFS and stops at the first request that doesn't fit: no skipping ahead, so long requests are not starved by short ones.
+- Requests whose longest possible length exceeds the batch token budget or the whole cache are rejected at `add()`: after a preemption they could never be re-admitted.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
