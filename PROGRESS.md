@@ -7,7 +7,7 @@
 | M0 Repo scaffold | done (2026-10-17) |
 | M1 Forward pass, token-identical to HF | done (2026-10-18): 0 mismatches / 1,920 tokens |
 | M2 Paged KV cache and allocator | done (2026-10-18): property tests pass; 0 mismatches / 1,920 tokens with the cache |
-| M3 Continuous batching and benchmark harness | not started |
+| M3 Continuous batching and benchmark harness | in progress |
 | M4 Triton paged-attention kernel | not started |
 | M5 Radix prefix cache | not started |
 | M6 Streaming API | not started |
@@ -31,6 +31,7 @@
 - M2 step 3: `KVCache` (per-layer key/value tensors of token slots, written by the mentor) and `paged_gqa_attention` in `attention.py` (4 blanks; the answers were given by the mentor with the step). 13 tests compare it with the M1 reference: scattered blocks, decode, chunked prefill, a Hypothesis test over random block orders, and two sequences sharing one cache.
 - M2 step 4: `Qwen3.forward_paged` (runs only the new tokens; writes their k/v to the cache, reads history through the block table) and `greedy_generate_paged`, written by the mentor (wiring, no new algorithm). 15 tests: logits and greedy tokens identical to the M1 no-cache path for block sizes 1/4/16, blocks returned after generation and after OutOfBlocksError, stale data in reused blocks has no effect. `generate.py` and `compare_hf.py` use the cache by default (`--no-cache` / `--engine m1` for the old path).
 - M2 closed: allocator and block-table property tests pass (no double hand-out, double free rejected, no leaked blocks); greedy tokens with the paged cache match HF on all 120 prompts (see Benchmark results).
+- M3 step 1: `Batch` / `build_batch` (`batch.py`) flatten many sequences' new tokens into one `[T]` batch, and `Qwen3.forward_batch` runs them in one pass, returning only each sequence's last-token logits. Written by the mentor (wiring, no new algorithm). 8 tests: a mixed prefill + decode batch, chunked prefill (Hypothesis) and 8 lockstep greedy steps all match M1's no-cache path; batch order does not matter.
 
 ## Design decisions
 
@@ -70,6 +71,9 @@
 - The KV cache stores fp16 by default (fp32 on CPU in tests): it is the largest memory user after the weights.
 - The model has one layer stack and takes attention as a function: the no-cache path (M1) and the paged path share every other line, so they cannot drift apart.
 - `greedy_generate_paged` releases the sequence's blocks in a `finally`: an error mid-generation cannot leak cache memory.
+- Batched forward flattens new tokens with no padding (sequence after sequence, `[T]`): linear layers and the MLP run on all rows at once and no compute goes to padding; only attention splits by sequence.
+- `forward_batch` computes the output head only for each sequence's last new token: the 151,936 x 1,024 head is the largest matmul, and the other prefill rows are never sampled.
+- All new tokens' k/v are written to the cache in one scatter per layer before attention: a sequence only ever reads its own slots, so writing everyone's first is safe.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment

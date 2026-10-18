@@ -5,6 +5,8 @@ Two paths share the same layers and differ only in attention:
         O(n^2) work per token. Kept as the simplest correct baseline.
     ``forward_paged`` (M2): runs only the NEW tokens. Their keys and values are written
         into the paged KV cache, and attention reads the whole history back from it.
+    ``forward_batch`` (M3): ``forward_paged`` for many sequences in one pass. Their new
+        tokens are flattened into one batch (see batch.py); only attention is per sequence.
 """
 
 from collections.abc import Callable
@@ -13,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from tinyserve.attention import causal_gqa_attention, paged_gqa_attention
+from tinyserve.batch import Batch
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.block_table import BlockTable
 from tinyserve.config import ModelConfig
@@ -61,12 +64,21 @@ class Qwen3:
         return x + mlp
 
     def _run(
-        self, token_ids: torch.Tensor, positions: torch.Tensor, attend: AttentionFn
+        self,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attend: AttentionFn,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Logits for every token, or only for ``rows`` if given."""
         cos, sin = rope_cos_sin(self.cfg.head_dim, self.cfg.rope_theta, positions)
         x = self.w["model.embed_tokens.weight"][token_ids]  # embedding = row lookup
         for i in range(self.cfg.num_layers):
             x = self._layer(i, x, cos, sin, attend)
+        if rows is not None:
+            # The output head is [vocab, hidden] = 151,936 x 1,024 for Qwen3-0.6B: the
+            # largest matmul in the model. Skip it for rows nobody samples from.
+            x = x[rows]
         x = rms_norm(x, self.w["model.norm.weight"], self.cfg.rms_norm_eps)
         return F.linear(x, self.lm_head).float()
 
@@ -109,6 +121,28 @@ class Qwen3:
             return paged_gqa_attention(q, cache.k[i], cache.v[i], all_slots, scale)
 
         return self._run(token_ids, positions, attend)
+
+    @torch.inference_mode()
+    def forward_batch(self, batch: Batch, cache: KVCache) -> torch.Tensor:
+        """One step for B sequences: ``[B, vocab]`` float32 logits of each one's last token.
+
+        Every new token's k/v is written to the cache in one scatter per layer. Attention
+        then runs sequence by sequence on its slice of the queries (M4's kernel will do all
+        sequences in one launch). Row b of the result predicts sequence b's next token.
+        """
+        scale = self.cfg.head_dim**-0.5
+        bounds = [0, *torch.tensor(batch.query_lens).cumsum(0).tolist()]
+
+        def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            cache.write(i, batch.new_slots, k, v)
+            return torch.cat(
+                [
+                    paged_gqa_attention(q[s:e], cache.k[i], cache.v[i], slots, scale)
+                    for s, e, slots in zip(bounds[:-1], bounds[1:], batch.seq_slots, strict=True)
+                ]
+            )
+
+        return self._run(batch.token_ids, batch.positions, attend, rows=batch.last_rows)
 
 
 def greedy_generate(
