@@ -13,6 +13,7 @@ dependencies = [
     "torch>=2.9",
     "safetensors>=0.4",
     "numpy>=1.26",  # safetensors.torch needs it to write bf16 tensors
+    "tokenizers>=0.20",  # HF tokenizer library only (no modeling code)
     "huggingface_hub>=0.24",
 ]
 
