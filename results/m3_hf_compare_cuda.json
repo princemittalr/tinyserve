@@ -1,0 +1,50 @@
+{
+  "summary": {
+    "date": "2026-10-18",
+    "hardware": "Tesla T4, CUDA 12.8, torch 2.11.0+cu128",
+    "dtype": "float16",
+    "engine": "batched",
+    "attention": "torch",
+    "prompts": 120,
+    "max_new_tokens": 16,
+    "tokens_compared": 1920,
+    "mismatches": 6,
+    "max_prefill_logit_abs_diff": 0.1513671875,
+    "seconds": 86.0,
+    "max_num_seqs": 32,
+    "batched_engine_seconds": 22.7
+  },
+  "mismatches": [
+    {
+      "prompt": "DNA stands for",
+      "diverge_at": 5,
+      "hf_top2_margin": 0.0
+    },
+    {
+      "prompt": "import numpy as np",
+      "diverge_at": 0,
+      "hf_top2_margin": 0.0156
+    },
+    {
+      "prompt": "In the year 2100, cities will",
+      "diverge_at": 8,
+      "hf_top2_margin": 0.0156
+    },
+    {
+      "prompt": "To change a flat tire, you need to",
+      "diverge_at": 0,
+      "hf_top2_margin": 0.0
+    },
+    {
+      "prompt": "When writing an email to a professor, you should",
+      "diverge_at": 2,
+      "hf_top2_margin": 0.0
+    },
+    {
+      "prompt": "भारत की राजधानी है",
+      "diverge_at": 12,
+      "hf_top2_margin": 0.0
+    }
+  ],
+  "note": "Transcribed by the mentor from the pasted notebook output: the summary is exact; only the mismatching prompts were printed, so per-prompt token lists are not included."
+}

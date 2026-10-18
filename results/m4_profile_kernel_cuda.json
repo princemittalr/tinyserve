@@ -1,0 +1,67 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4, CUDA 12.8",
+  "torch": "2.11.0+cu128",
+  "dtype": "float16",
+  "args": {
+    "model_dir": "checkpoints/Qwen3-0.6B",
+    "device": "cuda",
+    "dtype": "None",
+    "concurrency": "1,8,32,64",
+    "profile_concurrency": "64",
+    "context_len": "192",
+    "block_size": "16",
+    "iters": "5",
+    "trace": "None",
+    "kernel": "True",
+    "out": "None"
+  },
+  "timings": [
+    {
+      "concurrency": 1,
+      "build_ms": 0.22205700042832177,
+      "forward_ms": 40.36184699998557,
+      "no_attention_ms": 29.355511000176193,
+      "attention_share": 0.27269158420359985,
+      "kernel_forward_ms": 32.764716999736265,
+      "kernel_speedup": 1.2318692391059096
+    },
+    {
+      "concurrency": 8,
+      "build_ms": 0.9045289998539374,
+      "forward_ms": 118.10434099970735,
+      "no_attention_ms": 30.881452999892645,
+      "attention_share": 0.7385239802492174,
+      "kernel_forward_ms": 33.85817300022609,
+      "kernel_speedup": 3.488207736398497
+    },
+    {
+      "concurrency": 32,
+      "build_ms": 4.121674000089115,
+      "forward_ms": 385.0835230005032,
+      "no_attention_ms": 38.48661999927572,
+      "attention_share": 0.9000564352912461,
+      "kernel_forward_ms": 34.28086700023414,
+      "kernel_speedup": 11.233190893272129
+    },
+    {
+      "concurrency": 64,
+      "build_ms": 7.040065000182949,
+      "forward_ms": 740.0260670001444,
+      "no_attention_ms": 50.242608999724325,
+      "attention_share": 0.9321069740105323,
+      "kernel_forward_ms": 40.027599000495684,
+      "kernel_speedup": 18.487895489084426
+    }
+  ],
+  "profile": {
+    "concurrency": 64,
+    "kernel": true,
+    "aten_calls": 5609,
+    "kernel_launches": 1962,
+    "gpu_kernel_ms": 29.997123999999918,
+    "wall_ms": 67.5429670000085,
+    "gpu_busy": 0.44411913382478657
+  },
+  "top_ops": "-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \n                                   _paged_decode_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      16.896ms        56.32%      16.896ms     603.415us            28  \n                                               aten::mm        10.08%       5.381ms        14.72%       7.860ms      39.898us       8.343ms        27.81%       8.343ms      42.353us           197  \nturing_fp16_s1688gemm_fp16_128x64_sliced1x2_ldg8_f2f...         0.00%       0.000us         0.00%       0.000us       0.000us       4.629ms        15.43%       4.629ms      40.968us           113  \nturing_fp16_s1688gemm_fp16_64x64_sliced1x4_ldg8_f2f_...         0.00%       0.000us         0.00%       0.000us       0.000us       3.325ms        11.08%       3.325ms      39.578us            84  \n                                              aten::mul         8.90%       4.753ms        15.21%       8.123ms      16.958us       1.292ms         4.31%       1.292ms       2.697us           479  \n                                            aten::copy_         4.88%       2.606ms         9.91%       5.290ms      15.378us       1.161ms         3.87%       1.161ms       3.374us           344  \nvoid at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     860.379us         2.87%     860.379us       5.002us           172  \nvoid at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     826.173us         2.75%     826.173us       2.452us           337  \n                                             aten::mean         3.43%       1.830ms         5.30%       2.831ms      25.050us     600.255us         2.00%     600.255us       5.312us           113  \nvoid at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     600.255us         2.00%     600.255us       5.312us           113  \nvoid at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     393.660us         1.31%     393.660us       3.484us           113  \n                                              aten::add         4.70%       2.509ms         7.69%       4.108ms      18.260us     389.759us         1.30%     389.759us       1.732us           225  \nvoid cublasLt::splitKreduce_kernel<32, 16, int, __ha...         0.00%       0.000us         0.00%       0.000us       0.000us     389.437us         1.30%     389.437us       3.477us           112  \n                                 aten::_index_put_impl_         1.32%     706.033us         2.60%       1.388ms      24.788us     298.718us         1.00%     298.718us       5.334us            56  \nvoid at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     298.718us         1.00%     298.718us       5.334us            56  \n-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  \nSelf CPU time total: 53.408ms\nSelf CUDA time total: 29.997ms\n"
+}

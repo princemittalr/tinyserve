@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M3 done.** A continuous-batching scheduler (with preemption by recompute) runs many requests through the paged KV cache at once, and its greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). On a T4 it is still 5x slower than HF `generate()` at 64 concurrent requests. Next: the Triton paged-attention kernel (M4). See [PROGRESS.md](PROGRESS.md).
+> Status: **M4 done.** A custom Triton kernel runs decode attention for the whole batch in one launch per layer, reading keys and values straight from the paged KV cache. On a T4 it makes a 64-sequence decode step 18.5x faster, and the engine now outruns Hugging Face `generate()` at every concurrency tested (2.59x at 64 concurrent requests, 1.72x at 32; the 3x target at 32 is not met yet). Greedy output is token-identical to HF on 120 prompts in fp32 on CPU; in fp16 on the T4 a few near-ties flip (see Benchmarks). Next: the radix prefix cache (M5). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -30,20 +30,25 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Correctness (2026-10-18, laptop CPU, fp32): 0 greedy mismatches vs HF over 120 prompts x 16 tokens,
   without a KV cache (M1), with the paged KV cache (M2), and with all 120 prompts batched
   through the continuous-batching engine (M3).
+- Correctness on the T4 (2026-10-18, fp16, same 120 prompts, batched engine): 7 prompts diverge
+  from HF fp16 with the Triton kernel and 6 without it (the same 6 plus one). Every divergence is a
+  near-tie: HF's top two logits differ by at most 0.0156, one fp16 rounding step.
 - Throughput (2026-10-18, Kaggle T4, fp16, Qwen3-0.6B, 128-token random prompts, 128 output
   tokens each, same prompts for both):
 
-  | Concurrency | TinyServe tok/s | HF `generate()` tok/s | TinyServe TTFT p50 / p99 | TinyServe TPOT p50 / p99 |
-  |---|---|---|---|---|
-  | 1 | 25.5 | 25.2 | 40 / 66 ms | 39.2 / 39.7 ms |
-  | 8 | 70.6 | 193.3 | 134 / 147 ms | 113.0 / 113.8 ms |
-  | 32 | 88.0 | 415.6 | 366 / 721 ms | 363.1 / 364.1 ms |
-  | 64 | 90.4 | 451.3 | 701 / 2137 ms | 708.3 / 718.0 ms |
+  | Concurrency | M4 (Triton kernel) tok/s | M3 (PyTorch attention) tok/s | HF `generate()` tok/s | M4 / HF | M4 TTFT p50 / p99 | M4 TPOT p50 / p99 |
+  |---|---|---|---|---|---|---|
+  | 1 | 28.7 | 25.5 | 25.2 | 1.14x | 44 / 70 ms | 34.8 / 36.3 ms |
+  | 8 | 216.1 | 70.6 | 193.3 | 1.12x | 134 / 142 ms | 36.4 / 36.8 ms |
+  | 32 | 716.0 | 88.0 | 415.6 | 1.72x | 330 / 602 ms | 42.4 / 44.7 ms |
+  | 64 | 1168.2 | 90.4 | 451.3 | 2.59x | 337 / 1294 ms | 52.5 / 54.5 ms |
 
-  TinyServe is slower than HF from 8 concurrent requests on. Its attention still runs one
-  sequence at a time and copies each sequence's keys and values out of the cache (inferred
-  from TPOT growing linearly with the batch; not yet profiled). HF uses static batches, so
-  it reports no TTFT or TPOT. Raw data: `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`.
+  M3 ran attention one sequence at a time: profiled at 64 sequences, that was 94% of a decode
+  step and ~30,600 kernel launches, with the GPU idle 82% of the time. The M4 kernel does all
+  sequences in one launch per layer (decode step 740 -> 40 ms). What is left is mostly launch
+  overhead of the small non-attention kernels (GPU busy 44% of a step). HF uses static batches,
+  so it reports no TTFT or TPOT. Raw data: `results/m4_bench_cuda.json`,
+  `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`, `results/m4_profile*_cuda.json`.
 
 ## How it's tested
 
@@ -65,6 +70,11 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   matches the single-sequence path with and without preemptions.
 - `tests/test_devices.py` runs the model on PyTorch's `meta` device, so a tensor created on the
   wrong device fails on CPU instead of on the GPU.
+- The Triton decode kernel is compared with the PyTorch reference (within 1e-5 in fp32, 1e-3 in
+  fp16) across head groupings, block sizes, sequence lengths and scattered blocks; every cache slot
+  no sequence owns holds NaN, so any out-of-range read fails. Without a GPU (CI) the kernel runs in
+  Triton's interpreter; on the T4 the compiled kernel runs. The engine with the kernel matches the
+  PyTorch path's greedy tokens, with and without preemptions.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -73,10 +83,12 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
 - Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
 - Greedy decoding only; temperature and top-p sampling arrive with the API in M6.
-- Attention runs one sequence at a time inside each batched step (the M4 kernel does all
-  sequences in one launch); the linear layers and MLP are batched.
-- Paged attention copies each sequence's keys and values out of the cache before the math.
-  It is simple and testable, not fast; the M4 Triton kernel will read the blocks in place.
+- The Triton kernel covers decode only. Prefill attention still runs one sequence at a time in
+  PyTorch and copies that sequence's keys and values out of the cache first.
+- The kernel runs one program per (sequence, query head), so the two query heads of a GQA group
+  each load the same keys and values; no split-K over long contexts. Tuned only for the T4.
+- Triton has no Windows wheels: on Windows the kernel tests skip and the PyTorch path is used.
+- The decode step is still launch-bound (Python launches every small kernel); no CUDA graphs yet.
 
 ## Prior art
 
