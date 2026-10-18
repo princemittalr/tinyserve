@@ -23,6 +23,18 @@ pre-commit install          # run ruff and mypy on every commit
 ruff check . && ruff format --check . && mypy && pytest
 ```
 
+## Serving (OpenAI-compatible)
+
+```bash
+python scripts/serve.py --device cuda --attention triton --prefix-cache   # 127.0.0.1:8000
+curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hi"}], "stream": true, "temperature": 0}'
+```
+
+Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. Endpoints: `/v1/completions`,
+`/v1/chat/completions` (both with `"stream": true`), `/v1/models`, `/health`. Requests are
+limited in body size, prompt length, `max_tokens` and requests in flight (413 / 400 / 429).
+
 ## Benchmarks
 
 Every number here comes from a logged run with date and hardware; see [PROGRESS.md](PROGRESS.md).
@@ -107,6 +119,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   greedy output, concurrent clients share steps, a client that disconnects (or is still queued)
   is aborted and every block comes back, and a crashed engine fails every open request.
   Streamed text must equal the full decode for random UTF-8 cut into random byte tokens.
+- The HTTP API is tested end to end on the tiny model: greedy text through both endpoints,
+  streamed and not, equals the engine's; every limit returns OpenAI's error shape with the right
+  status; a client that disconnects mid-stream or before its answer frees every block.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -116,6 +131,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
 - The prefix cache reuses whole blocks only (16 tokens by default), and never a prompt's last
   token; eviction drops whole leaves of the tree.
+- The API has no authentication (it binds to 127.0.0.1), serves one model, and does not
+  implement `n > 1`, `stop`, logprobs, `echo` or penalties (requests using them get a 400).
+  Chat content must be plain text; the chat template turns Qwen3's thinking off.
 - Sampling supports temperature and top-p only (no top-k, repetition penalties or logprobs).
   Requests without a seed are reproducible per run, not per request.
 - The Triton kernel covers decode only. Prefill attention still runs one sequence at a time in

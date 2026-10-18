@@ -27,6 +27,8 @@ import threading
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
+import torch
+
 from tinyserve.engine import Engine
 from tinyserve.sampling import SamplingParams
 from tinyserve.sequence import SeqStatus
@@ -140,6 +142,7 @@ class AsyncEngine:
 
     # --- engine thread ------------------------------------------------------------------
 
+    @torch.inference_mode()  # thread-local: this thread needs its own
     def _run(self) -> None:
         try:
             while True:
