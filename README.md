@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M5 done.** A radix-tree prefix cache lets requests that share a prompt prefix reuse its keys and values instead of recomputing them. On a T4, with 4 shared 1,024-token prefixes, it cuts median time to first token from 232 to 42 ms for one user and the 99th percentile from 8.9 to 2.0 s at 32 concurrent users, and raises throughput 2.24x there (the median at 32 users got worse; see Benchmarks). M4's Triton kernel runs decode attention for the whole batch in one launch per layer (2.59x HF `generate()` throughput at 64 concurrent requests, 1.72x at 32; the 3x target at 32 is not met yet). Greedy output is token-identical to HF in fp32, on CPU and on the T4, with and without the prefix cache; in fp16 a few near-ties flip. Next: the streaming API (M6). See [PROGRESS.md](PROGRESS.md).
+> Status: **M6 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with batched greedy, temperature and top-p sampling, request limits, and no exposure beyond 127.0.0.1 unless asked. On a T4, the API's greedy text is identical to HF `generate()` in fp32 on 120 prompts (in fp16 a few near-ties flip, as before), and it delivers 724 tok/s at 32 concurrent streams (1.74x HF; the engine alone 766 tok/s, 1.84x) and 1,124 tok/s at 64. The 3x target at 32 is not met yet, and time to first token over HTTP grows under load (p99 5.6 s at 32 streams vs 0.6 s for the engine alone; see Benchmarks). The radix prefix cache (M5) and the Triton decode kernel (M4) work through the API too. Next: profiling and the write-up (M7). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -77,7 +77,28 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   median TTFT got worse; the likely cause (not yet profiled) is that hits arrive in large
   synchronized waves whose prefills each attend over 1,088 cached tokens one sequence at a time.
   fp32 greedy parity with the cache on 24 chat prompts sharing a system prompt: 0 mismatches /
-  384 tokens. Raw data: `results/m5_prefix_bench_cuda.json`, `results/m5_hf_compare_fp32_cuda.json`.
+  384 tokens. In fp32, outputs with the cache on and off are identical for 128 / 128 requests at
+  C=32 (fp16: 124 / 128, rounding). Raw data: `results/m5_prefix_bench_cuda.json`,
+  `results/m5_hf_compare_fp32_cuda.json`, `results/m5_prefix_bench_fp32_cuda.json`.
+
+- HTTP API (2026-10-18, Kaggle T4, fp16, Triton kernel): the M3/M4 workload sent to
+  `scripts/serve.py` as streaming `/v1/completions` requests (128-token prompts, 128 output tokens,
+  closed loop, client on the same machine), next to the engine alone in the same session
+  (`scripts/bench_api.py`, `scripts/benchmark.py`):
+
+  | Concurrency | tok/s engine / HTTP | HTTP cost | TTFT p50 engine / HTTP | TTFT p99 engine / HTTP | TPOT p50 engine / HTTP |
+  |---|---|---|---|---|---|
+  | 1 | 30.7 / 30.0 | 2.3% | 41 / 44 ms | 102 / 104 ms | 32.4 / 33.2 ms |
+  | 8 | 231.1 / 221.7 | 4.1% | 121 / 203 ms | 124 / 261 ms | 33.9 / 34.6 ms |
+  | 32 | 766.4 / 723.8 | 5.6% | 315 / 498 ms | 586 / 5,607 ms | 39.5 / 40.5 ms |
+  | 64 | 1,205.9 / 1,124.0 | 6.8% | 326 / 667 ms | 1,242 / 7,294 ms | 50.4 / 52.2 ms |
+
+  Streaming adds about 1 ms per token. Time to first token is the weak spot under load; the
+  likely cause (not yet profiled) is the engine thread and the HTTP event loop sharing one Python
+  interpreter. Greedy text through the API (fp32, kernel, prefix cache, 120 prompts at once, half
+  streamed) is identical to HF `generate()`, and the chat template is identical to Qwen3's own.
+  Raw data: `results/m6_api_bench_cuda.json`, `results/m6_engine_bench_cuda.json`,
+  `results/m6_api_hf_compare_float32_cuda.json`.
 
 ## How it's tested
 

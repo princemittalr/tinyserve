@@ -1,0 +1,18 @@
+{
+  "summary": {
+    "date": "2026-10-18",
+    "hardware": "Tesla T4",
+    "torch": "2.11.0+cu128",
+    "dtype": "float32",
+    "attention": "triton",
+    "prefix_cache": true,
+    "transport": "HTTP /v1/completions, token-id prompts, half SSE half plain, all at once",
+    "prompts": 120,
+    "max_new_tokens": 16,
+    "text_mismatches": 0,
+    "chat_template_conversations": 4,
+    "chat_template_diffs": 0
+  },
+  "note": "Exact summary from the pasted output; every one of the 120 prompts printed OK. Per-prompt texts were not pasted.",
+  "rows": []
+}

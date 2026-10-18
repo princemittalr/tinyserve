@@ -1,0 +1,79 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4, CUDA 12.8",
+  "torch": "2.11.0+cu128",
+  "dtype": "float16",
+  "attention": "triton",
+  "transport": "HTTP /v1/completions, SSE stream, token-id prompts, EOS ignored",
+  "args": {
+    "model_dir": "checkpoints/Qwen3-0.6B",
+    "device": "cuda",
+    "attention": "triton",
+    "concurrency": "1,8,32,64",
+    "num_requests": "None",
+    "input_len": "128",
+    "output_len": "128",
+    "kv_gib": "2.0",
+    "port": "8000",
+    "seed": "0",
+    "out": "None"
+  },
+  "results": [
+    {
+      "concurrency": 1,
+      "num_requests": 16,
+      "output_tokens": 2048,
+      "seconds": 68.21888120599999,
+      "output_tok_per_s": 30.021014179574,
+      "ttft_p50_ms": 44.02015250002478,
+      "ttft_p99_ms": 104.34493155000267,
+      "tpot_p50_ms": 33.18290869685064,
+      "tpot_p99_ms": 33.681021687401895,
+      "finish_reasons": [
+        "length"
+      ]
+    },
+    {
+      "concurrency": 8,
+      "num_requests": 32,
+      "output_tokens": 4096,
+      "seconds": 18.473940603000074,
+      "output_tok_per_s": 221.71772054603395,
+      "ttft_p50_ms": 202.99837549993072,
+      "ttft_p99_ms": 261.3996208400045,
+      "tpot_p50_ms": 34.627339125984776,
+      "tpot_p99_ms": 35.963557907952975,
+      "finish_reasons": [
+        "length"
+      ]
+    },
+    {
+      "concurrency": 32,
+      "num_requests": 128,
+      "output_tokens": 16384,
+      "seconds": 22.637059791999945,
+      "output_tok_per_s": 723.76890596853,
+      "ttft_p50_ms": 497.54963350000025,
+      "ttft_p99_ms": 5606.828681659967,
+      "tpot_p50_ms": 40.49664935433033,
+      "tpot_p99_ms": 42.371449928504106,
+      "finish_reasons": [
+        "length"
+      ]
+    },
+    {
+      "concurrency": 64,
+      "num_requests": 256,
+      "output_tokens": 32768,
+      "seconds": 29.15424856100003,
+      "output_tok_per_s": 1123.9528239405258,
+      "ttft_p50_ms": 667.4634690000403,
+      "ttft_p99_ms": 7294.283496199994,
+      "tpot_p50_ms": 52.24235683858241,
+      "tpot_p99_ms": 55.95287035826783,
+      "finish_reasons": [
+        "length"
+      ]
+    }
+  ]
+}

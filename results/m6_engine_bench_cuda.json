@@ -1,0 +1,63 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4, CUDA 12.8",
+  "torch": "2.11.0+cu128",
+  "dtype": "float16",
+  "attention": "triton",
+  "args": {
+    "concurrency": "1,8,32,64",
+    "input_len": "128",
+    "output_len": "128",
+    "block_size": "16",
+    "max_batch_tokens": "2048",
+    "seed": "0"
+  },
+  "num_blocks": 1024,
+  "note": "Transcribed from the printed summary lines of the Kaggle run (the JSON file itself was not pasted); values rounded as printed.",
+  "results": [
+    {
+      "concurrency": 1,
+      "output_tok_per_s": 30.7,
+      "ttft_p50_ms": 41,
+      "ttft_p99_ms": 102,
+      "tpot_p50_ms": 32.4,
+      "tpot_p99_ms": 33.5,
+      "kv_util_mean": 0.01,
+      "kv_util_max": 0.02,
+      "preemptions": 0
+    },
+    {
+      "concurrency": 8,
+      "output_tok_per_s": 231.1,
+      "ttft_p50_ms": 121,
+      "ttft_p99_ms": 124,
+      "tpot_p50_ms": 33.9,
+      "tpot_p99_ms": 34.2,
+      "kv_util_mean": 0.1,
+      "kv_util_max": 0.12,
+      "preemptions": 0
+    },
+    {
+      "concurrency": 32,
+      "output_tok_per_s": 766.4,
+      "ttft_p50_ms": 315,
+      "ttft_p99_ms": 586,
+      "tpot_p50_ms": 39.5,
+      "tpot_p99_ms": 41.7,
+      "kv_util_mean": 0.39,
+      "kv_util_max": 0.5,
+      "preemptions": 0
+    },
+    {
+      "concurrency": 64,
+      "output_tok_per_s": 1205.9,
+      "ttft_p50_ms": 326,
+      "ttft_p99_ms": 1242,
+      "tpot_p50_ms": 50.4,
+      "tpot_p99_ms": 53.0,
+      "kv_util_mean": 0.77,
+      "kv_util_max": 1.0,
+      "preemptions": 0
+    }
+  ]
+}

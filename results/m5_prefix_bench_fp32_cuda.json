@@ -1,0 +1,33 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4, CUDA 12.8",
+  "torch": "2.11.0+cu128",
+  "dtype": "float32",
+  "attention": "triton",
+  "workload": "4 random prefixes x 1024 tokens + 64-token suffix, 64 output tokens, closed loop",
+  "num_blocks": 2304,
+  "note": "Transcribed from the printed summary lines of the Kaggle run (the JSON file itself was not pasted); values rounded as printed.",
+  "results": [
+    {
+      "concurrency": 32,
+      "cache_off": {
+        "output_tok_per_s": 95.6,
+        "ttft_p50_ms": 585,
+        "ttft_p99_ms": 16014,
+        "prefix_hit_rate": 0.0,
+        "steps": 287,
+        "preemptions": 0
+      },
+      "cache_on": {
+        "output_tok_per_s": 312.1,
+        "ttft_p50_ms": 943,
+        "ttft_p99_ms": 3064,
+        "prefix_hit_rate": 0.91,
+        "steps": 260,
+        "preemptions": 0
+      },
+      "identical_outputs": 128,
+      "num_requests": 128
+    }
+  ]
+}
