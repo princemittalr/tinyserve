@@ -122,6 +122,8 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - The HTTP API is tested end to end on the tiny model: greedy text through both endpoints,
   streamed and not, equals the engine's; every limit returns OpenAI's error shape with the right
   status; a client that disconnects mid-stream or before its answer frees every block.
+- `tests/test_server_e2e.py` starts the real server process on a tiny checkpoint and checks,
+  over a socket, that streamed and plain answers equal the offline engine's greedy text.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
