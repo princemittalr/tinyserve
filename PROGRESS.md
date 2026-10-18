@@ -10,7 +10,7 @@
 | M3 Continuous batching and benchmark harness | done (2026-10-18): 0 mismatches / 1,920 tokens batched; T4 benchmark recorded (below HF throughput, see results) |
 | M4 Triton paged-attention kernel | done (2026-10-18): matches the PyTorch reference within 1e-5 (fp32) / 1e-3 (fp16); 18.5x faster decode forward at C=64; 1,168 tok/s at C=64 (2.59x HF) |
 | M5 Radix prefix cache | done (2026-10-18): shared-prefix workload on the T4, TTFT p50 232 -> 42 ms at C=1, p99 8.9 -> 2.0 s at C=32, throughput 2.24x at C=32; fp32 greedy parity with the cache 0 mismatches / 384 tokens |
-| M6 Streaming API | not started |
+| M6 Streaming API | in progress: step 1 (batched sampling) |
 | M7 Profiling and write-up | not started |
 
 ## Step log
@@ -56,6 +56,8 @@
 - M5 step 4 result (Kaggle T4): 259 passed, 2 skipped. Shared-prefix benchmark and fp32 parity with the cache: see Benchmark results and the M5 analysis.
 - M5 step 5: results recorded (`results/m5_prefix_bench_cuda.json` copied exactly from the pasted output; `results/m5_hf_compare_fp32_cuda.json` transcribed: exact summary, all 24 prompts OK).
 - M5 closed: TTFT reduction measured on a shared-prefix workload (the M5 criterion): median TTFT 5.5x lower at C=1 and 2.4x lower at C=8, p99 4.5x lower at C=32; throughput up 1.07x / 1.55x / 2.24x at C = 1 / 8 / 32. Median TTFT at C=32 got worse (346 -> 704 ms); see the analysis. Greedy output with the cache is exact in fp32.
+- M6 plan: (1) batched sampling (greedy, temperature, top-p, per-request seeds) in the engine; (2) an async serving loop: requests from many clients go into one engine thread, tokens stream back per request, incremental detokenisation, cancellation frees blocks; (3) the FastAPI app: OpenAI-compatible `/v1/completions` and `/v1/chat/completions` with SSE streaming, request limits, bound to 127.0.0.1 by default; (4) one T4 run: a streaming load test through HTTP, greedy parity through the API, plus the fp32 `bench_prefix.py` check parked in M5.
+- M6 step 1: batched sampling (`sampling.py`, written by the mentor, complete file). `SamplingParams(temperature=0.0, top_p=1.0, seed=None)`; temperature 0 is greedy and the default, so every earlier result is unchanged. `sample()` takes the whole batch's logits: softmax of logits / temperature per row, top-p filter per row (sort, keep tokens whose higher-ranked mass is below top_p), then the exponential race argmax(p / E), E ~ Exp(1), which samples exactly from p without renormalising or `torch.multinomial`. An all-greedy batch takes the old argmax path and draws no noise. Seeded requests draw their noise from their own `torch.Generator`, the rest from the engine's (`Engine(seed=0)`). `Engine.add_request(..., sampling=...)`, `generate(..., sampling=...)`. `scripts/generate.py --temperature --top-p --seed --num-samples` samples several continuations as one batch. 23 tests (`test_sampling.py`): parameter validation; greedy is argmax and draws no noise; empirical frequencies over 100,000 draws match softmax(logits / T) for T = 0.5 / 1 / 2 and the renormalised nucleus for top-p (within 0.01, about 6 standard deviations); a Hypothesis test that top-p keeps the smallest most likely set reaching top_p; top-p applies per request in a mixed batch; a seeded request gives the same tokens alone, among unseeded requests, and in a cache small enough to preempt it; different seeds differ. 10 planted bugs all caught.
 
 ## Design decisions
 
@@ -135,6 +137,9 @@
 - M5: blocks are cached right after a prefill as well as at finish: a long shared prompt is reused by requests that arrive while its first user is still decoding (SGLang also caches unfinished requests). Prompt blocks are full and never written again, so sharing them with a running sequence is safe.
 - M5: the prefix cache is opt-in (`prefix_cache=True`), like the kernel: earlier results stay reproducible, and every result records whether the cache was on.
 - M5: whole leaves are evicted, so `evict(n)` can free a few more blocks than asked: simpler than splitting a leaf, and the extra blocks were the least recently used ones anyway.
+- M6: sampling uses the exponential race (argmax of p / E with E ~ Exp(1)) instead of `torch.multinomial`: it is exact, needs no renormalisation after top-p (dropped tokens have p = 0), and is one elementwise op plus one argmax for the whole batch (vLLM samples the same way).
+- M6: temperature 0 means greedy and is the default, and an all-greedy batch skips softmax and noise entirely: greedy parity with HF stays exactly the M1-M5 code path.
+- M6: a request with a seed gets its own generator, so its tokens depend only on its prompt, parameters and seed, not on the batch it lands in (continuous batching changes the batch every step); requests without a seed share one engine generator.
 
 ## Environment
 

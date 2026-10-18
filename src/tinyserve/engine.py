@@ -7,18 +7,22 @@
 
 Every step: the scheduler picks the sequences and reserves their cache slots, the model
 runs all their pending tokens in one ``forward_batch``, and each sequence gets its next
-token (greedy for now; M6 adds sampling). The engine also records when each token came
-out, which is what the M3 benchmark turns into TTFT and TPOT.
+token: greedy, or sampled with its own ``SamplingParams`` (M6, sampling.py). The engine
+also records when each token came out, which is what the M3 benchmark turns into TTFT
+and TPOT.
 """
 
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import torch
+
 from tinyserve.batch import build_batch
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
+from tinyserve.sampling import SamplingParams, sample
 from tinyserve.scheduler import Scheduler
 from tinyserve.sequence import Sequence
 
@@ -52,6 +56,7 @@ class Engine:
         max_batch_tokens: int = 2048,
         clock: Callable[[], float] = time.perf_counter,
         prefix_cache: bool = False,
+        seed: int = 0,
     ) -> None:
         self.model = model
         self.cache = cache
@@ -68,14 +73,28 @@ class Engine:
         self.num_steps = 0
         self.kv_utilization: list[float] = []  # sampled once per step, after scheduling
         self._next_id = 0
+        dev = cache.k.device
+        self.sampling: dict[int, SamplingParams] = {}
+        # Seeded requests get their own generator; the rest share this one (sampling.py).
+        self.generators: dict[int, torch.Generator] = {}
+        self.shared_generator = torch.Generator(device=dev).manual_seed(seed)
 
     def add_request(
-        self, prompt: list[int], max_new_tokens: int, eos_ids: frozenset[int] = frozenset()
+        self,
+        prompt: list[int],
+        max_new_tokens: int,
+        eos_ids: frozenset[int] = frozenset(),
+        sampling: SamplingParams | None = None,
     ) -> int:
         seq_id = self._next_id
         self._next_id += 1
         self.seqs[seq_id] = self.scheduler.add(seq_id, prompt, max_new_tokens, eos_ids)
         self.times[seq_id] = RequestTimes(arrival=self.clock())
+        params = sampling or SamplingParams()
+        self.sampling[seq_id] = params
+        if params.seed is not None:
+            g = torch.Generator(device=self.cache.k.device)
+            self.generators[seq_id] = g.manual_seed(params.seed)
         return seq_id
 
     def has_work(self) -> bool:
@@ -93,21 +112,28 @@ class Engine:
         # prompt, the part after a cached prefix (M5), or one decode token.
         items = [(q.tokens[-q.num_scheduled :], q.table) for q in seqs]
         batch = build_batch(items, device=self.cache.k.device)
-        next_tokens = self.model.forward_batch(batch, self.cache).argmax(-1).tolist()
+        logits = self.model.forward_batch(batch, self.cache)
+        params = [self.sampling[q.seq_id] for q in seqs]
+        gens = [self.generators.get(q.seq_id) for q in seqs]
+        next_tokens = sample(logits, params, gens, self.shared_generator).tolist()
         now = self.clock()
         for q in seqs:
             self.times[q.seq_id].tokens.append(now)
         self.num_steps += 1
-        return s.update(seqs, next_tokens)
+        finished = s.update(seqs, next_tokens)
+        for q in finished:
+            self.generators.pop(q.seq_id, None)  # a finished request draws no more noise
+        return finished
 
     def generate(
         self,
         prompts: list[list[int]],
         max_new_tokens: int,
         eos_ids: frozenset[int] = frozenset(),
+        sampling: SamplingParams | None = None,
     ) -> list[list[int]]:
         """Run all prompts to completion together; outputs in the order of ``prompts``."""
-        ids = [self.add_request(p, max_new_tokens, eos_ids) for p in prompts]
+        ids = [self.add_request(p, max_new_tokens, eos_ids, sampling) for p in prompts]
         while self.has_work():
             self.step()
         return [self.seqs[i].output for i in ids]

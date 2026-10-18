@@ -99,6 +99,10 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   no sequence owns holds NaN, so any out-of-range read fails. Without a GPU (CI) the kernel runs in
   Triton's interpreter; on the T4 the compiled kernel runs. The engine with the kernel matches the
   PyTorch path's greedy tokens, with and without preemptions.
+- Sampling is checked statistically: over 100,000 draws, token frequencies must match
+  softmax(logits / temperature) and the renormalised top-p nucleus, a Hypothesis test checks the
+  top-p set is the smallest most likely one, and a seeded request must give the same tokens
+  alone, in a mixed batch, and when it is preempted and recomputed.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -108,7 +112,8 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
 - The prefix cache reuses whole blocks only (16 tokens by default), and never a prompt's last
   token; eviction drops whole leaves of the tree.
-- Greedy decoding only; temperature and top-p sampling arrive with the API in M6.
+- Sampling supports temperature and top-p only (no top-k, repetition penalties or logprobs).
+  Requests without a seed are reproducible per run, not per request.
 - The Triton kernel covers decode only. Prefill attention still runs one sequence at a time in
   PyTorch and copies that sequence's keys and values out of the cache first.
 - The kernel runs one program per (sequence, query head), so the two query heads of a GQA group
