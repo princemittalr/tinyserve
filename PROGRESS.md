@@ -6,7 +6,7 @@
 |---|---|
 | M0 Repo scaffold | done (2026-10-17) |
 | M1 Forward pass, token-identical to HF | done (2026-10-18): 0 mismatches / 1,920 tokens |
-| M2 Paged KV cache and allocator | not started |
+| M2 Paged KV cache and allocator | in progress |
 | M3 Continuous batching and benchmark harness | not started |
 | M4 Triton paged-attention kernel | not started |
 | M5 Radix prefix cache | not started |
@@ -26,6 +26,7 @@
 - M1 step 6: `Qwen3` forward pass (28 layers, no KV cache) and `greedy_generate`; tiny-random-model tests; `scripts/generate.py` demo. First real run (2026-10-18, laptop CPU, fp32): "The capital of France is" -> " Paris. The capital of Italy is Rome. ...", 20 tokens in 6.8 s.
 - M1 step 7: HF parity tests on a tiny random Qwen3 (run in CI); `scripts/compare_hf.py` + 120 prompts for the real-model acceptance run. Config now also reads the newer `rope_parameters` layout.
 - M1 closed: acceptance run passed (see Benchmark results).
+- M2 step 1: `BlockAllocator` (free stack + used set) skeleton with 7 blanks for me to fill; 14 unit tests and a Hypothesis state machine (random allocate/free traffic; checks no double hand-out, double free rejected, no leaked blocks).
 
 ## Design decisions
 
@@ -53,6 +54,11 @@
 - M1 acceptance is measured in fp32 on CPU: it isolates algorithm bugs from fp16 kernel rounding, which is a separate question for the GPU milestones.
 - `transformers` is a dev-only dependency used as the reference in tests; tinyserve never imports it.
 - CI installs CPU-only torch: no GPU there, and the default Linux wheel pulls ~3 GB of CUDA libraries.
+- Block allocator is plain Python with no tensors: bookkeeping is separate from the KV memory, so it can be property-tested in milliseconds.
+- Free blocks are a list used as a stack: allocate and free are O(1) per block, and a just-freed block is reused first.
+- Used blocks are tracked in a set: the double-free check is O(1) instead of scanning the free list.
+- allocate() and free() are all-or-nothing: on an error nothing changes, so the M3 scheduler can catch OutOfBlocksError and preempt safely.
+- M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
 
@@ -70,6 +76,7 @@ Raw data: `results/m1_hf_compare.json`.
 
 ## Open questions
 
+- Resolved 2026-10-18: the block allocator (core algorithm) is scaffolded as plain-Python blanks for me to fill, like M1.
 - Greedy parity in fp16 on the T4: expect rare near-tie flips; decide the tolerance policy when GPU work starts.
 
 - Resolved 2026-10-17: torch 2.14.1 on PyPI has a cp314 win_amd64 wheel.
