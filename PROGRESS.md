@@ -50,6 +50,7 @@
 - M4 follow-up (Kaggle T4, after closing M4): greedy parity in fp32 with the kernel, 0 mismatches / 1,920 tokens (see Benchmark results). The kernel itself is exact; the fp16 flips are rounding.
 - M5 plan: (1) reference counts in the block allocator, so blocks can be shared; (2) the radix tree over token blocks with LRU eviction (pure Python, blanks + property tests); (3) the scheduler reuses cached prefixes at admission, caches finished and preempted sequences' blocks, and evicts before it preempts; (4) a shared-prefix benchmark workload and the T4 TTFT measurement with the cache on and off, plus greedy parity with the cache on.
 - M5 step 1: `BlockAllocator` counts each block's owners (`_refs` dict replaces the `_used` set): `allocate` starts each block at 1, new `share()` adds an owner (only to blocks in use, all-or-nothing), `free` drops one and returns a block to the pool when its count reaches 0; `ref_count()`. 5 blanks; the mentor gave the answers with the step. 8 new unit tests and a second Hypothesis state machine (owners adopt the first k blocks of other owners; every block's count must equal its number of holders, no leak). The M2 tests are unchanged and still pass.
+- M5 step 2: `RadixCache` (`radix_cache.py`): a radix tree keyed by token ids one KV block at a time; each node holds a run of whole cached blocks. `match_prefix` returns the blocks of the longest cached whole-block prefix (splitting a node where the match ends), `insert` caches a sequence's whole blocks (parts already in the tree keep the tree's blocks; the cache shares the new leaf's blocks), `evict(n)` frees least recently used leaves whose blocks only the cache holds, and a parent that becomes such a leaf joins the heap. 8 blanks; the mentor gave the answers with the step, then the full file. 18 unit tests and a Hypothesis state machine that plays the scheduler (match, share, allocate, insert, finish, evict at random) and checks that every match returns blocks computed for exactly the query's prefix, that reference counts equal owners, and that the pool is whole again at the end. Not wired into the scheduler yet (step 3).
 
 ## Design decisions
 
@@ -120,6 +121,10 @@
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 - M5: reference counts live in the block allocator (`share` / `free`), not in the prefix cache: the allocator is the one place that decides when a block is really free, so a sequence, the cache, or both can hold a block and it returns to the pool exactly when the last one lets go (vLLM v1 also keeps `ref_cnt` per block).
 - M5: only full blocks are shared, never a sequence's partly filled last block: a sequence only writes past its last token, so shared blocks are never written and no copy-on-write is needed.
+- M5: the tree is block-granular (keys compared one block of `block_size` tokens at a time, children keyed by their first block): a match can only end on a block boundary, so matched tokens map to whole blocks with no partial-block bookkeeping.
+- M5: a match that ends inside a node splits it there: every node is then used by a sequence entirely or not at all, so eviction can decide per node.
+- M5: eviction is LRU over leaves whose blocks have reference count 1 (only the cache holds them), one heap per `evict` call: a block a running sequence reads is never freed, and removing leaves first keeps every cached path connected to the root. LRU time is a counter, not the wall clock, so tests are deterministic.
+- M5: whole leaves are evicted, so `evict(n)` can free a few more blocks than asked: simpler than splitting a leaf, and the extra blocks were the least recently used ones anyway.
 
 ## Environment
 
@@ -161,6 +166,7 @@ M4 T4 analysis (from the M4 step 1 and step 3 profiles):
 - Resolved 2026-10-18: the block allocator (core algorithm) is scaffolded as plain-Python blanks for me to fill, like M1.
 - Resolved 2026-10-18 (kernel tolerance): the Triton kernel must match the PyTorch reference within atol = rtol = 1e-5 in fp32 and 1e-3 in fp16; both accumulate in fp32 and round once.
 - Resolved 2026-10-18 (fp16 greedy parity on the T4): 7 near-tie flips with the kernel vs 6 without, all at HF top-2 margins <= 0.0156; accepted (see Design decisions). The same check in fp32 on the T4 with the kernel: 0 mismatches / 1,920 tokens (resolved 2026-10-18).
+- Resolved 2026-10-18 (M5 step 2): from now on I get complete files in each zip instead of blanks to fill; I review and explain the core algorithms instead of typing them, and PROGRESS says which code the mentor wrote.
 - Resolved 2026-10-18: M5 (prefix cache) comes before CUDA graphs and a cheaper `build_batch`; those stay open for the >= 3x HF target at C=32.
 - Profile one C=64 step (torch profiler) at the start of M4 to confirm that per-sequence attention dominates before writing the kernel. Resolved 2026-10-18 (M4 step 1): confirmed, see Benchmark results.
 

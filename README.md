@@ -66,6 +66,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - The block allocator and block tables have Hypothesis property tests: random allocate/free
   traffic must never hand out a block twice, must reject double frees, and must not leak blocks.
   With sharing (M5), every block's reference count must equal the number of owners holding it.
+- The radix prefix cache has a Hypothesis test that plays the scheduler with colliding random
+  prompts and random eviction: every match must return blocks computed for exactly the query's
+  prefix, blocks a running sequence uses are never evicted, and no block leaks.
 - Paged attention and the cached model are checked against the no-cache M1 path (logits and
   greedy tokens), including blocks scattered in random order and blocks reused with stale data.
 - The continuous-batching scheduler has a Hypothesis test over random workloads (every request
