@@ -1,0 +1,49 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4",
+  "torch": "2.11.0+cu128",
+  "transformers": "5.16.1",
+  "dtype": "float16",
+  "attn_implementation": "sdpa",
+  "args": {
+    "model_dir": "checkpoints/Qwen3-0.6B",
+    "device": "cuda",
+    "dtype": "None",
+    "concurrency": "1,8,32,64",
+    "num_requests": "None",
+    "input_len": "128",
+    "output_len": "128",
+    "seed": "0",
+    "out": "None"
+  },
+  "results": [
+    {
+      "concurrency": 1,
+      "num_requests": 16,
+      "output_tokens": 2048,
+      "seconds": 81.38308138100001,
+      "output_tok_per_s": 25.164935576869585
+    },
+    {
+      "concurrency": 8,
+      "num_requests": 32,
+      "output_tokens": 4096,
+      "seconds": 21.19505337999999,
+      "output_tok_per_s": 193.2526390268521
+    },
+    {
+      "concurrency": 32,
+      "num_requests": 128,
+      "output_tokens": 16384,
+      "seconds": 39.41805719200005,
+      "output_tok_per_s": 415.6470705848272
+    },
+    {
+      "concurrency": 64,
+      "num_requests": 256,
+      "output_tokens": 32768,
+      "seconds": 72.61242840399996,
+      "output_tok_per_s": 451.27260883888755
+    }
+  ]
+}

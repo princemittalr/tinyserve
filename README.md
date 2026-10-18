@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M3 in progress.** A continuous-batching scheduler (with preemption by recompute) runs many requests through the paged KV cache at once, and its greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). Next: the first T4 benchmark. See [PROGRESS.md](PROGRESS.md).
+> Status: **M3 done.** A continuous-batching scheduler (with preemption by recompute) runs many requests through the paged KV cache at once, and its greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). On a T4 it is still 5x slower than HF `generate()` at 64 concurrent requests. Next: the Triton paged-attention kernel (M4). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -30,7 +30,20 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Correctness (2026-10-18, laptop CPU, fp32): 0 greedy mismatches vs HF over 120 prompts x 16 tokens,
   without a KV cache (M1), with the paged KV cache (M2), and with all 120 prompts batched
   through the continuous-batching engine (M3).
-- No throughput numbers yet: `scripts/benchmark.py` exists, but no T4 run has been recorded.
+- Throughput (2026-10-18, Kaggle T4, fp16, Qwen3-0.6B, 128-token random prompts, 128 output
+  tokens each, same prompts for both):
+
+  | Concurrency | TinyServe tok/s | HF `generate()` tok/s | TinyServe TTFT p50 / p99 | TinyServe TPOT p50 / p99 |
+  |---|---|---|---|---|
+  | 1 | 25.5 | 25.2 | 40 / 66 ms | 39.2 / 39.7 ms |
+  | 8 | 70.6 | 193.3 | 134 / 147 ms | 113.0 / 113.8 ms |
+  | 32 | 88.0 | 415.6 | 366 / 721 ms | 363.1 / 364.1 ms |
+  | 64 | 90.4 | 451.3 | 701 / 2137 ms | 708.3 / 718.0 ms |
+
+  TinyServe is slower than HF from 8 concurrent requests on. Its attention still runs one
+  sequence at a time and copies each sequence's keys and values out of the cache (inferred
+  from TPOT growing linearly with the batch; not yet profiled). HF uses static batches, so
+  it reports no TTFT or TPOT. Raw data: `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`.
 
 ## How it's tested
 
@@ -47,6 +60,11 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   traffic must never hand out a block twice, must reject double frees, and must not leak blocks.
 - Paged attention and the cached model are checked against the no-cache M1 path (logits and
   greedy tokens), including blocks scattered in random order and blocks reused with stale data.
+- The continuous-batching scheduler has a Hypothesis test over random workloads (every request
+  finishes with the right output, no leaked blocks, no livelock), and the engine's greedy output
+  matches the single-sequence path with and without preemptions.
+- `tests/test_devices.py` runs the model on PyTorch's `meta` device, so a tensor created on the
+  wrong device fails on CPU instead of on the GPU.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations

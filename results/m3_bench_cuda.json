@@ -1,0 +1,83 @@
+{
+  "date": "2026-10-18",
+  "hardware": "Tesla T4, CUDA 12.8",
+  "torch": "2.11.0+cu128",
+  "dtype": "float16",
+  "args": {
+    "model_dir": "checkpoints/Qwen3-0.6B",
+    "device": "cuda",
+    "dtype": "None",
+    "concurrency": "1,8,32,64",
+    "num_requests": "None",
+    "input_len": "128",
+    "output_len": "128",
+    "block_size": "16",
+    "num_blocks": "None",
+    "max_batch_tokens": "2048",
+    "seed": "0",
+    "out": "None"
+  },
+  "num_blocks": 1024,
+  "results": [
+    {
+      "concurrency": 1,
+      "num_requests": 16,
+      "output_tokens": 2048,
+      "seconds": 80.23227162199998,
+      "steps": 2048,
+      "preemptions": 0,
+      "output_tok_per_s": 25.525888256645484,
+      "ttft_p50_ms": 40.107881000039924,
+      "ttft_p99_ms": 65.75680064998436,
+      "tpot_p50_ms": 39.23498675590591,
+      "tpot_p99_ms": 39.70654169881861,
+      "kv_util_mean": 0.01214599609375,
+      "kv_util_max": 0.015625
+    },
+    {
+      "concurrency": 8,
+      "num_requests": 32,
+      "output_tokens": 4096,
+      "seconds": 58.02229592100002,
+      "steps": 512,
+      "preemptions": 0,
+      "output_tok_per_s": 70.5935526159959,
+      "ttft_p50_ms": 133.5451214999921,
+      "ttft_p99_ms": 146.67677153997602,
+      "tpot_p50_ms": 112.95661396063025,
+      "tpot_p99_ms": 113.7864389527563,
+      "kv_util_mean": 0.09716796875,
+      "kv_util_max": 0.125
+    },
+    {
+      "concurrency": 32,
+      "num_requests": 128,
+      "output_tokens": 16384,
+      "seconds": 186.22959446599998,
+      "steps": 514,
+      "preemptions": 0,
+      "output_tok_per_s": 87.97742403391871,
+      "ttft_p50_ms": 365.98549249993084,
+      "ttft_p99_ms": 720.531523570105,
+      "tpot_p50_ms": 363.11455902755927,
+      "tpot_p99_ms": 364.1441886141734,
+      "kv_util_mean": 0.38715953307393,
+      "kv_util_max": 0.5
+    },
+    {
+      "concurrency": 64,
+      "num_requests": 256,
+      "output_tokens": 32768,
+      "seconds": 362.523696386,
+      "steps": 516,
+      "preemptions": 0,
+      "output_tok_per_s": 90.38857411712478,
+      "ttft_p50_ms": 700.816894999889,
+      "ttft_p99_ms": 2137.3744055499437,
+      "tpot_p50_ms": 708.2804430196842,
+      "tpot_p99_ms": 718.0118875984264,
+      "kv_util_mean": 0.7713178294573644,
+      "kv_util_max": 1.0
+    }
+  ]
+}
