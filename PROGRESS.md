@@ -8,7 +8,7 @@
 | M1 Forward pass, token-identical to HF | done (2026-10-18): 0 mismatches / 1,920 tokens |
 | M2 Paged KV cache and allocator | done (2026-10-18): property tests pass; 0 mismatches / 1,920 tokens with the cache |
 | M3 Continuous batching and benchmark harness | done (2026-10-18): 0 mismatches / 1,920 tokens batched; T4 benchmark recorded (below HF throughput, see results) |
-| M4 Triton paged-attention kernel | not started |
+| M4 Triton paged-attention kernel | in progress |
 | M5 Radix prefix cache | not started |
 | M6 Streaming API | not started |
 | M7 Profiling and write-up | not started |
@@ -40,6 +40,7 @@
 - M3 step 6: first T4 run (Kaggle). HF baseline ran; our benchmark crashed: `rope_cos_sin` built its frequency table on the CPU while the positions were on the GPU ("Expected all tensors to be on the same device"). Cause: `torch.arange` without `device=`; CPU-only tests could not see it. Fix (mentor): create it on `positions.device`. New `tests/test_devices.py` runs the forward paths on PyTorch's `meta` device, which refuses to mix with CPU tensors, so a missing `device=` now fails on the laptop and in CI; plus a `gpu` test that runs the engine on CUDA and compares with CPU greedy.
 - M3 step 6 result (Kaggle T4, after the fix): 177 passed, 2 skipped, including the `gpu` engine test. First TinyServe T4 benchmark recorded (see Benchmark results).
 - M3 closed: the harness reports tok/s at concurrency 1/8/32/64, TTFT and TPOT p50/p99 and KV utilization; batched greedy output matches HF on all 120 prompts. Throughput is far below HF at C >= 8 (0.20x at C=64); see the analysis below the results table. M4's kernel targets exactly that.
+- M4 step 1: `scripts/profile_step.py` and `profiling.py` (written by the mentor; measurement plumbing) to confirm the bottleneck before writing the kernel. On a decode batch of C sequences with 192 cached tokens each, it times `build_batch`, `forward_batch`, and `forward_batch` with attention replaced by a stand-in that returns q (the difference is what attention costs as written), at C = 1/8/32/64; then one C=64 forward under torch.profiler (op calls, kernel launches, GPU busy fraction, top operators). 6 tests. T4 numbers pending.
 
 ## Design decisions
 
@@ -98,6 +99,7 @@
 - HF baseline is static batching (batches of C run to completion) with the same prompts and fixed output length: that is what `generate()` offers, and identical inputs make the throughput comparison fair. Only tok/s is compared; HF's per-token times are not observable.
 - Requests per benchmark level scale with concurrency (4 per slot, at least 16): concurrency 64 runs several waves, and concurrency 1 does not take an hour.
 - Device bugs are caught on CPU by running the model on the `meta` device: it has no data, but it refuses to mix with CPU tensors, so any tensor created without `device=` fails a laptop test instead of a GPU run.
+- Attention's cost is measured by replacing it with a stand-in (returns q) and timing the difference: a direct ablation is easier to trust than adding up profiler rows, and it includes the Python launch overhead the profiler splits across many ops.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
@@ -128,7 +130,7 @@ M3 T4 analysis (inferred from the numbers above, not yet profiled; M7 profiles):
 
 - Resolved 2026-10-18: the block allocator (core algorithm) is scaffolded as plain-Python blanks for me to fill, like M1.
 - Greedy parity in fp16 on the T4: expect rare near-tie flips; decide the tolerance policy in M4 (the kernel is compared in fp16).
-- Profile one C=64 step (torch profiler) at the start of M4 to confirm that per-sequence attention dominates before writing the kernel.
+- Profile one C=64 step (torch profiler) at the start of M4 to confirm that per-sequence attention dominates before writing the kernel. Tool added in M4 step 1; result pending the T4 run.
 
 - Resolved 2026-10-17: torch 2.14.1 on PyPI has a cp314 win_amd64 wheel.
 - Dev tools use `>=` ranges, so CI may get a newer ruff than the laptop. Pin exact versions if that ever breaks CI.
