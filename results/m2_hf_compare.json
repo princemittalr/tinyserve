@@ -1,0 +1,616 @@
+{
+  "summary": {
+    "date": "2026-10-18",
+    "hardware": "Windows AMD64 CPU, torch 2.14.1+cpu",
+    "dtype": "float32",
+    "engine": "paged",
+    "prompts": 120,
+    "max_new_tokens": 16,
+    "tokens_compared": 1920,
+    "mismatches": 0,
+    "max_prefill_logit_abs_diff": 0.00012302398681640625,
+    "seconds": 692.9
+  },
+  "rows": [
+    {
+      "prompt": "The capital of France is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The largest planet in the solar system is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Water boils at a temperature of",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The chemical symbol for gold is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The speed of light in a vacuum is approximately",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Photosynthesis is the process by which plants",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The first person to walk on the moon was",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The Great Wall of China was built to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "DNA stands for",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The theory of relativity was developed by",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The tallest mountain on Earth is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The longest river in Africa is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "An atom consists of",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The French Revolution began in the year",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Gravity is the force that",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The human heart has four chambers called",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The Pacific Ocean is the",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Shakespeare wrote a play called",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The currency of Japan is the",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Mount Everest is located in",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "In computer science, a hash table is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A binary search tree is a data structure where",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The time complexity of merge sort is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "In Python, a list comprehension lets you",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A mutex is used to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "TCP differs from UDP because",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The difference between a process and a thread is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Recursion is when a function",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A GPU is faster than a CPU for matrix multiplication because",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The purpose of a compiler is to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "def fibonacci(n):",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "def is_prime(n):",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "import numpy as np",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "for i in range(10):",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "class Stack:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "SELECT name FROM users WHERE",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "#include <stdio.h>",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "int main() {",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "git commit -m",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The output of print(2 ** 10) is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "2 + 2 =",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The square root of 144 is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "If x + 3 = 10, then x =",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The derivative of x squared is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A triangle with sides 3, 4 and 5 is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The sum of the angles in a triangle is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Pi is approximately equal to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Ten percent of 250 is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The next number in the sequence 2, 4, 8, 16 is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A prime number is a number that",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Once upon a time, in a small village,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The old man looked out of the window and",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "It was a dark and stormy night when",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "She opened the letter and read",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The robot woke up for the first time and",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "In the year 2100, cities will",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The dragon flew over the mountains and",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "He had never seen the ocean before, so",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The detective examined the room and noticed",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The little girl asked her mother why",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "To make a cup of tea, first",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The best way to learn a new language is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Here are three tips for better sleep:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A good resume should include",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "To change a flat tire, you need to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Exercise is important because",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The main ingredients of pizza are",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "When writing an email to a professor, you should",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "To stay focused while studying,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The benefits of reading every day include",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Dear Sir or Madam, I am writing to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Thank you for your message. I will",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Question: What is the capital of Germany? Answer:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Question: Who painted the Mona Lisa? Answer:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Question: How many legs does a spider have? Answer:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Q: What is 7 times 8? A:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Translate to French: Good morning. ->",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Translate to Spanish: Thank you very much. ->",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Summarize: The meeting was moved from Monday to Wednesday because the manager was ill.",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "List the days of the week:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The colors of the rainbow are",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The planets in order from the sun are",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A haiku about autumn:",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Roses are red, violets are blue,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The quick brown fox",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "To be or not to be,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Four score and seven years ago",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Machine learning is a field of study that",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A neural network is made of",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Gradient descent works by",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Overfitting happens when a model",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The attention mechanism in transformers",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "A large language model predicts",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Tokenization is the process of",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The KV cache in a transformer stores",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Batching requests on a GPU improves throughput because",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Quantization reduces model size by",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "\u092d\u093e\u0930\u0924 \u0915\u0940 \u0930\u093e\u091c\u0927\u093e\u0928\u0940 \u0939\u0948",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "\u65e5\u672c\u306e\u9996\u90fd\u306f",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "La capital de Espa\u00f1a es",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Die Hauptstadt von Italien ist",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Le soleil se l\u00e8ve \u00e0",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "1, 2, 3, 4, 5,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "a, b, c, d,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Monday, Tuesday, Wednesday,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "January, February, March,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "red, orange, yellow,",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The weather today is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "I think the most important skill for an engineer is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "My favourite book is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "If I could travel anywhere, I would go to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The meaning of life is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The best programming language for beginners is",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "In my opinion, social media",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Climate change is caused by",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "Electric cars are becoming popular because",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The internet was invented to",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "<|im_start|>user\nWhat is 15 + 27?<|im_end|>\n<|im_start|>assistant\n",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "<|im_start|>user\nName three fruits.<|im_end|>\n<|im_start|>assistant\n",
+      "match": true,
+      "n_tokens": 16
+    },
+    {
+      "prompt": "The three states of matter are",
+      "match": true,
+      "n_tokens": 16
+    }
+  ]
+}

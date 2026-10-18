@@ -29,6 +29,7 @@
 - M2 step 1: `BlockAllocator` (free stack + used set) with 6 blanks; 14 unit tests and a Hypothesis state machine (random allocate/free traffic; checks no double hand-out, double free rejected, no leaked blocks). The blank answers came from the mentor.
 - M2 step 2: `BlockTable` (a sequence's blocks, token position -> KV-cache slot) with 5 blanks; 18 unit tests and a Hypothesis state machine (several sequences on one allocator; no two tokens share a slot, no leak). I got stuck and the mentor gave the full file.
 - M2 step 3: `KVCache` (per-layer key/value tensors of token slots, written by the mentor) and `paged_gqa_attention` in `attention.py` (4 blanks; the answers were given by the mentor with the step). 13 tests compare it with the M1 reference: scattered blocks, decode, chunked prefill, a Hypothesis test over random block orders, and two sequences sharing one cache.
+- M2 step 4: `Qwen3.forward_paged` (runs only the new tokens; writes their k/v to the cache, reads history through the block table) and `greedy_generate_paged`, written by the mentor (wiring, no new algorithm). 15 tests: logits and greedy tokens identical to the M1 no-cache path for block sizes 1/4/16, blocks returned after generation and after OutOfBlocksError, stale data in reused blocks has no effect. `generate.py` and `compare_hf.py` use the cache by default (`--no-cache` / `--engine m1` for the old path).
 
 ## Design decisions
 
@@ -66,6 +67,8 @@
 - Paged attention takes the query positions as the LAST n of the sequence: one function covers prefill (n = total), decode (n = 1) and chunked prefill.
 - Paged attention gathers k/v into a contiguous copy before the math: slow, but obviously equal to the M1 reference. M4's kernel reads blocks in place instead.
 - The KV cache stores fp16 by default (fp32 on CPU in tests): it is the largest memory user after the weights.
+- The model has one layer stack and takes attention as a function: the no-cache path (M1) and the paged path share every other line, so they cannot drift apart.
+- `greedy_generate_paged` releases the sequence's blocks in a `finally`: an error mid-generation cannot leak cache memory.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment

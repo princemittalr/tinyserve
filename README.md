@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M1 done.** Greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). Next: paged KV cache (M2). See [PROGRESS.md](PROGRESS.md).
+> Status: **M1 done, M2 in progress.** Greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). Generation now uses a paged KV cache. See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -28,7 +28,7 @@ ruff check . && ruff format --check . && mypy && pytest
 Every number here comes from a logged run with date and hardware; see [PROGRESS.md](PROGRESS.md).
 
 - Correctness (2026-10-18, laptop CPU, fp32): 0 greedy mismatches vs HF over 120 prompts x 16 tokens.
-- No throughput numbers yet: M1 has no KV cache, so speed is not meaningful until M3.
+- No throughput numbers yet: speed is measured from M3, with batching.
 
 ## How it's tested
 
@@ -41,6 +41,10 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   loads it through TinyServe's own loader, and checks logits and greedy tokens match (runs in CI).
 - `scripts/compare_hf.py` compares greedy tokens with HF `generate()` on the real Qwen3-0.6B over
   120 prompts (`benchmarks/prompts/m1_greedy.txt`).
+- The block allocator and block tables have Hypothesis property tests: random allocate/free
+  traffic must never hand out a block twice, must reject double frees, and must not leak blocks.
+- Paged attention and the cached model are checked against the no-cache M1 path (logits and
+  greedy tokens), including blocks scattered in random order and blocks reused with stale data.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -48,7 +52,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Single GPU only. No tensor parallelism, no quantization, not for deployment.
 - Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
 - Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
-- No KV cache yet: generation re-runs the whole sequence every step, so it is slow.
+- One sequence at a time: batching many requests is M3.
+- Paged attention copies each sequence's keys and values out of the cache before the math.
+  It is simple and testable, not fast; the M4 Triton kernel will read the blocks in place.
 
 ## Prior art
 

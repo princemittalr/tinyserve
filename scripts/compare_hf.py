@@ -1,4 +1,4 @@
-"""M1 acceptance test: greedy tokens from TinyServe vs Hugging Face generate().
+"""Greedy tokens from TinyServe vs Hugging Face generate() (M1 acceptance; M2 re-check).
 
 Both run the same checkpoint in float32 on CPU, from the same token ids. For each prompt
 we compare the generated token lists exactly. On a mismatch we report where the two
@@ -6,8 +6,9 @@ diverge and HF's top-2 logit margin there: a tiny margin means a near-tie that f
 rounding can flip, a large margin means a real bug.
 
 Usage:
-    python scripts/compare_hf.py --limit 5        # quick smoke run
-    python scripts/compare_hf.py                  # all prompts (slow on CPU: no KV cache yet)
+    python scripts/compare_hf.py --limit 5        # quick smoke run, paged KV cache (M2)
+    python scripts/compare_hf.py                  # all prompts, paged KV cache
+    python scripts/compare_hf.py --engine m1      # M1's no-cache path (slow)
 """
 
 import argparse
@@ -22,8 +23,10 @@ import torch
 from tokenizers import Tokenizer
 from transformers import AutoModelForCausalLM
 
+from tinyserve.block_allocator import BlockAllocator
 from tinyserve.config import ModelConfig
-from tinyserve.model import Qwen3, greedy_generate
+from tinyserve.kv_cache import KVCache
+from tinyserve.model import Qwen3, greedy_generate, greedy_generate_paged
 from tinyserve.weights import load_weights
 
 
@@ -47,8 +50,12 @@ def main() -> None:
     parser.add_argument("--prompts", type=Path, default=Path("benchmarks/prompts/m1_greedy.txt"))
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--out", type=Path, default=Path("results/m1_hf_compare.json"))
+    parser.add_argument("--engine", choices=["paged", "m1"], default="paged")
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--out", type=Path, default=None, help="default: results/<m2|m1>_...")
     args = parser.parse_args()
+    if args.out is None:
+        args.out = Path(f"results/{'m2' if args.engine == 'paged' else 'm1'}_hf_compare.json")
 
     torch.set_num_threads(max(1, torch.get_num_threads()))
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
@@ -59,6 +66,12 @@ def main() -> None:
     eos = eos_ids(args.model_dir)
 
     prompts = read_prompts(args.prompts)[: args.limit]
+    # One cache, reused by every prompt: big enough for the longest prompt + its new tokens.
+    longest = max(len(tok.encode(p).ids) for p in prompts) + args.max_new_tokens
+    num_blocks = -(-longest // args.block_size)
+    cache = KVCache(cfg, num_blocks, args.block_size, dtype=torch.float32)
+    allocator = BlockAllocator(num_blocks)
+
     rows, max_prefill_diff, start = [], 0.0, time.perf_counter()
     for n, text in enumerate(prompts, 1):
         ids = tok.encode(text).ids
@@ -74,7 +87,12 @@ def main() -> None:
             pad_token_id=eos[0] if eos else None,
         )
         expected = full[0, len(ids) :].tolist()
-        got = greedy_generate(ours, ids, args.max_new_tokens, frozenset(eos))
+        if args.engine == "paged":
+            got = greedy_generate_paged(
+                ours, ids, args.max_new_tokens, cache, allocator, frozenset(eos)
+            )
+        else:
+            got = greedy_generate(ours, ids, args.max_new_tokens, frozenset(eos))
 
         row: dict[str, object] = {
             "prompt": text,
@@ -97,6 +115,7 @@ def main() -> None:
         "date": dt.date.today().isoformat(),
         "hardware": f"{platform.system()} {platform.machine()} CPU, torch {torch.__version__}",
         "dtype": "float32",
+        "engine": args.engine,
         "prompts": len(rows),
         "max_new_tokens": args.max_new_tokens,
         "tokens_compared": sum(int(str(r["n_tokens"])) for r in rows),
