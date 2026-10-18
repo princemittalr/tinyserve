@@ -3,9 +3,9 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M6 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with batched greedy, temperature and top-p sampling, request limits, and no exposure beyond 127.0.0.1 unless asked. On a T4, the API's greedy text is identical to HF `generate()` in fp32 on 120 prompts (in fp16 a few near-ties flip, as before), and it delivers 724 tok/s at 32 concurrent streams (1.74x HF; the engine alone 766 tok/s, 1.84x) and 1,124 tok/s at 64. The 3x target at 32 is not met yet, and time to first token over HTTP grows under load (p99 5.6 s at 32 streams vs 0.6 s for the engine alone; see Benchmarks). The radix prefix cache (M5) and the Triton decode kernel (M4) work through the API too. Now: profiling and the write-up (M7). See [PROGRESS.md](PROGRESS.md).
+> Status: **M7 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with a paged KV cache, continuous batching, a radix prefix cache and a Triton decode kernel. On a T4 it delivers 766 tok/s at 32 concurrent sequences (1.84x HF `generate()`, 69% of vLLM 0.32 on the same workload) and 1,206 tok/s at 64 (2.67x HF, 87% of vLLM). The 3x-HF target at 32 is not met; vLLM itself reaches 2.65x there. Profiling shows the decode step is launch-bound (the GPU is busy about half of each step). [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, and the comparison. See [PROGRESS.md](PROGRESS.md).
 
-## Planned features
+## Features
 
 1. Model forward pass loaded from safetensors (Hugging Face used only as a test reference)
 2. Paged KV cache with a block allocator
@@ -97,8 +97,10 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   Streaming adds about 1 ms per token. Time to first token is the weak spot under load. Profiled
   in M7 (`scripts/profile_api.py`), it is not the GIL: the event loop is never more than 9 ms
   late. The median gap is requests arriving mid-step and waiting for it to end (~100 ms at 32
-  streams). The p99 is a few requests on random-token prompts whose first text arrives only with
-  their last token (inferred: their output decodes to nothing visible until then). Greedy text through the API (fp32, kernel, prefix cache, 120 prompts at once, half
+  streams). The p99 is a few requests on random-token prompts whose whole output decodes to empty
+  text, so their only chunk arrives with their last token (confirmed: 3 of 128 at 32 streams,
+  1 chunk each, empty text). Measured to the first token instead, TTFT p99 is 731 ms at 32
+  streams and 1,426 ms at 64. Greedy text through the API (fp32, kernel, prefix cache, 120 prompts at once, half
   streamed) is identical to HF `generate()`, and the chat template is identical to Qwen3's own.
   Raw data: `results/m6_api_bench_cuda.json`, `results/m6_engine_bench_cuda.json`,
   `results/m6_api_hf_compare_float32_cuda.json`.
@@ -111,6 +113,24 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   launch the next one; `build_batch` adds 3.2 ms. The GEMMs reach 176 GB/s (55% of the T4's
   spec), the decode kernel 89 GB/s (it loads each k/v twice). Raw data:
   `results/m7_engine_profile_cuda.json`, `results/m7_prefix_steps_cuda.json`.
+
+- Comparison with HF `generate()` and vLLM (2026-10-18, Kaggle T4, fp16, the M3 workload: the
+  same seeded 128-token random prompts, 128 greedy output tokens, EOS ignored; closed loop at
+  C, HF in static batches of C; output tok/s; `scripts/bench_vllm.py`):
+
+  | Concurrency | HF `generate()` | TinyServe engine | TinyServe over HTTP | vLLM 0.32 eager | vLLM 0.32 (CUDA graphs) | TinyServe / vLLM |
+  |---|---|---|---|---|---|---|
+  | 1 | 25.2 | 30.7 | 30.0 | not run | 142.4 | 22% |
+  | 8 | 193.3 | 231.1 | 221.7 | not run | 682.0 | 34% |
+  | 32 | 415.6 | 766.4 | 723.8 | 814.3 | 1,103.2 | 69% |
+  | 64 | 451.3 | 1,205.9 | 1,124.0 | not run | 1,384.5 | 87% |
+
+  vLLM without CUDA graphs is within session noise of TinyServe at C=32 (814 vs 766 tok/s;
+  TinyServe's own C=32 result varied 716-766 over three sessions), and CUDA graphs make vLLM
+  1.35x faster than its eager mode: the gap is mostly kernel-launch overhead. The runs were in
+  different Kaggle sessions, vLLM on torch 2.13.0+cu130 and the rest on 2.11.0+cu128. Raw data:
+  `results/m7_vllm_bench_cuda.json`, `results/m3_bench_hf_cuda.json`,
+  `results/m6_engine_bench_cuda.json`, `results/m6_api_bench_cuda.json`.
 
 ## How it's tested
 
@@ -180,6 +200,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   each load the same keys and values; no split-K over long contexts. Tuned only for the T4.
 - Triton has no Windows wheels: on Windows the kernel tests skip and the PyTorch path is used.
 - The decode step is still launch-bound (Python launches every small kernel); no CUDA graphs yet.
+- Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
+  one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
+  decodes to empty text gets only at its end.
 
 ## Prior art
 

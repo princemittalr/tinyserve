@@ -1,0 +1,74 @@
+{
+  "date": "2026-10-18",
+  "workload": "128-token random prompts, 128 greedy output tokens, EOS ignored, max_num_seqs = C",
+  "args": {
+    "model_dir": "checkpoints/Qwen3-0.6B",
+    "concurrency": "1,8,32,64",
+    "modes": "graphs,eager",
+    "eager_concurrency": "32",
+    "num_requests": "None",
+    "input_len": "128",
+    "output_len": "128",
+    "gpu_memory_utilization": "0.8",
+    "seed": "0",
+    "one": "None",
+    "out": "results/m7_vllm_bench_cuda.json"
+  },
+  "results": [
+    {
+      "concurrency": 1,
+      "mode": "graphs",
+      "num_requests": 16,
+      "output_tokens": 2048,
+      "seconds": 14.382176888000004,
+      "output_tok_per_s": 142.39847110410534,
+      "vllm": "0.32.0",
+      "torch": "2.13.0+cu130",
+      "hardware": "Tesla T4"
+    },
+    {
+      "concurrency": 8,
+      "mode": "graphs",
+      "num_requests": 32,
+      "output_tokens": 4096,
+      "seconds": 6.005534911999916,
+      "output_tok_per_s": 682.0374970788375,
+      "vllm": "0.32.0",
+      "torch": "2.13.0+cu130",
+      "hardware": "Tesla T4"
+    },
+    {
+      "concurrency": 32,
+      "mode": "graphs",
+      "num_requests": 128,
+      "output_tokens": 16384,
+      "seconds": 14.850720104999937,
+      "output_tok_per_s": 1103.2461647757968,
+      "vllm": "0.32.0",
+      "torch": "2.13.0+cu130",
+      "hardware": "Tesla T4"
+    },
+    {
+      "concurrency": 64,
+      "mode": "graphs",
+      "num_requests": 256,
+      "output_tokens": 32768,
+      "seconds": 23.667936947000044,
+      "output_tok_per_s": 1384.4890694688709,
+      "vllm": "0.32.0",
+      "torch": "2.13.0+cu130",
+      "hardware": "Tesla T4"
+    },
+    {
+      "concurrency": 32,
+      "mode": "eager",
+      "num_requests": 128,
+      "output_tokens": 16384,
+      "seconds": 20.121523218999982,
+      "output_tok_per_s": 814.2524709326785,
+      "vllm": "0.32.0",
+      "torch": "2.13.0+cu130",
+      "hardware": "Tesla T4"
+    }
+  ]
+}

@@ -14,10 +14,14 @@ step) and "eager" (``enforce_eager=True``: every kernel launched from Python, li
 TinyServe today). Each (C, mode) runs in its own process, because vLLM does not give
 the GPU memory back when an ``LLM`` is dropped; ``--one C MODE`` is that child.
 
-vLLM is not a TinyServe dependency. Installing it replaces Kaggle's torch, so run this
-last in a session. If it does not install or run on a T4, the error is recorded.
+vLLM is not a TinyServe dependency. Installing it replaces Kaggle's torch (vLLM 0.32 pins
+torch 2.13 built for CUDA 13, which needs an NVIDIA driver >= 580), so run it in its own
+session. Kaggle's torchaudio is built for CUDA 12.8 and then breaks transformers' import, so
+remove it; nothing here uses audio. If vLLM does not run, the error is recorded.
 
-Usage: python scripts/bench_vllm.py --model-dir checkpoints/Qwen3-0.6B
+Usage (Kaggle T4, 2026-10-18):
+    pip install vllm && pip uninstall -y torchaudio
+    python scripts/bench_vllm.py --model-dir checkpoints/Qwen3-0.6B
 """
 
 import argparse
