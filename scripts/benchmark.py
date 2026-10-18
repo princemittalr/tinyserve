@@ -55,6 +55,8 @@ def main() -> None:
     parser.add_argument("--max-batch-tokens", type=int, default=2048)
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch",
                         help="decode attention: per-sequence PyTorch or M4 kernel")  # fmt: skip
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
+                        help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="replay CUDA graphs for decode steps (M8; needs triton)")  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
@@ -68,7 +70,8 @@ def main() -> None:
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     weights = load_weights(args.model_dir, cfg, dtype, args.device)
-    model = Qwen3(cfg, weights, decode_attention=args.attention)
+    model = Qwen3(cfg, weights, decode_attention=args.attention,
+                  prefill_attention=args.prefill_attention)  # fmt: skip
     most = max(num_requests_for(c, args.num_requests) for c in levels)
     prompts = synthetic_prompts(most, args.input_len, cfg.vocab_size, args.seed)
 
@@ -109,6 +112,7 @@ def main() -> None:
         "torch": torch.__version__,
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
         "cuda_graphs": None
         if graphs is None
         else {

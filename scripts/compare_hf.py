@@ -75,6 +75,8 @@ def main() -> None:
                         help="default: float32 on cpu, float16 on cuda")  # fmt: skip
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch",
                         help="batched engine's decode attention (M4 kernel: triton)")  # fmt: skip
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
+                        help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--prefix-cache", action="store_true",
                         help="batched engine with the M5 radix prefix cache")  # fmt: skip
     parser.add_argument("--cuda-graphs", action="store_true",
@@ -94,7 +96,8 @@ def main() -> None:
     torch.set_num_threads(max(1, torch.get_num_threads()))
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     weights = load_weights(args.model_dir, cfg, dtype=dtype, device=device)
-    ours = Qwen3(cfg, weights, decode_attention=args.attention)
+    ours = Qwen3(cfg, weights, decode_attention=args.attention,
+                 prefill_attention=args.prefill_attention)  # fmt: skip
     hf: Any = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=dtype)
     hf.to(device).eval()
     tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
@@ -180,6 +183,7 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "engine": args.engine,
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
         "cuda_graphs": args.cuda_graphs,
         "prompts": len(rows),
         "max_new_tokens": args.max_new_tokens,

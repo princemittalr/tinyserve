@@ -57,6 +57,8 @@ def main() -> None:
                         help="default: room for the largest concurrency")  # fmt: skip
     parser.add_argument("--max-batch-tokens", type=int, default=2048)
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
+                        help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -66,7 +68,8 @@ def main() -> None:
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     weights = load_weights(args.model_dir, cfg, dtype, args.device)
-    model = Qwen3(cfg, weights, decode_attention=args.attention)
+    model = Qwen3(cfg, weights, decode_attention=args.attention,
+                  prefill_attention=args.prefill_attention)  # fmt: skip
     most = max(num_requests_for(c, args.num_requests) for c in levels)
     prompts = shared_prefix_prompts(most, args.num_prefixes, args.prefix_len, args.suffix_len,
                                     cfg.vocab_size, args.seed)  # fmt: skip
@@ -111,6 +114,7 @@ def main() -> None:
         "torch": torch.__version__,
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
         "args": {k: str(v) for k, v in vars(args).items()},
         "num_blocks": num_blocks,
         "results": results,

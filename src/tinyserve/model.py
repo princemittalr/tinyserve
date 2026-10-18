@@ -9,6 +9,8 @@ Two paths share the same layers and differ only in attention:
         tokens are flattened into one batch (see batch.py); only attention is per sequence.
         With ``decode_attention="triton"`` (M4), every sequence that brings one token is
         handled by one Triton kernel launch per layer instead of one PyTorch call each.
+        With ``prefill_attention="batched"`` (M8), the other sequences attend in one
+        padded call per layer (``batched_prefill_attention``) instead of one call each.
     ``forward_decode`` (M8): a decode step with fixed shapes and no host syncs, from
         buffers filled in advance (``DecodeInputs``), so a CUDA graph can capture it
         (cuda_graphs.py). Same layers, same kernel; only how the inputs arrive differs.
@@ -20,7 +22,12 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from tinyserve.attention import causal_gqa_attention, paged_gqa_attention
+from tinyserve.attention import (
+    batched_prefill_attention,
+    causal_gqa_attention,
+    paged_gqa_attention,
+    prefill_plan,
+)
 from tinyserve.batch import Batch, DecodeInputs
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.block_table import BlockTable
@@ -44,10 +51,14 @@ class Qwen3:
         cfg: ModelConfig,
         weights: dict[str, torch.Tensor],
         decode_attention: Literal["torch", "triton"] = "torch",
+        prefill_attention: Literal["per_seq", "batched"] = "per_seq",
     ) -> None:
         """``decode_attention`` picks how ``forward_batch`` attends for one-token sequences:
         "torch" runs ``paged_gqa_attention`` per sequence, "triton" runs the M4 kernel once
-        for all of them. Triton is imported only when chosen (it has no Windows wheels)."""
+        for all of them. Triton is imported only when chosen (it has no Windows wheels).
+        ``prefill_attention`` picks how the other sequences attend: "per_seq" runs
+        ``paged_gqa_attention`` for each, "batched" (M8) runs ``batched_prefill_attention``
+        once for all of them."""
         self.cfg = cfg
         self.w = weights
         self.decode_kernel: DecodeFn | None = None
@@ -59,6 +70,11 @@ class Qwen3:
             self.decode_launch = launch_paged_decode
         elif decode_attention != "torch":
             raise ValueError(f"decode_attention must be 'torch' or 'triton': {decode_attention!r}")
+        if prefill_attention not in ("per_seq", "batched"):
+            raise ValueError(
+                f"prefill_attention must be 'per_seq' or 'batched': {prefill_attention!r}"
+            )
+        self.batched_prefill = prefill_attention == "batched"
         # Tied embeddings: the output projection reuses the input embedding matrix.
         key = "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm_head.weight"
         self.lm_head = weights[key]
@@ -157,7 +173,8 @@ class Qwen3:
 
         Every new token's k/v is written to the cache in one scatter per layer. With the
         Triton kernel, all sequences that bring one token (decode) attend in one launch;
-        the rest (prefill) attend one by one in PyTorch, on their slice of the queries.
+        the rest (prefill) attend one by one in PyTorch, on their slice of the queries, or
+        all together in one call per layer with ``prefill_attention="batched"``.
         Row b of the result predicts sequence b's next token.
         """
         scale = self.cfg.head_dim**-0.5
@@ -171,6 +188,14 @@ class Qwen3:
             # A one-token sequence's only query row is its last row.
             rows, tables, lens = rows[idx], tables[idx], lens[idx]
 
+        plan = None
+        if self.batched_prefill and rest:  # built once per step, used by every layer
+            plan = prefill_plan(
+                [bounds[b] for b in rest],
+                [batch.query_lens[b] for b in rest],
+                [batch.seq_slots[b] for b in rest],
+            )
+
         def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             cache.write(i, batch.new_slots, k, v)
             ki, vi, bs = cache.k[i], cache.v[i], cache.block_size
@@ -179,6 +204,10 @@ class Qwen3:
             out = torch.empty_like(q)
             if kernel and one:
                 out[rows] = kernel(q[rows], ki, vi, tables, lens, scale, bs)
+            if plan is not None:
+                res = batched_prefill_attention(q, ki, vi, plan, scale)
+                out[plan.rows[plan.real]] = res[plan.real]
+                return out
             for b in rest:
                 s, e = bounds[b], bounds[b + 1]
                 out[s:e] = paged_gqa_attention(q[s:e], ki, vi, batch.seq_slots[b], scale)

@@ -263,6 +263,8 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
+                        help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--workload", choices=["m3", "prefix"], default="m3")
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="m3 workload: decode steps replay CUDA graphs (M8)")  # fmt: skip
@@ -295,7 +297,8 @@ def main() -> None:
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, dev),
-                  decode_attention=args.attention)  # fmt: skip
+                  decode_attention=args.attention,
+                  prefill_attention=args.prefill_attention)  # fmt: skip
     print(f"{hardware(dev)}, {dtype}, {args.attention} decode attention, workload "
           f"{args.workload}")  # fmt: skip
     with torch.inference_mode():
@@ -308,6 +311,7 @@ def main() -> None:
         "torch": torch.__version__,
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
         "cuda_graphs": args.cuda_graphs,
         "args": {k: str(v) for k, v in vars(args).items()},
         **data,
