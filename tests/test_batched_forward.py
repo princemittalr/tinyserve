@@ -167,3 +167,15 @@ def test_chunked_prefill_in_a_batch_matches_reference(
         logits = m.forward_batch(batch, cache)
     for row, p in enumerate(prompts):
         torch.testing.assert_close(logits[row], reference_last_logits(m, p))
+
+
+def test_build_batch_block_tables_and_lengths_for_the_kernel() -> None:
+    alloc = BlockAllocator(16)
+    a, b = BlockTable(alloc, 4), BlockTable(alloc, 4)
+    a.append(9)  # 3 blocks
+    b.append(2)  # 1 block
+    b.append(1)
+    batch = build_batch([([7] * 9, a), ([4], b)])
+    assert batch.block_tables.dtype == batch.context_lens.dtype == torch.int32
+    assert batch.block_tables.tolist() == [a.blocks, [*b.blocks, 0, 0]]  # padded with 0
+    assert batch.context_lens.tolist() == [9, 3]

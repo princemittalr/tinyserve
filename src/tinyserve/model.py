@@ -7,9 +7,12 @@ Two paths share the same layers and differ only in attention:
         into the paged KV cache, and attention reads the whole history back from it.
     ``forward_batch`` (M3): ``forward_paged`` for many sequences in one pass. Their new
         tokens are flattened into one batch (see batch.py); only attention is per sequence.
+        With ``decode_attention="triton"`` (M4), every sequence that brings one token is
+        handled by one Triton kernel launch per layer instead of one PyTorch call each.
 """
 
 from collections.abc import Callable
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -24,12 +27,33 @@ from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin, swiglu_mlp
 
 # (layer index, q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]) -> attention output [T, Hq, D]
 AttentionFn = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+# paged_decode_attention's signature (triton_attention.py); kept here so the model does
+# not import Triton unless asked to.
+DecodeFn = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, int],
+    torch.Tensor,
+]
 
 
 class Qwen3:
-    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor]) -> None:
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        weights: dict[str, torch.Tensor],
+        decode_attention: Literal["torch", "triton"] = "torch",
+    ) -> None:
+        """``decode_attention`` picks how ``forward_batch`` attends for one-token sequences:
+        "torch" runs ``paged_gqa_attention`` per sequence, "triton" runs the M4 kernel once
+        for all of them. Triton is imported only when chosen (it has no Windows wheels)."""
         self.cfg = cfg
         self.w = weights
+        self.decode_kernel: DecodeFn | None = None
+        if decode_attention == "triton":
+            from tinyserve.triton_attention import paged_decode_attention
+
+            self.decode_kernel = paged_decode_attention
+        elif decode_attention != "torch":
+            raise ValueError(f"decode_attention must be 'torch' or 'triton': {decode_attention!r}")
         # Tied embeddings: the output projection reuses the input embedding matrix.
         key = "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm_head.weight"
         self.lm_head = weights[key]
@@ -126,21 +150,34 @@ class Qwen3:
     def forward_batch(self, batch: Batch, cache: KVCache) -> torch.Tensor:
         """One step for B sequences: ``[B, vocab]`` float32 logits of each one's last token.
 
-        Every new token's k/v is written to the cache in one scatter per layer. Attention
-        then runs sequence by sequence on its slice of the queries (M4's kernel will do all
-        sequences in one launch). Row b of the result predicts sequence b's next token.
+        Every new token's k/v is written to the cache in one scatter per layer. With the
+        Triton kernel, all sequences that bring one token (decode) attend in one launch;
+        the rest (prefill) attend one by one in PyTorch, on their slice of the queries.
+        Row b of the result predicts sequence b's next token.
         """
         scale = self.cfg.head_dim**-0.5
         bounds = [0, *torch.tensor(batch.query_lens).cumsum(0).tolist()]
+        kernel = self.decode_kernel
+        one = [b for b, n in enumerate(batch.query_lens) if kernel and n == 1]
+        rest = [b for b, n in enumerate(batch.query_lens) if not (kernel and n == 1)]
+        rows, tables, lens = batch.last_rows, batch.block_tables, batch.context_lens
+        if one and rest:  # mixed batch: pick out the one-token sequences
+            idx = torch.tensor(one, device=batch.token_ids.device)
+            # A one-token sequence's only query row is its last row.
+            rows, tables, lens = rows[idx], tables[idx], lens[idx]
 
         def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             cache.write(i, batch.new_slots, k, v)
-            return torch.cat(
-                [
-                    paged_gqa_attention(q[s:e], cache.k[i], cache.v[i], slots, scale)
-                    for s, e, slots in zip(bounds[:-1], bounds[1:], batch.seq_slots, strict=True)
-                ]
-            )
+            ki, vi, bs = cache.k[i], cache.v[i], cache.block_size
+            if kernel and not rest:  # all decode: q's rows are the B sequences, in order
+                return kernel(q, ki, vi, tables, lens, scale, bs)
+            out = torch.empty_like(q)
+            if kernel and one:
+                out[rows] = kernel(q[rows], ki, vi, tables, lens, scale, bs)
+            for b in rest:
+                s, e = bounds[b], bounds[b + 1]
+                out[s:e] = paged_gqa_attention(q[s:e], ki, vi, batch.seq_slots[b], scale)
+            return out
 
         return self._run(batch.token_ids, batch.positions, attend, rows=batch.last_rows)
 

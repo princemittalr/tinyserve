@@ -33,6 +33,9 @@ class Batch:
         seq_slots: B tensors; ``seq_slots[b]`` is ``[total_b]``, the slots of every token
             of sequence b so far (new ones included), in position order.
         query_lens: B ints; sequence b owns flat rows ``sum(query_lens[:b]) ..`` onward.
+        block_tables: ``[B, max_blocks]`` int32, each sequence's block ids in order, padded
+            with 0 (never read: the Triton kernel stops at ``context_lens[b]``).
+        context_lens: ``[B]`` int32, tokens of each sequence so far, new ones included.
     """
 
     token_ids: torch.Tensor
@@ -40,6 +43,8 @@ class Batch:
     new_slots: torch.Tensor
     seq_slots: list[torch.Tensor]
     query_lens: list[int]
+    block_tables: torch.Tensor
+    context_lens: torch.Tensor
 
     @property
     def num_seqs(self) -> int:
@@ -68,6 +73,7 @@ def build_batch(
     new_slots: list[int] = []
     seq_slots: list[torch.Tensor] = []
     query_lens: list[int] = []
+    blocks: list[list[int]] = []
     for new_tokens, table in items:
         n, total = len(new_tokens), table.num_tokens
         if not 0 < n <= total:
@@ -78,10 +84,18 @@ def build_batch(
         new_slots.extend(every[total - n :])
         seq_slots.append(torch.tensor(every, device=device))
         query_lens.append(n)
+        blocks.append(table.blocks)
+    width = max(len(b) for b in blocks)
     return Batch(
         token_ids=torch.tensor(tokens, device=device),
         positions=torch.tensor(positions, device=device),
         new_slots=torch.tensor(new_slots, device=device),
         seq_slots=seq_slots,
         query_lens=query_lens,
+        block_tables=torch.tensor(
+            [b + [0] * (width - len(b)) for b in blocks], dtype=torch.int32, device=device
+        ),
+        context_lens=torch.tensor(
+            [t.num_tokens for _, t in items], dtype=torch.int32, device=device
+        ),
     )

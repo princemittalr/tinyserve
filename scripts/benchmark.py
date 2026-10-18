@@ -8,6 +8,7 @@ scripts/bench_hf.py runs the same prompts through HF generate() as the baseline.
 
 Usage:
     python scripts/benchmark.py --device cuda --dtype float16          # T4 (Kaggle)
+    python scripts/benchmark.py --device cuda --attention triton       # M4 kernel
     python scripts/benchmark.py --concurrency 1,4 --num-requests 8 --input-len 32 \\
         --output-len 16                                                # laptop smoke run
 Laptop CPU numbers only show that the harness works; they are not benchmark results.
@@ -50,22 +51,27 @@ def main() -> None:
     parser.add_argument("--num-blocks", type=int, default=None,
                         help="default: room for the largest concurrency")  # fmt: skip
     parser.add_argument("--max-batch-tokens", type=int, default=2048)
+    parser.add_argument("--attention", choices=["torch", "triton"], default="torch",
+                        help="decode attention: per-sequence PyTorch or M4 kernel")  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     dtype = getattr(torch, args.dtype or ("float16" if args.device != "cpu" else "float32"))
     levels = [int(c) for c in args.concurrency.split(",")]
-    out = args.out or Path(f"results/m3_bench_{args.device.split(':')[0]}.json")
+    milestone = "m4" if args.attention == "triton" else "m3"
+    out = args.out or Path(f"results/{milestone}_bench_{args.device.split(':')[0]}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
-    model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, args.device))
+    weights = load_weights(args.model_dir, cfg, dtype, args.device)
+    model = Qwen3(cfg, weights, decode_attention=args.attention)
     most = max(num_requests_for(c, args.num_requests) for c in levels)
     prompts = synthetic_prompts(most, args.input_len, cfg.vocab_size, args.seed)
 
     per_seq = -(-(args.input_len + args.output_len) // args.block_size)
     num_blocks = args.num_blocks or per_seq * max(levels)
     cache = KVCache(cfg, num_blocks, args.block_size, dtype, args.device)  # reused by every run
-    print(f"{hardware(args.device)}, {dtype}, KV cache {num_blocks} blocks x "
+    print(f"{hardware(args.device)}, {dtype}, {args.attention} decode attention, "
+          f"KV cache {num_blocks} blocks x "
           f"{args.block_size} tokens = {cache.memory_bytes / 2**30:.2f} GiB")  # fmt: skip
 
     def engine(max_num_seqs: int) -> Engine:
@@ -90,6 +96,7 @@ def main() -> None:
         "hardware": hardware(args.device),
         "torch": torch.__version__,
         "dtype": str(dtype).removeprefix("torch."),
+        "attention": args.attention,
         "args": {k: str(v) for k, v in vars(args).items()},
         "num_blocks": num_blocks,
         "results": results,

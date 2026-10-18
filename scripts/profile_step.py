@@ -1,4 +1,4 @@
-"""M4 step 1: where does one decode step's time go?
+"""M4 steps 1 and 3: where does one decode step's time go, and what does the kernel save?
 
 Every sequence decodes one token with ``--context-len`` tokens already cached (192 = a
 128-token prompt halfway through 128 output tokens, the middle of the M3 benchmark).
@@ -7,13 +7,16 @@ For each concurrency C it times, on the same batch:
     build      build_batch: block tables -> slot tensors on the device (host work)
     forward    forward_batch, as the engine runs it
     no-attn    forward_batch with attention replaced by a stand-in that returns q
+    kernel     (with --kernel) forward_batch with the M4 Triton decode kernel
 
-forward - no-attn is what attention costs as written. Then one forward at
-``--profile-concurrency`` runs under torch.profiler: op calls, kernel launches, GPU busy
-fraction and the top operators. The cache holds zeros; timing does not depend on values.
+forward - no-attn is what attention costs in PyTorch. Then one forward at
+``--profile-concurrency`` (with the kernel if --kernel) runs under torch.profiler: op
+calls, kernel launches, GPU busy fraction and the top operators. The cache holds zeros;
+timing does not depend on values.
 
 Usage:
     python scripts/profile_step.py --device cuda                      # T4 (Kaggle)
+    python scripts/profile_step.py --device cuda --kernel             # + Triton kernel
     python scripts/profile_step.py --concurrency 1,4 --profile-concurrency 4   # laptop
 Laptop CPU numbers only show that the script works.
 """
@@ -56,15 +59,19 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--trace", type=Path, default=None,
                         help="also write a Chrome trace (open in ui.perfetto.dev)")  # fmt: skip
+    parser.add_argument("--kernel", action="store_true", help="also time the Triton kernel")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype or ("float16" if device.type != "cpu" else "float32"))
     levels = [int(c) for c in args.concurrency.split(",")]
-    out = args.out or Path(f"results/m4_profile_{device.type}.json")
+    name = "m4_profile_kernel" if args.kernel else "m4_profile"
+    out = args.out or Path(f"results/{name}_{device.type}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
-    model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, device))
+    weights = load_weights(args.model_dir, cfg, dtype, device)
+    model = Qwen3(cfg, weights)
+    kernel_model = Qwen3(cfg, weights, decode_attention="triton") if args.kernel else None
     per_seq = -(-(args.context_len + 1) // args.block_size)
     num_blocks = per_seq * max(*levels, args.profile_concurrency)
     cache = KVCache(cfg, num_blocks, args.block_size, dtype, device)
@@ -82,19 +89,29 @@ def main() -> None:
         fwd = time_ms(lambda: model.forward_batch(batch, cache), device, iters=args.iters)
         with attention_replaced():
             no_attn = time_ms(lambda: model.forward_batch(batch, cache), device, iters=args.iters)
-        return {"concurrency": c, "build_ms": build, "forward_ms": fwd,
-                "no_attention_ms": no_attn, "attention_share": (fwd - no_attn) / fwd}  # fmt: skip
+        r = {"concurrency": c, "build_ms": build, "forward_ms": fwd,
+             "no_attention_ms": no_attn, "attention_share": (fwd - no_attn) / fwd}  # fmt: skip
+        if kernel_model is not None:
+            km = kernel_model
+            kern = time_ms(lambda: km.forward_batch(batch, cache), device, iters=args.iters)
+            r |= {"kernel_forward_ms": kern, "kernel_speedup": fwd / kern}
+        return r
 
     rows = []
-    print(f"{'C':>4} | {'build ms':>9} | {'forward ms':>10} | {'no-attn ms':>10} | attention share")
+    head = f"{'C':>4} | {'build ms':>9} | {'forward ms':>10} | {'no-attn ms':>10} | attn share"
+    print(head + (" | kernel ms | speedup" if kernel_model else ""))
     for c in levels:
         r = measure(c)
         rows.append(r)
-        print(f"{c:>4} | {r['build_ms']:9.1f} | {r['forward_ms']:10.1f} | "
-              f"{r['no_attention_ms']:10.1f} | {r['attention_share']:6.0%}")  # fmt: skip
+        line = (f"{c:>4} | {r['build_ms']:9.1f} | {r['forward_ms']:10.1f} | "
+                f"{r['no_attention_ms']:10.1f} | {r['attention_share']:10.0%}")  # fmt: skip
+        if kernel_model:
+            line += f" | {r['kernel_forward_ms']:9.1f} | {r['kernel_speedup']:6.1f}x"
+        print(line)
 
     c = args.profile_concurrency
     batch = build_batch(tables_for(c), device)
+    model = kernel_model or model  # profile the kernel path when it was asked for
     model.forward_batch(batch, cache)  # warm-up outside the profiler
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":
@@ -102,7 +119,9 @@ def main() -> None:
     with profile(activities=activities, acc_events=True) as prof:
         wall = time_ms(lambda: model.forward_batch(batch, cache), device, warmup=0, iters=1)
     summary = profile_summary(prof, wall)
-    print(f"\nprofiled one forward at C={c}: {wall:.1f} ms wall (slower under the profiler), "
+    path = "Triton kernel" if kernel_model else "PyTorch"
+    print(f"\nprofiled one forward ({path}) at C={c}: {wall:.1f} ms wall (slower under the "
+          "profiler), "
           f"{summary['aten_calls']:,.0f} aten op calls, "
           f"{summary['kernel_launches']:,.0f} kernel launches, "
           f"GPU busy {summary['gpu_kernel_ms']:.1f} ms "
@@ -121,7 +140,7 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "args": {k: str(v) for k, v in vars(args).items()},
         "timings": rows,
-        "profile": {"concurrency": c, **summary},
+        "profile": {"concurrency": c, "kernel": kernel_model is not None, **summary},
         "top_ops": table,
     }
     out.parent.mkdir(parents=True, exist_ok=True)

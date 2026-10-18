@@ -1,6 +1,7 @@
 """Greedy tokens from TinyServe vs Hugging Face generate() (M1 acceptance; M2, M3 re-checks).
 
-Both run the same checkpoint in float32 on CPU, from the same token ids. For each prompt
+Both run the same checkpoint in float32 on CPU (or, with --device cuda, float16 on the
+GPU), from the same token ids. For each prompt
 we compare the generated token lists exactly. On a mismatch we report where the two
 diverge and HF's top-2 logit margin there: a tiny margin means a near-tie that float
 rounding can flip, a large margin means a real bug.
@@ -10,6 +11,8 @@ Usage:
     python scripts/compare_hf.py                  # all prompts, paged KV cache
     python scripts/compare_hf.py --engine m1      # M1's no-cache path (slow)
     python scripts/compare_hf.py --engine batched # M3: all prompts at once through Engine
+    python scripts/compare_hf.py --engine batched --device cuda --attention triton
+                                                  # M4: fp16 on the T4 with the kernel
 """
 
 import argparse
@@ -45,6 +48,13 @@ def eos_ids(model_dir: Path) -> list[int]:
     return eos if isinstance(eos, list) else [eos]
 
 
+def hardware(device: torch.device) -> str:
+    if device.type == "cuda":
+        name = torch.cuda.get_device_name(device)
+        return f"{name}, CUDA {torch.version.cuda}, torch {torch.__version__}"
+    return f"{platform.system()} {platform.machine()} CPU, torch {torch.__version__}"
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -55,17 +65,27 @@ def main() -> None:
     parser.add_argument("--engine", choices=["paged", "m1", "batched"], default="paged")
     parser.add_argument("--max-num-seqs", type=int, default=32, help="batched engine only")
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
+                        help="default: float32 on cpu, float16 on cuda")  # fmt: skip
+    parser.add_argument("--attention", choices=["torch", "triton"], default="torch",
+                        help="batched engine's decode attention (M4 kernel: triton)")  # fmt: skip
     parser.add_argument("--out", type=Path, default=None, help="default: results/<m2|m1>_...")
     args = parser.parse_args()
+    device = torch.device(args.device)
+    dtype = getattr(torch, args.dtype or ("float32" if device.type == "cpu" else "float16"))
     if args.out is None:
         milestone = {"m1": "m1", "paged": "m2", "batched": "m3"}[args.engine]
-        args.out = Path(f"results/{milestone}_hf_compare.json")
+        milestone = "m4" if args.attention == "triton" else milestone
+        suffix = "" if device.type == "cpu" else f"_{device.type}"
+        args.out = Path(f"results/{milestone}_hf_compare{suffix}.json")
 
     torch.set_num_threads(max(1, torch.get_num_threads()))
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
-    ours = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype=torch.float32))
-    hf: Any = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.float32)
-    hf.eval()
+    weights = load_weights(args.model_dir, cfg, dtype=dtype, device=device)
+    ours = Qwen3(cfg, weights, decode_attention=args.attention)
+    hf: Any = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=dtype)
+    hf.to(device).eval()
     tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
     eos = eos_ids(args.model_dir)
 
@@ -73,7 +93,7 @@ def main() -> None:
     # One cache, reused by every prompt: big enough for the longest prompt + its new tokens.
     longest = max(len(tok.encode(p).ids) for p in prompts) + args.max_new_tokens
     num_blocks = -(-longest // args.block_size)
-    cache = KVCache(cfg, num_blocks, args.block_size, dtype=torch.float32)
+    cache = KVCache(cfg, num_blocks, args.block_size, dtype=dtype, device=device)
     allocator = BlockAllocator(num_blocks)
 
     ours_out: list[list[int]] = []
@@ -82,7 +102,7 @@ def main() -> None:
         # Every prompt in one Engine run; the cache gets room for max_num_seqs of them.
         engine = Engine(
             ours,
-            KVCache(cfg, num_blocks * args.max_num_seqs, args.block_size, dtype=torch.float32),
+            KVCache(cfg, num_blocks * args.max_num_seqs, args.block_size, dtype, device),
             max_num_seqs=args.max_num_seqs,
         )
         t0 = time.perf_counter()
@@ -97,7 +117,7 @@ def main() -> None:
     rows, max_prefill_diff, start = [], 0.0, time.perf_counter()
     for n, text in enumerate(prompts, 1):
         ids = tok.encode(text).ids
-        x = torch.tensor(ids)
+        x = torch.tensor(ids, device=device)
         prefill_diff = (ours.forward(x) - hf(x[None]).logits[0].float()).abs().max().item()
         max_prefill_diff = max(max_prefill_diff, prefill_diff)
 
@@ -128,7 +148,8 @@ def main() -> None:
                 (i for i, (a, b) in enumerate(zip(got, expected, strict=False)) if a != b), None
             )
             k = min(len(got), len(expected)) if k is None else k
-            top2 = hf(torch.tensor(ids + expected[:k])[None]).logits[0, -1].float().topk(2).values
+            prefix = torch.tensor(ids + expected[:k], device=device)
+            top2 = hf(prefix[None]).logits[0, -1].float().topk(2).values
             row |= {"diverge_at": k, "hf_top2_margin": (top2[0] - top2[1]).item(),
                     "ours": got, "hf": expected}  # fmt: skip
         rows.append(row)
@@ -137,9 +158,10 @@ def main() -> None:
     mismatches = [r for r in rows if not r["match"]]
     summary = {
         "date": dt.date.today().isoformat(),
-        "hardware": f"{platform.system()} {platform.machine()} CPU, torch {torch.__version__}",
-        "dtype": "float32",
+        "hardware": hardware(device),
+        "dtype": str(dtype).removeprefix("torch."),
         "engine": args.engine,
+        "attention": args.attention,
         "prompts": len(rows),
         "max_new_tokens": args.max_new_tokens,
         "tokens_compared": sum(int(str(r["n_tokens"])) for r in rows),
