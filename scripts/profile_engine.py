@@ -15,12 +15,16 @@
     tokens cached, --suffix-len new each), with and without attention, to see what the
     per-sequence PyTorch prefill attention costs.
 
+--cuda-graphs (M8): decode steps replay CUDA graphs (captured once for the run); the
+    decode rows' "build" is then filling the graph's input buffers and "fwd" the replay.
+
 Tracing waits for the GPU after every forward, so its tok/s are a little below
 benchmark.py's; use benchmark.py for throughput and this for the breakdown.
 
 Usage:
     python scripts/profile_engine.py --device cuda --attention triton           # T4
     python scripts/profile_engine.py --device cuda --attention triton --workload prefix
+    python scripts/profile_engine.py --device cuda --attention triton --cuda-graphs  # M8
     python scripts/profile_engine.py --concurrency 1,4 --num-requests 8 --input-len 32 \\
         --output-len 16 --profile-concurrency 4 --profile-steps 4               # laptop
 Laptop CPU numbers only show that the script works.
@@ -46,6 +50,7 @@ from tinyserve.bench import (
 )
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.config import ModelConfig
+from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine, StepRecord
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
@@ -82,14 +87,20 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
     prompts = synthetic_prompts(most, args.input_len, cfg.vocab_size, args.seed)
     per_seq = -(-(args.input_len + args.output_len) // args.block_size)
     cache = KVCache(cfg, per_seq * max(*levels, pc), args.block_size, dtype, dev)
+    graphs = DecodeGraphs(model, cache, max(*levels, pc)) if args.cuda_graphs else None
+    if graphs is not None:
+        mib = graphs.capture_bytes / 2**20
+        print(f"CUDA graphs: buckets {graphs.buckets}, captured in "
+              f"{graphs.capture_seconds:.1f} s, {mib:.0f} MiB")  # fmt: skip
 
     def engine(c: int, trace: bool = False) -> Engine:
-        return Engine(model, cache, c, args.max_batch_tokens, trace_steps=trace)
+        return Engine(model, cache, c, args.max_batch_tokens, trace_steps=trace,
+                      decode_graphs=graphs)  # fmt: skip
 
     run_closed_loop(engine(2), prompts[:2], 4, concurrency=2)  # warm-up, not reported
     print(f"{'C':>3} | {'tok/s':>7} | decode step ms: {'sched':>5} {'build':>5} "
           f"{'fwd':>6} {'sample':>6} {'update':>6} {'total':>6} | {'T4 floor':>8} | "
-          f"floor/fwd | steps with prefill: n, mean ms")  # fmt: skip
+          f"floor/fwd | steps with prefill: n, mean ms, share of time")  # fmt: skip
     levels_out = []
     for c in levels:
         n = num_requests_for(c, args.num_requests)
@@ -98,8 +109,12 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
         recs: list[StepRecord] = e.step_records or []
         d = summarize_steps([x for x in recs if x.num_prefill_seqs == 0])
         p = summarize_steps([x for x in recs if x.num_prefill_seqs > 0])
+        # Share of the run's step time spent in steps that carry a prefill.
+        all_ms = sum(x.total_ms for x in recs)
+        share = sum(x.total_ms for x in recs if x.num_prefill_seqs > 0) / all_ms if recs else 0.0
         row: dict[str, Any] = {"concurrency": c, "output_tok_per_s": r.output_tok_per_s,
-                               "decode_steps": d, "prefill_steps": p}  # fmt: skip
+                               "decode_steps": d, "prefill_steps": p,
+                               "prefill_time_share": share}  # fmt: skip
         line = f"{c:>3} | {r.output_tok_per_s:7.1f} | "
         if d["steps"]:
             cost = decode_step_cost(cfg, d["num_seqs"], d["context_tokens"], elem)
@@ -113,7 +128,7 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
                      f"{d['total_ms']:6.1f} | {floor:8.2f} | "
                      f"{floor / d['forward_ms']:9.0%} | ")  # fmt: skip
         if p["steps"]:
-            line += f"{p['steps']:.0f}, {p['total_ms']:.1f}"
+            line += f"{p['steps']:.0f}, {p['total_ms']:.1f}, {share:.0%}"
         print(line)
         levels_out.append(row)
 
@@ -138,8 +153,8 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
         sync(dev)
         wall = (time.perf_counter() - start) * 1e3
     s = profile_summary(prof, wall)
-    per_step = {key: s[key] / k for key in ("aten_calls", "kernel_launches", "gpu_kernel_ms",
-                                             "wall_ms")}  # fmt: skip
+    per_step = {key: s[key] / k for key in ("aten_calls", "kernel_launches", "graph_launches",
+                                             "gpu_kernel_ms", "wall_ms")}  # fmt: skip
     gemm_ms = gpu_time_ms(prof, lambda name: "gemm" in name.lower()) / k
     attn_ms = gpu_time_ms(prof, lambda name: "paged_decode" in name) / k
     w_bytes = weight_bytes(cfg, elem)
@@ -154,7 +169,8 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
     }  # fmt: skip
     print(f"\nprofiled {k} decode steps at C={pc} (slower under the profiler): per step "
           f"{per_step['wall_ms']:.1f} ms wall, {per_step['aten_calls']:,.0f} aten calls, "
-          f"{per_step['kernel_launches']:,.0f} kernel launches, GPU busy "
+          f"{per_step['kernel_launches']:,.0f} kernel launches, "
+          f"{per_step['graph_launches']:.0f} graph replays, GPU busy "
           f"{per_step['gpu_kernel_ms']:.1f} ms = {s['gpu_busy']:.0%}")  # fmt: skip
     if gemm_ms:
         print(f"GEMMs: {gemm_ms:.1f} ms/step for {w_bytes / 1e9:.2f} GB of weights = "
@@ -248,6 +264,8 @@ def main() -> None:
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
     parser.add_argument("--workload", choices=["m3", "prefix"], default="m3")
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="m3 workload: decode steps replay CUDA graphs (M8)")  # fmt: skip
     parser.add_argument("--concurrency", default=None,
                         help="m3: levels, default 1,8,32,64; prefix: one, default 32")  # fmt: skip
     parser.add_argument("--num-requests", type=int, default=None)
@@ -272,6 +290,7 @@ def main() -> None:
     dev = torch.device(args.device)
     dtype = getattr(torch, args.dtype or ("float16" if dev.type != "cpu" else "float32"))
     name = "m7_engine_profile" if args.workload == "m3" else "m7_prefix_steps"
+    name = "m8_engine_profile" if args.cuda_graphs else name
     out = args.out or Path(f"results/{name}_{dev.type}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
@@ -289,6 +308,7 @@ def main() -> None:
         "torch": torch.__version__,
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
+        "cuda_graphs": args.cuda_graphs,
         "args": {k: str(v) for k, v in vars(args).items()},
         **data,
     }

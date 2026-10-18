@@ -1,6 +1,8 @@
 """The profiling helpers behind scripts/profile_step.py (M4) and scripts/profile_engine.py
 (M7), on a tiny random Qwen3."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
@@ -84,7 +86,7 @@ def test_profile_summary_on_cpu_counts_ops_and_no_kernels() -> None:
         with profile(activities=[ProfilerActivity.CPU], acc_events=True) as prof:
             m.forward_batch(batch, cache)
         s = profile_summary(prof, wall_ms=1.0)
-        assert s["kernel_launches"] == 0
+        assert s["kernel_launches"] == s["graph_launches"] == 0
         assert s["gpu_kernel_ms"] == 0
         return s["aten_calls"]
 
@@ -123,8 +125,9 @@ def record(forward_ms: float, num_seqs: int) -> StepRecord:
 
 
 def test_summarize_steps_means() -> None:
-    s = summarize_steps([record(10.0, 2), record(20.0, 4)])
+    s = summarize_steps([record(10.0, 2), replace(record(20.0, 4), graph=True)])
     assert s["steps"] == 2
+    assert s["graph_steps"] == 0.5
     assert s["forward_ms"] == 15.0
     assert s["total_ms"] == 19.0
     assert s["num_seqs"] == 3.0

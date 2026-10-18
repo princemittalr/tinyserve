@@ -100,19 +100,22 @@ def profile_summary(prof: profile, wall_ms: float) -> dict[str, float]:
     """Totals from a finished profiler run over a span that took ``wall_ms``.
 
     aten_calls: PyTorch operator calls dispatched from Python (each costs CPU time).
-    kernel_launches: CUDA kernels launched (0 on CPU).
+    kernel_launches: CUDA kernels launched one by one from the host (0 on CPU).
+    graph_launches: CUDA graph replays (M8); each runs a whole recorded forward pass.
     gpu_kernel_ms: time the GPU spent running kernels; gpu_busy is that over wall time.
     A low gpu_busy means the GPU mostly waits for Python to launch the next kernel.
     """
     rows = prof.key_averages()
     aten_calls = sum(r.count for r in rows if r.key.startswith("aten::"))
     launches = sum(r.count for r in rows if r.key in ("cudaLaunchKernel", "cuLaunchKernel"))
+    graphs = sum(r.count for r in rows if r.key in ("cudaGraphLaunch", "cuGraphLaunch"))
     # Kernels and copies appear as rows of their own, on the GPU; CPU-side rows also carry
     # their kernels' time, so only GPU rows are summed (as the profiler's own total does).
     gpu_us = sum(r.self_device_time_total for r in rows if r.device_type != DeviceType.CPU)
     return {
         "aten_calls": aten_calls,
         "kernel_launches": launches,
+        "graph_launches": graphs,
         "gpu_kernel_ms": gpu_us / 1e3,
         "wall_ms": wall_ms,
         "gpu_busy": gpu_us / 1e3 / wall_ms if wall_ms > 0 else 0.0,
@@ -164,6 +167,7 @@ def summarize_steps(records: list[StepRecord]) -> dict[str, float]:
     out["num_prefill_seqs"] = sum(r.num_prefill_seqs for r in records) / n
     out["num_tokens"] = sum(r.num_tokens for r in records) / n
     out["context_tokens"] = sum(r.context_tokens for r in records) / n
+    out["graph_steps"] = sum(r.graph for r in records) / n  # share replayed as a CUDA graph
     return out
 
 
