@@ -9,9 +9,12 @@ Every step: the scheduler picks the sequences and reserves their cache slots, th
 runs all their pending tokens in one ``forward_batch``, and each sequence gets its next
 token: greedy, or sampled with its own ``SamplingParams`` (M6, sampling.py). The engine
 also records when each token came out, which is what the M3 benchmark turns into TTFT
-and TPOT.
+and TPOT. With ``trace_steps=True`` (M7) it also records where each step's time went
+(``StepRecord``); that waits for the GPU after the forward pass, so leave it off when
+measuring throughput.
 """
 
+import itertools
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -47,6 +50,29 @@ class RequestTimes:
         return (self.tokens[-1] - self.tokens[0]) / (len(self.tokens) - 1)
 
 
+@dataclass(frozen=True)
+class StepRecord:
+    """One engine step: what ran and how long each phase took (``Engine(trace_steps=True)``).
+
+    A prefill sequence is one that brought more than one token (a prompt, the part after
+    a cached prefix, or a recompute after preemption); the rest decode one token each.
+    """
+
+    num_seqs: int
+    num_prefill_seqs: int
+    num_tokens: int  # rows in the forward pass
+    context_tokens: int  # sum of each sequence's tokens so far, new ones included
+    schedule_ms: float  # schedule(): admission, preemption, prefix-cache lookups
+    build_ms: float  # build_batch: block tables -> tensors on the device
+    forward_ms: float  # forward_batch, until the GPU has finished it
+    sample_ms: float  # sampling, plus copying the next tokens to the host
+    update_ms: float  # scheduler.update(): record tokens, retire, cache blocks
+
+    @property
+    def total_ms(self) -> float:
+        return self.schedule_ms + self.build_ms + self.forward_ms + self.sample_ms + self.update_ms
+
+
 class Engine:
     def __init__(
         self,
@@ -57,6 +83,7 @@ class Engine:
         clock: Callable[[], float] = time.perf_counter,
         prefix_cache: bool = False,
         seed: int = 0,
+        trace_steps: bool = False,
     ) -> None:
         self.model = model
         self.cache = cache
@@ -78,6 +105,7 @@ class Engine:
         # Seeded requests get their own generator; the rest share this one (sampling.py).
         self.generators: dict[int, torch.Generator] = {}
         self.shared_generator = torch.Generator(device=dev).manual_seed(seed)
+        self.step_records: list[StepRecord] | None = [] if trace_steps else None
 
     def add_request(
         self,
@@ -116,6 +144,8 @@ class Engine:
     def step(self) -> list[Sequence]:
         """Run one model step. Returns the sequences that finished in it."""
         s = self.scheduler
+        marks: list[float] = []  # phase boundaries, only when tracing
+        self._mark(marks)
         seqs = s.schedule()
         if not seqs:
             # add() rejects requests that can never fit, so this would be a scheduler bug.
@@ -124,11 +154,17 @@ class Engine:
         # Each sequence's input is what schedule() just appended to its table: a whole
         # prompt, the part after a cached prefix (M5), or one decode token.
         items = [(q.tokens[-q.num_scheduled :], q.table) for q in seqs]
+        # Read before update(), which releases the tables of finished sequences.
+        context = sum(table.num_tokens for _, table in items)
+        self._mark(marks)
         batch = build_batch(items, device=self.cache.k.device)
+        self._mark(marks)
         logits = self.model.forward_batch(batch, self.cache)
+        self._mark(marks)
         params = [self.sampling[q.seq_id] for q in seqs]
         gens = [self.generators.get(q.seq_id) for q in seqs]
         next_tokens = sample(logits, params, gens, self.shared_generator).tolist()
+        self._mark(marks)
         now = self.clock()
         for q in seqs:
             self.times[q.seq_id].tokens.append(now)
@@ -136,7 +172,34 @@ class Engine:
         finished = s.update(seqs, next_tokens)
         for q in finished:
             self.generators.pop(q.seq_id, None)  # a finished request draws no more noise
+        if self.step_records is not None:
+            self._mark(marks)
+            ms = [(b - a) * 1e3 for a, b in itertools.pairwise(marks)]
+            self.step_records.append(
+                StepRecord(
+                    num_seqs=len(seqs),
+                    num_prefill_seqs=sum(len(t) > 1 for t, _ in items),
+                    num_tokens=sum(len(t) for t, _ in items),
+                    context_tokens=context,
+                    schedule_ms=ms[0],
+                    build_ms=ms[1],
+                    forward_ms=ms[2],
+                    sample_ms=ms[3],
+                    update_ms=ms[4],
+                )
+            )
         return finished
+
+    def _mark(self, marks: list[float]) -> None:
+        """Tracing only: wait for queued GPU work, then note the time. CUDA calls return
+        once kernels are queued, so without the wait their time would show up in whatever
+        phase next waits for the GPU (the ``.tolist()`` after sampling)."""
+        if self.step_records is None:
+            return
+        dev = self.cache.k.device
+        if dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+        marks.append(self.clock())
 
     def generate(
         self,

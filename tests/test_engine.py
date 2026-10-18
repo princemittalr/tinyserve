@@ -90,3 +90,52 @@ def test_ttft_and_tpot() -> None:
     assert t.ttft == 2.0
     assert t.tpot == 0.5
     assert RequestTimes(arrival=0.0, tokens=[1.0]).tpot is None
+
+
+def traced(num_blocks: int = 64, max_num_seqs: int = 8) -> Engine:
+    ticks = itertools.count()
+    cache = KVCache(CFG, num_blocks, 4, dtype=torch.float32)
+    return Engine(tiny_model(), cache, max_num_seqs=max_num_seqs, trace_steps=True,
+                  clock=lambda: float(next(ticks)))  # fmt: skip
+
+
+def test_step_trace_is_off_by_default() -> None:
+    e = engine()
+    e.generate(PROMPTS[:2], 3)
+    assert e.step_records is None
+
+
+def test_step_trace_records_each_step_without_changing_outputs() -> None:
+    e = traced()
+    assert e.generate(PROMPTS, 6) == engine().generate(PROMPTS, 6)
+    recs = e.step_records
+    assert recs is not None and len(recs) == e.num_steps
+    first = recs[0]
+    # Step 1 prefills every prompt; the 1-token prompt counts as decoding (one row).
+    assert first.num_seqs == len(PROMPTS)
+    assert first.num_prefill_seqs == sum(len(p) > 1 for p in PROMPTS)
+    assert first.num_tokens == first.context_tokens == sum(map(len, PROMPTS))
+    second = recs[1]
+    assert second.num_prefill_seqs == 0
+    assert second.num_tokens == len(PROMPTS)
+    assert second.context_tokens == sum(len(p) + 1 for p in PROMPTS)
+
+
+def test_step_trace_phases_come_from_the_engine_clock() -> None:
+    # The fake clock advances 1 s per call: one call per phase boundary, plus the token
+    # timestamp taken between sampling and the scheduler update.
+    e = traced()
+    e.generate(PROMPTS[:2], 3)
+    assert e.step_records is not None
+    for r in e.step_records:
+        assert (r.schedule_ms, r.build_ms, r.forward_ms, r.sample_ms) == (1e3, 1e3, 1e3, 1e3)
+        assert r.update_ms == 2e3
+        assert r.total_ms == 6e3
+
+
+def test_step_trace_counts_context_of_sequences_that_finish_in_the_step() -> None:
+    # max_new_tokens=1: every sequence finishes (and frees its table) in its first step.
+    e = traced()
+    e.generate(PROMPTS, 1)
+    assert e.step_records is not None
+    assert [r.context_tokens for r in e.step_records] == [sum(map(len, PROMPTS))]

@@ -1,4 +1,4 @@
-"""Measuring where a decode step's time goes, before writing the M4 kernel.
+"""Measuring where a step's time goes: one forward pass (M4) and whole engine steps (M7).
 
 The M3 T4 numbers suggest that attention dominates a large decode step: TPOT grows by
 about 11 ms per extra sequence, and ``forward_batch`` runs attention once per sequence per
@@ -10,6 +10,10 @@ layer. These helpers test that guess directly instead of inferring it:
     attention_replaced  swaps the model's attention for a stand-in that returns q, so
                         time(real) - time(stand-in) is the cost of attention as written.
     profile_summary     op calls, kernel launches and GPU kernel time from torch.profiler.
+    gpu_time_ms         GPU time of the kernels whose name matches, e.g. only the GEMMs.
+    prefill_items       batch inputs of sequences that prefill after a cached prefix (M5).
+    fill_to_decode      admit requests and run their prefills, so every later step decodes.
+    summarize_steps     mean phase times of an engine's ``StepRecord`` list (M7).
 """
 
 import statistics
@@ -23,6 +27,7 @@ from torch.profiler import DeviceType, profile
 import tinyserve.model
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.block_table import BlockTable
+from tinyserve.engine import Engine, StepRecord
 
 
 def decode_tables(
@@ -109,3 +114,51 @@ def profile_summary(prof: profile, wall_ms: float) -> dict[str, float]:
         "wall_ms": wall_ms,
         "gpu_busy": gpu_us / 1e3 / wall_ms if wall_ms > 0 else 0.0,
     }
+
+
+def gpu_time_ms(prof: profile, match: Callable[[str], bool]) -> float:
+    """GPU time of the kernels whose name satisfies ``match`` (e.g. every GEMM)."""
+    rows = prof.key_averages()
+    gpu = [r for r in rows if r.device_type != DeviceType.CPU and match(r.key)]
+    return float(sum(r.self_device_time_total for r in gpu)) / 1e3
+
+
+def prefill_items(
+    allocator: BlockAllocator, block_size: int, num_seqs: int, cached_len: int, new_len: int
+) -> list[tuple[list[int], BlockTable]]:
+    """``build_batch`` inputs for ``num_seqs`` sequences that each have ``cached_len``
+    tokens in the cache and prefill ``new_len`` more: a prefix-cache hit (M5)."""
+    items = []
+    for _ in range(num_seqs):
+        t = BlockTable(allocator, block_size)
+        t.append(cached_len + new_len)
+        items.append(([0] * new_len, t))
+    return items
+
+
+def fill_to_decode(engine: Engine, prompts: list[list[int]], max_new_tokens: int) -> list[int]:
+    """Add every prompt, then step until each has its first token. From then on, until
+    the first one finishes, every step decodes one token for all of them."""
+    ids = [engine.add_request(p, max_new_tokens) for p in prompts]
+    while any(not engine.seqs[i].output for i in ids):
+        engine.step()
+    return ids
+
+
+_PHASES = ("schedule_ms", "build_ms", "forward_ms", "sample_ms", "update_ms", "total_ms")
+
+
+def summarize_steps(records: list[StepRecord]) -> dict[str, float]:
+    """Means over ``records``: each phase's ms, the batch size and the context read.
+    Empty input gives ``{"steps": 0}``."""
+    n = len(records)
+    if n == 0:
+        return {"steps": 0}
+    out: dict[str, float] = {"steps": n}
+    for phase in _PHASES:
+        out[phase] = sum(getattr(r, phase) for r in records) / n
+    out["num_seqs"] = sum(r.num_seqs for r in records) / n
+    out["num_prefill_seqs"] = sum(r.num_prefill_seqs for r in records) / n
+    out["num_tokens"] = sum(r.num_tokens for r in records) / n
+    out["context_tokens"] = sum(r.context_tokens for r in records) / n
+    return out

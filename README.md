@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M6 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with batched greedy, temperature and top-p sampling, request limits, and no exposure beyond 127.0.0.1 unless asked. On a T4, the API's greedy text is identical to HF `generate()` in fp32 on 120 prompts (in fp16 a few near-ties flip, as before), and it delivers 724 tok/s at 32 concurrent streams (1.74x HF; the engine alone 766 tok/s, 1.84x) and 1,124 tok/s at 64. The 3x target at 32 is not met yet, and time to first token over HTTP grows under load (p99 5.6 s at 32 streams vs 0.6 s for the engine alone; see Benchmarks). The radix prefix cache (M5) and the Triton decode kernel (M4) work through the API too. Next: profiling and the write-up (M7). See [PROGRESS.md](PROGRESS.md).
+> Status: **M6 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with batched greedy, temperature and top-p sampling, request limits, and no exposure beyond 127.0.0.1 unless asked. On a T4, the API's greedy text is identical to HF `generate()` in fp32 on 120 prompts (in fp16 a few near-ties flip, as before), and it delivers 724 tok/s at 32 concurrent streams (1.74x HF; the engine alone 766 tok/s, 1.84x) and 1,124 tok/s at 64. The 3x target at 32 is not met yet, and time to first token over HTTP grows under load (p99 5.6 s at 32 streams vs 0.6 s for the engine alone; see Benchmarks). The radix prefix cache (M5) and the Triton decode kernel (M4) work through the API too. Now: profiling and the write-up (M7). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -145,6 +145,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   status; a client that disconnects mid-stream or before its answer frees every block.
 - `tests/test_server_e2e.py` starts the real server process on a tiny checkpoint and checks,
   over a socket, that streamed and plain answers equal the offline engine's greedy text.
+- The roofline model's byte counts are checked against the real checkpoint's 596,049,920
+  parameters and against every tensor of the tiny test checkpoint; the engine's step trace must
+  not change any output.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations

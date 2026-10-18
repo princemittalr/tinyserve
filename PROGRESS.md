@@ -11,7 +11,7 @@
 | M4 Triton paged-attention kernel | done (2026-10-18): matches the PyTorch reference within 1e-5 (fp32) / 1e-3 (fp16); 18.5x faster decode forward at C=64; 1,168 tok/s at C=64 (2.59x HF) |
 | M5 Radix prefix cache | done (2026-10-18): shared-prefix workload on the T4, TTFT p50 232 -> 42 ms at C=1, p99 8.9 -> 2.0 s at C=32, throughput 2.24x at C=32; fp32 greedy parity with the cache 0 mismatches / 384 tokens |
 | M6 Streaming API | done (2026-10-18): OpenAI-compatible streaming API with request limits, bound to 127.0.0.1 by default; over HTTP on the T4 0 text mismatches vs HF fp32 on 120 prompts, 724 tok/s at C=32 (5.6% below the engine alone, 1.74x HF) |
-| M7 Profiling and write-up | not started |
+| M7 Profiling and write-up | in progress |
 
 ## Step log
 
@@ -64,6 +64,8 @@
 - M6 step 4 result (Kaggle T4): 336 passed, 2 skipped. HTTP benchmark, parity through the API, the chat template and the fp32 prefix-cache check: see Benchmark results and the M6 analysis.
 - M6 step 5: results recorded (`results/m6_api_bench_cuda.json` copied exactly from the pasted output; `results/m6_engine_bench_cuda.json` and `results/m5_prefix_bench_fp32_cuda.json` transcribed from the printed summary lines; `results/m6_api_hf_compare_float32_cuda.json` holds the exact summary, all 120 prompts OK).
 - M6 closed: the streaming API has request limits (413 / 400 / 404 / 429 / 503, each tested) and binds to 127.0.0.1 by default (other hosts need `--allow-remote`, tested). On the T4 it serves greedy text identical to HF `generate()` in fp32 through both streaming and plain responses, with the kernel and the prefix cache, and costs 2-7% of the engine's throughput.
+- M7 plan: (1) a per-step trace of the engine (schedule / build_batch / forward / sample / update) and a roofline model of a decode step, run on the M3 workload and on the M5 shared-prefix workload, plus torch.profiler over steady decode steps; (2) profile the server under load to test the inferred GIL contention behind the API's TTFT; (3) vLLM on a T4 with the same prompts, if it runs there, next to HF `generate()`; (4) the write-up (roofline argument, where the time goes, honest comparison) and README.
+- M7 step 1: engine step trace and roofline (written by the mentor, complete files; profiling plumbing). `Engine(trace_steps=True)` appends a `StepRecord` per step: sequences, prefills, tokens in, context read, and the ms of schedule, build_batch, forward (waits for the GPU), sample + copy to host, and update; off by default, because the wait after the forward costs a little throughput. `roofline.py`: T4 spec (320 GB/s, 65 TFLOPS fp16, 8.1 fp32), weight bytes per forward (596,049,920 parameters, checked against the M1 count), k/v bytes per token (112 KiB in fp16) and the FLOPs and floor of a decode step. `scripts/profile_engine.py --workload m3` (phase means of all-decode steps vs the T4 floor, then torch.profiler over 10 steady decode steps at C=32: launches, GPU busy, GB/s of the GEMMs and of the decode kernel) and `--workload prefix` (the M5 workload at C=32 with the cache off and on: prefills per step, the slowest steps, and forward_batch over 1 / 8 / 32 cache hits with and without attention). 14 new tests; 12 planted bugs, all caught.
 
 ## Design decisions
 
@@ -155,6 +157,9 @@
 - M6: bind to 127.0.0.1 by default, and refuse other hosts without `--allow-remote`: there is no authentication, so exposing the port means anyone who can reach it can use the GPU.
 - M6: the API benchmark runs the M3/M4 workload unchanged (same prompts, EOS ignored) and the engine-only benchmark in the same session: the difference is what HTTP, JSON, SSE and detokenising cost, not a different workload.
 - M6: greedy parity through the API compares text (HF's tokens decoded with the same tokenizer) with token-id prompts: the API returns text, and token-id prompts keep tokenisation out of the comparison.
+- M7: the step trace waits for the GPU at each phase boundary, and only when tracing is on: CUDA calls return before the GPU finishes, so without the wait the forward's time would land in the `.tolist()` after sampling; with it off, the engine runs exactly as before.
+- M7: the roofline floor counts each weight and each cached k/v element once per step (bytes / 320 GB/s): decode is memory-bound at every benchmarked batch size (fp16 intensity is about B FLOP/byte against a T4 ridge of 203), so bytes, not FLOPs, set the floor. The kernel's own traffic is reported both ways, since it loads each k/v once per query head.
+- M7: the prefill-attention question is tested by the same ablation as M4 (attention replaced by a stand-in), on a batch shaped like the cache-on waves: k hits with 1,024 cached and 64 new tokens each.
 
 ## Environment
 
