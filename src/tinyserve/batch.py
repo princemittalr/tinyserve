@@ -99,3 +99,89 @@ def build_batch(
             [t.num_tokens for _, t in items], dtype=torch.int32, device=device
         ),
     )
+
+
+@dataclass(frozen=True)
+class DecodeInputs:
+    """Fixed-size inputs of a decode step: the input of ``Qwen3.forward_decode`` (M8).
+
+    A CUDA graph records kernels that read fixed addresses with fixed shapes, so its inputs
+    live in buffers allocated once and overwritten every step. Row r is one sequence's one
+    new token; rows past the real sequences are padding (``fill_decode_inputs``).
+
+    Attributes:
+        token_ids: ``[N]`` int64, each sequence's new token.
+        positions: ``[N]`` int64, its position (= tokens before it).
+        slots: ``[N]`` int64, the cache slot its k/v are written to.
+        block_tables: ``[N, W]`` int32, the sequence's blocks in order, then padding.
+        context_lens: ``[N]`` int32, tokens of the sequence so far, the new one included.
+    """
+
+    token_ids: torch.Tensor
+    positions: torch.Tensor
+    slots: torch.Tensor
+    block_tables: torch.Tensor
+    context_lens: torch.Tensor
+
+    @classmethod
+    def empty(cls, num_rows: int, width: int, device: torch.device | str) -> "DecodeInputs":
+        def zeros(*shape: int, dtype: torch.dtype = torch.int64) -> torch.Tensor:
+            return torch.zeros(shape, dtype=dtype, device=device)
+
+        return cls(
+            zeros(num_rows),
+            zeros(num_rows),
+            zeros(num_rows),
+            zeros(num_rows, width, dtype=torch.int32),
+            zeros(num_rows, dtype=torch.int32),
+        )
+
+    @property
+    def num_rows(self) -> int:
+        return self.token_ids.shape[0]
+
+    def head(self, n: int) -> "DecodeInputs":
+        """The first ``n`` rows, as views: same memory, so a fill shows through."""
+        return DecodeInputs(
+            self.token_ids[:n],
+            self.positions[:n],
+            self.slots[:n],
+            self.block_tables[:n],
+            self.context_lens[:n],
+        )
+
+
+def fill_decode_inputs(
+    dst: DecodeInputs, items: Sequence[tuple[int, BlockTable]], pad_block: int
+) -> None:
+    """Write B decode sequences into the first B rows of ``dst``; the rest become padding.
+
+    ``items`` are ``(new_token, table)`` pairs, the token already appended to the table.
+    Reads only each table's block list and length: no per-token slot list, unlike
+    ``build_batch``. A padding row is a one-token sequence on ``pad_block`` (the KV cache's
+    padding block): token 0 at position 0, written to and read from that block's first slot.
+    The values are built on the host and copied into ``dst`` in place.
+    """
+    n, width = dst.block_tables.shape
+    if not 0 < len(items) <= n:
+        raise ValueError(f"{len(items)} sequences do not fit {n} rows")
+    ints: list[list[int]] = []  # per row: token, position, slot, context length
+    blocks: list[list[int]] = []
+    for token, table in items:
+        total = table.num_tokens
+        if total < 1:
+            raise ValueError("the new token must already be appended to the table")
+        if len(table.blocks) > width:
+            raise ValueError(f"a sequence holds {len(table.blocks)} blocks, rows hold {width}")
+        ints.append([token, total - 1, table.slot(total - 1), total])
+        blocks.append(table.blocks + [pad_block] * (width - len(table.blocks)))
+    block_size = items[0][1].block_size
+    for _ in range(n - len(items)):
+        ints.append([0, 0, pad_block * block_size, 1])
+        blocks.append([pad_block] * width)
+    host = torch.tensor(ints, dtype=torch.int64)
+    dst.token_ids.copy_(host[:, 0])
+    dst.positions.copy_(host[:, 1])
+    dst.slots.copy_(host[:, 2])
+    dst.context_lens.copy_(host[:, 3])
+    dst.block_tables.copy_(torch.tensor(blocks, dtype=torch.int32))

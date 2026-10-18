@@ -106,7 +106,7 @@ def paged_decode_attention(
     """Decode attention for B sequences in one kernel launch.
 
     Same result as ``paged_decode_attention_ref`` (attention.py) within the tolerance in
-    tests/test_triton_attention.py.
+    tests/test_triton_attention.py. Checks its arguments, then calls ``launch_paged_decode``.
 
     Args:
         q: ``[B, Hq, D]``, each sequence's one new query, RoPE-rotated.
@@ -120,6 +120,24 @@ def paged_decode_attention(
 
     Returns:
         ``[B, Hq, D]`` in q's dtype.
+    """
+    check_decode_args(q, k_cache, v_cache, block_tables, context_lens, block_size)
+    return launch_paged_decode(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+
+
+def check_decode_args(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Raise ValueError if the kernel's arguments don't fit together.
+
+    The last check reads ``context_lens`` back to the host, which waits for the GPU (a
+    host sync). That is why it is separate from the launch: a CUDA graph (M8) cannot
+    capture a sync, and the graph path fills ``context_lens`` itself (batch.py).
     """
     b, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -139,6 +157,22 @@ def paged_decode_attention(
     if bool((context_lens < 1).any()):
         raise ValueError("every sequence needs at least one token")
 
+
+def launch_paged_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """The kernel launch alone: no checks and no host sync, so a CUDA graph can capture it.
+
+    Same arguments and result as ``paged_decode_attention``; the caller guarantees what
+    ``check_decode_args`` would check.
+    """
+    b, num_q_heads, head_dim = q.shape
     out = torch.empty_like(q)
     _paged_decode_kernel[(b, num_q_heads)](
         q, k_cache, v_cache, out, block_tables, context_lens,
@@ -147,7 +181,7 @@ def paged_decode_attention(
         out.stride(0), out.stride(1),
         k_cache.stride(0), k_cache.stride(1),
         block_tables.stride(0),
-        GROUP=num_q_heads // num_kv_heads,
+        GROUP=num_q_heads // k_cache.shape[1],
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
     )  # fmt: skip

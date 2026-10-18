@@ -61,10 +61,12 @@ def scattered_cache(
 
 
 def test_cache_shape_and_memory() -> None:
+    # 5 blocks for the allocator plus the padding block (M8): 6 blocks of 4 slots.
     c = KVCache(tiny_cfg(num_layers=3), num_blocks=5, block_size=4)
-    assert c.k.shape == c.v.shape == (3, 20, HKV, D)
+    assert c.k.shape == c.v.shape == (3, 24, HKV, D)
+    assert (c.num_blocks, c.num_slots, c.pad_block) == (5, 20, 5)
     assert c.k.dtype == torch.float16
-    assert c.memory_bytes == 2 * 3 * 20 * HKV * D * 2
+    assert c.memory_bytes == 2 * 3 * 24 * HKV * D * 2
 
 
 def test_write_lands_in_the_right_slots_only() -> None:

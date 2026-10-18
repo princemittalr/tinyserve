@@ -5,6 +5,11 @@ Each layer's cache is a flat array of token slots, ``[num_slots, Hkv, D]`` with
 slot; this class only stores and returns the vectors at those slots. Slot s belongs to
 block ``s // block_size``, so the same memory viewed as ``[num_blocks, block_size, Hkv, D]``
 is the block layout the Triton kernel (M4) will read.
+
+One extra block sits after the ``num_blocks`` the allocator hands out: the PADDING block
+(M8). A CUDA graph replays fixed shapes, so a decode step for 5 sequences may run as a
+batch of 8; the 3 padding rows write their k/v into this block and read it back, and
+never touch a block a sequence owns.
 """
 
 import torch
@@ -23,21 +28,22 @@ class KVCache:
     ) -> None:
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self.num_slots = num_blocks * block_size
-        shape = (cfg.num_layers, self.num_slots, cfg.num_kv_heads, cfg.head_dim)
+        self.num_slots = num_blocks * block_size  # slots the allocator's blocks cover
+        self.pad_block = num_blocks  # never allocated: see the module docstring
+        shape = (cfg.num_layers, self.num_slots + block_size, cfg.num_kv_heads, cfg.head_dim)
         self.k = torch.zeros(shape, dtype=dtype, device=device)
         self.v = torch.zeros(shape, dtype=dtype, device=device)
 
     @property
     def memory_bytes(self) -> int:
-        """Bytes held by the key and value tensors together."""
+        """Bytes held by the key and value tensors together, the padding block included."""
         return 2 * self.k.numel() * self.k.element_size()
 
     def write(self, layer: int, slots: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         """Store new keys and values: ``k[i]`` and ``v[i]`` go to slot ``slots[i]``.
 
         Args:
-            slots: ``[T]`` int64, from ``BlockTable.append``.
+            slots: ``[T]`` int64, from ``BlockTable.append`` (or the padding block's).
             k, v: ``[T, Hkv, D]``, already RoPE-rotated (k); cast to the cache dtype.
         """
         self.k[layer, slots] = k.to(self.k.dtype)

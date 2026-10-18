@@ -9,6 +9,9 @@ Two paths share the same layers and differ only in attention:
         tokens are flattened into one batch (see batch.py); only attention is per sequence.
         With ``decode_attention="triton"`` (M4), every sequence that brings one token is
         handled by one Triton kernel launch per layer instead of one PyTorch call each.
+    ``forward_decode`` (M8): a decode step with fixed shapes and no host syncs, from
+        buffers filled in advance (``DecodeInputs``), so a CUDA graph can capture it
+        (cuda_graphs.py). Same layers, same kernel; only how the inputs arrive differs.
 """
 
 from collections.abc import Callable
@@ -18,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from tinyserve.attention import causal_gqa_attention, paged_gqa_attention
-from tinyserve.batch import Batch
+from tinyserve.batch import Batch, DecodeInputs
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.block_table import BlockTable
 from tinyserve.config import ModelConfig
@@ -48,10 +51,12 @@ class Qwen3:
         self.cfg = cfg
         self.w = weights
         self.decode_kernel: DecodeFn | None = None
+        self.decode_launch: DecodeFn | None = None  # the same kernel without its checks
         if decode_attention == "triton":
-            from tinyserve.triton_attention import paged_decode_attention
+            from tinyserve.triton_attention import launch_paged_decode, paged_decode_attention
 
             self.decode_kernel = paged_decode_attention
+            self.decode_launch = launch_paged_decode
         elif decode_attention != "torch":
             raise ValueError(f"decode_attention must be 'torch' or 'triton': {decode_attention!r}")
         # Tied embeddings: the output projection reuses the input embedding matrix.
@@ -180,6 +185,30 @@ class Qwen3:
             return out
 
         return self._run(batch.token_ids, batch.positions, attend, rows=batch.last_rows)
+
+    @torch.inference_mode()
+    def forward_decode(self, inputs: DecodeInputs, cache: KVCache) -> torch.Tensor:
+        """One decode step for every row of ``inputs``: ``[N, vocab]`` float32 logits.
+
+        Row r predicts the next token of the sequence in row r; padding rows give logits
+        nobody reads. Nothing here waits for the GPU or depends on a Python value that
+        changes between steps: the shapes are fixed by the buffers, and every per-step value
+        (tokens, positions, slots, block tables, lengths) is read from them on the device.
+        That is what lets a CUDA graph record this once and replay it (cuda_graphs.py).
+        Needs ``decode_attention="triton"``; ``fill_decode_inputs`` guarantees what the
+        kernel's skipped checks would check.
+        """
+        launch = self.decode_launch
+        if launch is None:
+            raise ValueError('forward_decode needs decode_attention="triton"')
+        scale = self.cfg.head_dim**-0.5
+
+        def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            cache.write(i, inputs.slots, k, v)
+            ki, vi, bs = cache.k[i], cache.v[i], cache.block_size
+            return launch(q, ki, vi, inputs.block_tables, inputs.context_lens, scale, bs)
+
+        return self._run(inputs.token_ids, inputs.positions, attend)
 
 
 def greedy_generate(
