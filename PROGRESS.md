@@ -5,7 +5,7 @@
 | Milestone | Status |
 |---|---|
 | M0 Repo scaffold | done (2026-10-17) |
-| M1 Forward pass, token-identical to HF | in progress (step 6: full model + greedy; step 7: HF comparison) |
+| M1 Forward pass, token-identical to HF | in progress (step 7: HF comparison on 120 prompts; result pending) |
 | M2 Paged KV cache and allocator | not started |
 | M3 Continuous batching and benchmark harness | not started |
 | M4 Triton paged-attention kernel | not started |
@@ -23,7 +23,8 @@
 - M1 step 3: spec tests and skeletons for `rms_norm`, `rope_cos_sin`, `apply_rope` in `layers.py`. I attempted it, got stuck, and used the mentor's solution; I can explain each line.
 - M1 step 4: SwiGLU MLP (`swiglu_mlp`), 5 spec tests; the three blanks were answered by the mentor.
 - M1 step 5: reference causal grouped-query attention (`attention.py`), 8 spec tests incl. a match against PyTorch SDPA. Blank answers came from the mentor.
-- M1 step 6: `Qwen3` forward pass (28 layers, no KV cache) and `greedy_generate`; tiny-random-model tests; `scripts/generate.py` demo.
+- M1 step 6: `Qwen3` forward pass (28 layers, no KV cache) and `greedy_generate`; tiny-random-model tests; `scripts/generate.py` demo. First real run (2026-10-18, laptop CPU, fp32): "The capital of France is" -> " Paris. The capital of Italy is Rome. ...", 20 tokens in 6.8 s.
+- M1 step 7: HF parity tests on a tiny random Qwen3 (run in CI); `scripts/compare_hf.py` + 120 prompts for the real-model acceptance run. Config now also reads the newer `rope_parameters` layout.
 
 ## Design decisions
 
@@ -48,6 +49,8 @@
 - GQA maps query head h to kv head h // (Hq/Hkv) (`repeat_interleave`, not `repeat`): that is how Qwen3 groups heads.
 - M1 has no KV cache: each step re-runs the whole sequence (O(n^2)). Simplest correct baseline; M2 replaces it.
 - Qwen3 applies q_norm/k_norm per head before RoPE; the output head reuses the embedding matrix (tied).
+- M1 acceptance is measured in fp32 on CPU: it isolates algorithm bugs from fp16 kernel rounding, which is a separate question for the GPU milestones.
+- `transformers` is a dev-only dependency used as the reference in tests; tinyserve never imports it.
 - CI installs CPU-only torch: no GPU there, and the default Linux wheel pulls ~3 GB of CUDA libraries.
 
 ## Environment
@@ -60,6 +63,8 @@
 None yet.
 
 ## Open questions
+
+- Greedy parity in fp16 on the T4: expect rare near-tie flips; decide the tolerance policy when GPU work starts.
 
 - Resolved 2026-10-17: torch 2.14.1 on PyPI has a cp314 win_amd64 wheel.
 - Dev tools use `>=` ranges, so CI may get a newer ruff than the laptop. Pin exact versions if that ever breaks CI.

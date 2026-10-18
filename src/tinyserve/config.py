@@ -49,6 +49,14 @@ class ModelConfig:
             raise UnsupportedConfigError("attention_bias=True is not supported")
         if d.get("rope_scaling") is not None:
             raise UnsupportedConfigError(f"rope_scaling={d['rope_scaling']!r} is not supported")
+        # Newer transformers versions write {"rope_parameters": {"rope_theta": ...}} instead
+        # of a top-level "rope_theta"; the Hub's Qwen3 checkpoints use the older form.
+        rope = d.get("rope_parameters") or {}
+        if rope.get("rope_type", "default") != "default":
+            raise UnsupportedConfigError(f"rope_parameters={rope!r} is not supported")
+        rope_theta = d.get("rope_theta") or rope.get("rope_theta")
+        if rope_theta is None:
+            raise UnsupportedConfigError("config has no rope_theta")
 
         cfg = cls(
             vocab_size=int(d["vocab_size"]),
@@ -60,7 +68,7 @@ class ModelConfig:
             # Qwen3 sets head_dim explicitly; it is NOT hidden_size // num_heads in general.
             head_dim=int(d.get("head_dim", d["hidden_size"] // d["num_attention_heads"])),
             rms_norm_eps=float(d["rms_norm_eps"]),
-            rope_theta=float(d["rope_theta"]),
+            rope_theta=float(rope_theta),
             max_position_embeddings=int(d["max_position_embeddings"]),
             tie_word_embeddings=bool(d.get("tie_word_embeddings", False)),
         )

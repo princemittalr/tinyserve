@@ -1,0 +1,116 @@
+"""M1 acceptance test: greedy tokens from TinyServe vs Hugging Face generate().
+
+Both run the same checkpoint in float32 on CPU, from the same token ids. For each prompt
+we compare the generated token lists exactly. On a mismatch we report where the two
+diverge and HF's top-2 logit margin there: a tiny margin means a near-tie that float
+rounding can flip, a large margin means a real bug.
+
+Usage:
+    python scripts/compare_hf.py --limit 5        # quick smoke run
+    python scripts/compare_hf.py                  # all prompts (slow on CPU: no KV cache yet)
+"""
+
+import argparse
+import datetime as dt
+import json
+import platform
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+from tokenizers import Tokenizer
+from transformers import AutoModelForCausalLM
+
+from tinyserve.config import ModelConfig
+from tinyserve.model import Qwen3, greedy_generate
+from tinyserve.weights import load_weights
+
+
+def read_prompts(path: Path) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [ln.replace("\\n", "\n") for ln in lines if ln.strip()]
+
+
+def eos_ids(model_dir: Path) -> list[int]:
+    path = model_dir / "generation_config.json"
+    if not path.exists():
+        return []
+    eos = json.loads(path.read_text(encoding="utf-8")).get("eos_token_id", [])
+    return eos if isinstance(eos, list) else [eos]
+
+
+@torch.inference_mode()
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
+    parser.add_argument("--prompts", type=Path, default=Path("benchmarks/prompts/m1_greedy.txt"))
+    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--out", type=Path, default=Path("results/m1_hf_compare.json"))
+    args = parser.parse_args()
+
+    torch.set_num_threads(max(1, torch.get_num_threads()))
+    cfg = ModelConfig.from_file(args.model_dir / "config.json")
+    ours = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype=torch.float32))
+    hf: Any = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.float32)
+    hf.eval()
+    tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
+    eos = eos_ids(args.model_dir)
+
+    prompts = read_prompts(args.prompts)[: args.limit]
+    rows, max_prefill_diff, start = [], 0.0, time.perf_counter()
+    for n, text in enumerate(prompts, 1):
+        ids = tok.encode(text).ids
+        x = torch.tensor(ids)
+        prefill_diff = (ours.forward(x) - hf(x[None]).logits[0].float()).abs().max().item()
+        max_prefill_diff = max(max_prefill_diff, prefill_diff)
+
+        full = hf.generate(
+            x[None],
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+            eos_token_id=eos or None,
+            pad_token_id=eos[0] if eos else None,
+        )
+        expected = full[0, len(ids) :].tolist()
+        got = greedy_generate(ours, ids, args.max_new_tokens, frozenset(eos))
+
+        row: dict[str, object] = {
+            "prompt": text,
+            "match": got == expected,
+            "n_tokens": len(expected),
+        }
+        if got != expected:
+            k = next(
+                (i for i, (a, b) in enumerate(zip(got, expected, strict=False)) if a != b), None
+            )
+            k = min(len(got), len(expected)) if k is None else k
+            top2 = hf(torch.tensor(ids + expected[:k])[None]).logits[0, -1].float().topk(2).values
+            row |= {"diverge_at": k, "hf_top2_margin": (top2[0] - top2[1]).item(),
+                    "ours": got, "hf": expected}  # fmt: skip
+        rows.append(row)
+        print(f"[{n}/{len(prompts)}] {'OK  ' if row['match'] else 'DIFF'} {text[:50]!r}")
+
+    mismatches = [r for r in rows if not r["match"]]
+    summary = {
+        "date": dt.date.today().isoformat(),
+        "hardware": f"{platform.system()} {platform.machine()} CPU, torch {torch.__version__}",
+        "dtype": "float32",
+        "prompts": len(rows),
+        "max_new_tokens": args.max_new_tokens,
+        "tokens_compared": sum(int(str(r["n_tokens"])) for r in rows),
+        "mismatches": len(mismatches),
+        "max_prefill_logit_abs_diff": max_prefill_diff,
+        "seconds": round(time.perf_counter() - start, 1),
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps({"summary": summary, "rows": rows}, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    for r in mismatches:
+        print(f"MISMATCH {r['prompt']!r}: diverges at token {r['diverge_at']}, "
+              f"HF top-2 margin {r['hf_top2_margin']:.4f}")  # fmt: skip
+
+
+if __name__ == "__main__":
+    main()

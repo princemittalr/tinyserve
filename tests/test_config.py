@@ -54,8 +54,15 @@ def test_from_file(tmp_path: Path) -> None:
         {"attention_bias": True},
         {"rope_scaling": {"type": "yarn", "factor": 4.0}},
         {"num_key_value_heads": 3},
+        {"rope_theta": None, "rope_parameters": {"rope_type": "yarn", "rope_theta": 1e6}},
+        {"rope_theta": None},
     ],
 )
 def test_rejects_unsupported(override: dict[str, Any]) -> None:
     with pytest.raises(UnsupportedConfigError):
         ModelConfig.from_dict(TINY | override)
+
+
+def test_rope_theta_from_newer_rope_parameters_layout() -> None:
+    d = TINY | {"rope_theta": None, "rope_parameters": {"rope_type": "default", "rope_theta": 5e5}}
+    assert ModelConfig.from_dict(d).rope_theta == 5e5

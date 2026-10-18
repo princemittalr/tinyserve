@@ -34,6 +34,10 @@ None yet. Every number here will come from a logged run with date and hardware.
 - The weight loader is tested on small synthetic checkpoints (missing, unexpected, misshapen
   and fp16-overflowing tensors). `tests/test_real_checkpoint.py` checks the real Qwen3-0.6B
   files when `TINYSERVE_MODEL_DIR` is set.
+- `tests/test_hf_parity.py` builds a tiny random Qwen3 with Hugging Face transformers, saves it,
+  loads it through TinyServe's own loader, and checks logits and greedy tokens match (runs in CI).
+- `scripts/compare_hf.py` compares greedy tokens with HF `generate()` on the real Qwen3-0.6B over
+  120 prompts (`benchmarks/prompts/m1_greedy.txt`).
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations

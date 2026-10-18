@@ -1,0 +1,120 @@
+The capital of France is
+The largest planet in the solar system is
+Water boils at a temperature of
+The chemical symbol for gold is
+The speed of light in a vacuum is approximately
+Photosynthesis is the process by which plants
+The first person to walk on the moon was
+The Great Wall of China was built to
+DNA stands for
+The theory of relativity was developed by
+The tallest mountain on Earth is
+The longest river in Africa is
+An atom consists of
+The French Revolution began in the year
+Gravity is the force that
+The human heart has four chambers called
+The Pacific Ocean is the
+Shakespeare wrote a play called
+The currency of Japan is the
+Mount Everest is located in
+In computer science, a hash table is
+A binary search tree is a data structure where
+The time complexity of merge sort is
+In Python, a list comprehension lets you
+A mutex is used to
+TCP differs from UDP because
+The difference between a process and a thread is
+Recursion is when a function
+A GPU is faster than a CPU for matrix multiplication because
+The purpose of a compiler is to
+def fibonacci(n):
+def is_prime(n):
+import numpy as np
+for i in range(10):
+class Stack:
+SELECT name FROM users WHERE
+#include <stdio.h>
+int main() {
+git commit -m
+The output of print(2 ** 10) is
+2 + 2 =
+The square root of 144 is
+If x + 3 = 10, then x =
+The derivative of x squared is
+A triangle with sides 3, 4 and 5 is
+The sum of the angles in a triangle is
+Pi is approximately equal to
+Ten percent of 250 is
+The next number in the sequence 2, 4, 8, 16 is
+A prime number is a number that
+Once upon a time, in a small village,
+The old man looked out of the window and
+It was a dark and stormy night when
+She opened the letter and read
+The robot woke up for the first time and
+In the year 2100, cities will
+The dragon flew over the mountains and
+He had never seen the ocean before, so
+The detective examined the room and noticed
+The little girl asked her mother why
+To make a cup of tea, first
+The best way to learn a new language is
+Here are three tips for better sleep:
+A good resume should include
+To change a flat tire, you need to
+Exercise is important because
+The main ingredients of pizza are
+When writing an email to a professor, you should
+To stay focused while studying,
+The benefits of reading every day include
+Dear Sir or Madam, I am writing to
+Thank you for your message. I will
+Question: What is the capital of Germany? Answer:
+Question: Who painted the Mona Lisa? Answer:
+Question: How many legs does a spider have? Answer:
+Q: What is 7 times 8? A:
+Translate to French: Good morning. ->
+Translate to Spanish: Thank you very much. ->
+Summarize: The meeting was moved from Monday to Wednesday because the manager was ill.
+List the days of the week:
+The colors of the rainbow are
+The planets in order from the sun are
+A haiku about autumn:
+Roses are red, violets are blue,
+The quick brown fox
+To be or not to be,
+Four score and seven years ago
+Machine learning is a field of study that
+A neural network is made of
+Gradient descent works by
+Overfitting happens when a model
+The attention mechanism in transformers
+A large language model predicts
+Tokenization is the process of
+The KV cache in a transformer stores
+Batching requests on a GPU improves throughput because
+Quantization reduces model size by
+भारत की राजधानी है
+日本の首都は
+La capital de España es
+Die Hauptstadt von Italien ist
+Le soleil se lève à
+1, 2, 3, 4, 5,
+a, b, c, d,
+Monday, Tuesday, Wednesday,
+January, February, March,
+red, orange, yellow,
+The weather today is
+I think the most important skill for an engineer is
+My favourite book is
+If I could travel anywhere, I would go to
+The meaning of life is
+The best programming language for beginners is
+In my opinion, social media
+Climate change is caused by
+Electric cars are becoming popular because
+The internet was invented to
+<|im_start|>user\nWhat is 15 + 27?<|im_end|>\n<|im_start|>assistant\n
+<|im_start|>user\nName three fruits.<|im_end|>\n<|im_start|>assistant\n
+The three states of matter are

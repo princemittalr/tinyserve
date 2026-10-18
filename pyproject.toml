@@ -24,6 +24,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "pre-commit>=3.7",
+    # Reference implementation for correctness tests only; tinyserve never imports it.
+    "transformers>=4.51",
 ]
 
 [tool.hatch.build.targets.wheel]
