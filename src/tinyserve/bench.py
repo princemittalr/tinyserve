@@ -15,7 +15,29 @@ import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 
+import torch
+
 from tinyserve.engine import Engine
+
+# Qwen3's special tokens (<|im_start|>, <|endoftext|>, ...) start at id 151,643.
+MAX_PROMPT_TOKEN_ID = 150_000
+
+
+def synthetic_prompts(num: int, length: int, vocab_size: int, seed: int = 0) -> list[list[int]]:
+    """``num`` prompts of ``length`` random token ids, the same for a given seed.
+
+    Shared by our benchmark and the HF baseline, so both run exactly the same inputs.
+    """
+    high = min(vocab_size, MAX_PROMPT_TOKEN_ID)
+    g = torch.Generator().manual_seed(seed)
+    ids: list[list[int]] = torch.randint(0, high, (num, length), generator=g).tolist()
+    return ids
+
+
+def num_requests_for(concurrency: int, requested: int | None = None) -> int:
+    """Requests per run: ``requested`` if given, else 4 per slot (at least 16), so every
+    level runs several "waves" of requests rather than one."""
+    return requested if requested is not None else max(16, 4 * concurrency)
 
 
 def percentile(values: Sequence[float], p: float) -> float:

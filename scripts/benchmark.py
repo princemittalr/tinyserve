@@ -1,8 +1,10 @@
 """M3 benchmark: output tok/s, TTFT and TPOT p50/p99 and KV utilization vs concurrency.
 
-Synthetic workload: ``--num-requests`` random-token prompts of ``--input-len`` tokens,
-each generating exactly ``--output-len`` tokens (no EOS), run closed-loop at each
-concurrency (see tinyserve/bench.py). Same seed, same prompts for every concurrency.
+Synthetic workload: random-token prompts of ``--input-len`` tokens, each generating
+exactly ``--output-len`` tokens (no EOS), run closed-loop at each concurrency (see
+tinyserve/bench.py). ``--num-requests`` per level defaults to 4 per concurrency slot (at
+least 16). Every level uses the first N prompts of the same seeded list, and
+scripts/bench_hf.py runs the same prompts through HF generate() as the baseline.
 
 Usage:
     python scripts/benchmark.py --device cuda --dtype float16          # T4 (Kaggle)
@@ -19,7 +21,7 @@ from pathlib import Path
 
 import torch
 
-from tinyserve.bench import run_closed_loop
+from tinyserve.bench import num_requests_for, run_closed_loop, synthetic_prompts
 from tinyserve.config import ModelConfig
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
@@ -40,7 +42,8 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
     parser.add_argument("--concurrency", default="1,8,32,64")
-    parser.add_argument("--num-requests", type=int, default=128)
+    parser.add_argument("--num-requests", type=int, default=None,
+                        help="per level; default: max(16, 4 x concurrency)")  # fmt: skip
     parser.add_argument("--input-len", type=int, default=128)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=16)
@@ -56,9 +59,8 @@ def main() -> None:
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, args.device))
-    g = torch.Generator().manual_seed(args.seed)
-    vocab = min(cfg.vocab_size, 150_000)  # stay below Qwen3's special-token ids
-    prompts = torch.randint(0, vocab, (args.num_requests, args.input_len), generator=g).tolist()
+    most = max(num_requests_for(c, args.num_requests) for c in levels)
+    prompts = synthetic_prompts(most, args.input_len, cfg.vocab_size, args.seed)
 
     per_seq = -(-(args.input_len + args.output_len) // args.block_size)
     num_blocks = args.num_blocks or per_seq * max(levels)
@@ -72,7 +74,8 @@ def main() -> None:
     run_closed_loop(engine(2), prompts[:2], 4, concurrency=2)  # warm-up, not reported
     results = []
     for c in levels:
-        r = run_closed_loop(engine(c), prompts, args.output_len, concurrency=c)
+        n = num_requests_for(c, args.num_requests)
+        r = run_closed_loop(engine(c), prompts[:n], args.output_len, concurrency=c)
         results.append(r.as_dict())
         tpot = "-"
         if r.tpot_p50_ms is not None and r.tpot_p99_ms is not None:

@@ -36,6 +36,7 @@
 - M3 step 3: `Engine` (`engine.py`, written by the mentor; serving-loop plumbing): each step runs `schedule()`, one `forward_batch` and `update()`, and records when every output token came out (TTFT, TPOT) plus KV-cache utilization per step. 8 tests: outputs match M1 greedy with a roomy cache, one sequence at a time, and a tight cache that forces preemptions; requests can join mid-run; finished requests leave at once; EOS; timing bookkeeping. `compare_hf.py --engine batched` runs every prompt through the engine at once.
 - M3 step 3 check (real model): all 120 prompts through the engine at once (max 32 in flight) give HF's greedy tokens exactly (see Benchmark results).
 - M3 step 4: benchmark harness, written by the mentor (benchmark plumbing): `bench.py` (closed-loop driver at a fixed concurrency; output tok/s, TTFT and TPOT p50/p99, KV utilization mean/max; `percentile` checked against numpy by Hypothesis) and `scripts/benchmark.py` (synthetic random-token workload, concurrency 1/8/32/64, JSON report). 10 tests. No GPU numbers yet: the first T4 run is the next step.
+- M3 step 5: `scripts/bench_hf.py`, the HF `generate()` baseline on the same seeded prompts (static batches of C, fp16 on the T4), and Kaggle notebook cells for the first T4 run. `synthetic_prompts` and `num_requests_for` moved into `bench.py` so both scripts run exactly the same inputs; requests per level default to 4 per concurrency slot (at least 16). Written by the mentor (benchmark plumbing). 2 new tests.
 
 ## Design decisions
 
@@ -91,6 +92,8 @@
 - Benchmark requests ignore EOS and all produce exactly `--output-len` tokens: runs at different concurrencies (and against HF) do the same work.
 - Benchmark prompts are random token ids from a fixed seed: the work per request is exact and reproducible; the text content does not change the cost of a forward pass.
 - TPOT is averaged per request first, then p50/p99 are taken across requests: one number per request, so long requests don't dominate the percentiles.
+- HF baseline is static batching (batches of C run to completion) with the same prompts and fixed output length: that is what `generate()` offers, and identical inputs make the throughput comparison fair. Only tok/s is compared; HF's per-token times are not observable.
+- Requests per benchmark level scale with concurrency (4 per slot, at least 16): concurrency 64 runs several waves, and concurrency 1 does not take an hour.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment

@@ -9,7 +9,13 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from tests.test_model import CFG, tiny_model
-from tinyserve.bench import percentile, run_closed_loop
+from tinyserve.bench import (
+    MAX_PROMPT_TOKEN_ID,
+    num_requests_for,
+    percentile,
+    run_closed_loop,
+    synthetic_prompts,
+)
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.sequence import Sequence
@@ -87,3 +93,18 @@ def test_single_token_requests_have_no_tpot() -> None:
 def test_concurrency_must_be_positive() -> None:
     with pytest.raises(ValueError):
         run_closed_loop(make_engine(), PROMPTS, 3, concurrency=0)
+
+
+def test_synthetic_prompts_are_reproducible_and_avoid_special_tokens() -> None:
+    a = synthetic_prompts(5, 7, vocab_size=151_936, seed=3)
+    assert a == synthetic_prompts(5, 7, vocab_size=151_936, seed=3)
+    assert a != synthetic_prompts(5, 7, vocab_size=151_936, seed=4)
+    assert len(a) == 5 and all(len(p) == 7 for p in a)
+    assert all(0 <= t < MAX_PROMPT_TOKEN_ID for p in a for t in p)
+    assert all(t < 64 for p in synthetic_prompts(5, 7, vocab_size=64) for t in p)
+
+
+def test_num_requests_defaults_to_four_waves_and_at_least_sixteen() -> None:
+    assert num_requests_for(1) == 16
+    assert num_requests_for(32) == 128
+    assert num_requests_for(64, requested=10) == 10
