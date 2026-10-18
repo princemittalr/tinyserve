@@ -6,11 +6,24 @@ contiguous slab of memory. It gets blocks one at a time as it grows, and they ca
 anywhere in the big tensor. So no memory is reserved for tokens that were never
 generated, and a finished sequence's blocks go straight back to the pool.
 
-This file only does the bookkeeping: which block ids are free and which are in use.
+M5 adds sharing. Two requests with the same prompt prefix compute the same keys and
+values for it, so the prefix cache lets the second one point at the first one's blocks
+instead of recomputing them. A block can then have several owners (sequences, and the
+prefix cache itself), so the allocator counts them:
+
+    allocate(n)   each new block starts with 1 reference
+    share(blocks) one more owner for each block (it must already be in use)
+    free(blocks)  one owner fewer; a block goes back to the pool when its count hits 0
+
+Shared blocks are never written to: only full blocks are shared, and a sequence only
+ever writes past its last token, so it writes into blocks it alone owns.
+
+This file only does the bookkeeping: which block ids are free and who holds the rest.
 It never touches a tensor. Block ids are plain ints ``0 .. num_blocks - 1``.
 
 ``tests/test_block_allocator.py`` is the spec. Its property tests are M2's acceptance
-criteria: no block is ever handed out twice, a double free is caught, and no block leaks.
+criteria (no block handed out twice, double free caught, no leak), plus M5's: a shared
+block stays in use until its last owner frees it.
 """
 
 
@@ -23,17 +36,17 @@ class OutOfBlocksError(RuntimeError):
 
 
 class BlockAllocator:
-    """Hands out and takes back KV-cache block ids.
+    """Hands out and takes back KV-cache block ids, counting each block's owners.
 
     Data structures:
         ``_free``: a list used as a stack of free block ids. ``pop()`` and ``append()`` at
             the end are O(1). A freshly built allocator hands out 0, 1, 2, ... in order,
             so the stack starts as ``[num_blocks - 1, ..., 1, 0]`` (0 on top).
-        ``_used``: a set of the block ids currently handed out. ``in`` is O(1), which is
-            what makes the double-free check cheap.
+        ``_refs``: block id -> number of owners, for every block currently handed out.
+            ``in`` and updates are O(1), which keeps the double-free check cheap.
 
     Invariant, true after every public call: every id ``0 .. num_blocks - 1`` is in exactly
-    one of ``_free`` and ``_used``.
+    one of ``_free`` and ``_refs``, and every count in ``_refs`` is at least 1.
     """
 
     def __init__(self, num_blocks: int) -> None:
@@ -41,7 +54,7 @@ class BlockAllocator:
             raise ValueError(f"num_blocks must be positive, got {num_blocks}")
         self.num_blocks = num_blocks
         self._free: list[int] = list(range(num_blocks - 1, -1, -1))
-        self._used: set[int] = set()
+        self._refs: dict[int, int] = {}
 
     @property
     def num_free(self) -> int:
@@ -49,10 +62,15 @@ class BlockAllocator:
 
     @property
     def num_used(self) -> int:
-        return len(self._used)
+        """Blocks with at least one owner (a shared block counts once)."""
+        return len(self._refs)
+
+    def ref_count(self, block: int) -> int:
+        """Owners of ``block`` right now; 0 if it is free."""
+        return self._refs.get(block, 0)
 
     def allocate(self, n: int) -> list[int]:
-        """Take ``n`` free blocks and return their ids.
+        """Take ``n`` free blocks and return their ids, each with 1 reference.
 
         All or nothing: if fewer than ``n`` blocks are free, raise ``OutOfBlocksError``
         and change nothing. ``n == 0`` returns ``[]``. Negative ``n`` is a ``ValueError``.
@@ -60,30 +78,44 @@ class BlockAllocator:
         """
         if n < 0:
             raise ValueError(f"cannot allocate {n} blocks")
-        # TODO(you) 1: when must we refuse? Compare n with the number of free blocks.
         if n > self.num_free:
             raise OutOfBlocksError(f"asked for {n} blocks, only {self.num_free} free")
-        # TODO(you) 2: take n ids off the top of the free stack (list.pop() takes the last one).
         blocks = [self._free.pop() for _ in range(n)]
-        # TODO(you) 3: remember that these ids are now in use (set.update adds many at once).
-        self._used.update(blocks)
+        for b in blocks:
+            self._refs[b] = 1
         return blocks
 
-    def free(self, blocks: list[int]) -> None:
-        """Give blocks back to the pool.
+    def share(self, blocks: list[int]) -> None:
+        """Add one owner to each block, e.g. a new sequence reusing a cached prefix.
 
-        All or nothing: if any id is not currently in use (never allocated, already freed,
-        or out of range), or the same id appears twice in ``blocks``, raise ``ValueError``
-        and change nothing. Cost: O(len(blocks)).
+        All or nothing: every id must be in use (you cannot share a free block: its
+        contents are garbage and it could be handed out at any time), and no id may
+        appear twice; otherwise raise ``ValueError`` and change nothing.
+        Cost: O(len(blocks)).
+        """
+        if len(set(blocks)) != len(blocks):
+            raise ValueError(f"duplicate block ids in share(): {blocks}")
+        for b in blocks:
+            if b not in self._refs:
+                raise ValueError(f"cannot share a block that is not in use: {b}")
+        for b in blocks:
+            self._refs[b] += 1
+
+    def free(self, blocks: list[int]) -> None:
+        """Drop one owner from each block; blocks nobody owns go back to the pool.
+
+        All or nothing: if any id is not currently in use (never allocated, already freed
+        by its last owner, or out of range), or the same id appears twice in ``blocks``,
+        raise ``ValueError`` and change nothing. Cost: O(len(blocks)).
         """
         if len(set(blocks)) != len(blocks):
             raise ValueError(f"duplicate block ids in free(): {blocks}")
         # Check every id BEFORE changing anything, so a bad call cannot half-free a list.
         for b in blocks:
-            # TODO(you) 4: a block may only be freed if it is currently in use.
-            if b not in self._used:
+            if b not in self._refs:
                 raise ValueError(f"double free or unknown block: {b}")
         for b in blocks:
-            # TODO(you) 5: move b from the used set back onto the free stack (two lines).
-            self._used.remove(b)
-            self._free.append(b)
+            self._refs[b] -= 1
+            if self._refs[b] == 0:
+                del self._refs[b]
+                self._free.append(b)

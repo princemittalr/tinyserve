@@ -9,7 +9,7 @@
 | M2 Paged KV cache and allocator | done (2026-10-18): property tests pass; 0 mismatches / 1,920 tokens with the cache |
 | M3 Continuous batching and benchmark harness | done (2026-10-18): 0 mismatches / 1,920 tokens batched; T4 benchmark recorded (below HF throughput, see results) |
 | M4 Triton paged-attention kernel | done (2026-10-18): matches the PyTorch reference within 1e-5 (fp32) / 1e-3 (fp16); 18.5x faster decode forward at C=64; 1,168 tok/s at C=64 (2.59x HF) |
-| M5 Radix prefix cache | not started |
+| M5 Radix prefix cache | in progress |
 | M6 Streaming API | not started |
 | M7 Profiling and write-up | not started |
 
@@ -47,6 +47,9 @@
 - M4 step 3: the kernel in the engine (written by the mentor; wiring). `Qwen3(..., decode_attention="triton")` sends every one-token sequence of a `forward_batch` through one kernel launch per layer; prefill sequences keep the per-sequence PyTorch path; a pure decode batch passes q straight through. `Batch` now carries `block_tables` (int32, padded with 0) and `context_lens`. `profile_step.py --kernel` times the kernel path next to the PyTorch one; `benchmark.py --attention triton` and `compare_hf.py --device cuda --attention triton` run the benchmark and the fp16 greedy check with the kernel. 8 tests (CPU via the interpreter): logits equal the PyTorch path for all-decode, mixed and all-prefill batches; the engine with the kernel matches M1 greedy with a roomy cache, one sequence at a time and with preemptions.
 - M4 step 3 result (Kaggle T4, fp16): see Benchmark results. Decode forward at 192 cached tokens: 32.8 / 33.9 / 34.3 / 40.0 ms with the kernel vs 40.4 / 118.1 / 385.1 / 740.0 ms without, at C = 1 / 8 / 32 / 64 (1.2x / 3.5x / 11.2x / 18.5x). Engine throughput 28.7 / 216.1 / 716.0 / 1,168.2 tok/s (1.14x / 1.12x / 1.72x / 2.59x HF). fp16 greedy vs HF fp16 on 120 prompts x 16 tokens: 7 prompts diverge with the kernel, 6 without (the same 6, plus one); every divergence is at an HF top-2 logit margin of 0.0156 or less.
 - M4 closed: the kernel matches the PyTorch reference within the stated tolerance across head groupings, block sizes, lengths and dtypes (18 tests, on CPU in CI and on the T4), and its speedup is measured (step 3). The >= 3x HF target at C=32 is still not met (1.72x); the profile says why (see analysis).
+- M4 follow-up (Kaggle T4, after closing M4): greedy parity in fp32 with the kernel, 0 mismatches / 1,920 tokens (see Benchmark results). The kernel itself is exact; the fp16 flips are rounding.
+- M5 plan: (1) reference counts in the block allocator, so blocks can be shared; (2) the radix tree over token blocks with LRU eviction (pure Python, blanks + property tests); (3) the scheduler reuses cached prefixes at admission, caches finished and preempted sequences' blocks, and evicts before it preempts; (4) a shared-prefix benchmark workload and the T4 TTFT measurement with the cache on and off, plus greedy parity with the cache on.
+- M5 step 1: `BlockAllocator` counts each block's owners (`_refs` dict replaces the `_used` set): `allocate` starts each block at 1, new `share()` adds an owner (only to blocks in use, all-or-nothing), `free` drops one and returns a block to the pool when its count reaches 0; `ref_count()`. 5 blanks; the mentor gave the answers with the step. 8 new unit tests and a second Hypothesis state machine (owners adopt the first k blocks of other owners; every block's count must equal its number of holders, no leak). The M2 tests are unchanged and still pass.
 
 ## Design decisions
 
@@ -115,6 +118,8 @@
 - Mixed batches split by sequence: one-token sequences go to the kernel, longer ones (prefill) to the PyTorch path, and both write into one output tensor by row; prefill is a minority of steps at steady state.
 - fp16 greedy parity on the T4 is judged against the same check without the kernel, not against zero: fp16 rounding flips near-ties (margins of 0 to 1 fp16 step) in both paths, so the kernel is accepted if it adds only near-tie flips. Exact parity is measured in fp32.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
+- M5: reference counts live in the block allocator (`share` / `free`), not in the prefix cache: the allocator is the one place that decides when a block is really free, so a sequence, the cache, or both can hold a block and it returns to the pool exactly when the last one lets go (vLLM v1 also keeps `ref_cnt` per block).
+- M5: only full blocks are shared, never a sequence's partly filled last block: a sequence only writes past its last token, so shared blocks are never written and no copy-on-write is needed.
 
 ## Environment
 
@@ -135,9 +140,10 @@
 | 2026-10-18 | Kaggle Tesla T4, torch 2.11.0+cu128, fp16, block size 16 | M4 step 1 profile: one decode forward, every sequence with 192 cached tokens (`scripts/profile_step.py`) | forward / without attention: C=1 41.2 / 28.2 ms (attention 32%); C=8 113.1 / 29.2 ms (74%); C=32 377.3 / 35.3 ms (91%); C=64 713.6 / 42.5 ms (94%). C=64 under torch.profiler: 227,499 aten op calls, 30,603 kernel launches, GPU busy 241.8 ms of 1,353.6 ms wall (18%) |
 | 2026-10-18 | Kaggle Tesla T4, torch 2.11.0+cu128, fp16, block size 16 | M4 step 3: decode forward with the Triton kernel vs PyTorch, 192 cached tokens (`scripts/profile_step.py --kernel`) | kernel / PyTorch: C=1 32.8 / 40.4 ms (1.2x); C=8 33.9 / 118.1 ms (3.5x); C=32 34.3 / 385.1 ms (11.2x); C=64 40.0 / 740.0 ms (18.5x). C=64 with the kernel under torch.profiler: 5,609 aten op calls, 1,962 kernel launches (was 30,603), GPU busy 30.0 ms of 67.5 ms wall (44%); the kernel itself is 16.9 ms of GPU time (56%) |
 | 2026-10-18 | Kaggle Tesla T4, torch 2.11.0+cu128, fp16, block size 16, 1,024 blocks, max 2,048 batch tokens | TinyServe engine with the Triton kernel, same workload as M3 (`scripts/benchmark.py --attention triton`) | C=1: 28.7 tok/s, TTFT p50/p99 44/70 ms, TPOT p50/p99 34.8/36.3 ms; C=8: 216.1 tok/s, TTFT 134/142 ms, TPOT 36.4/36.8 ms; C=32: 716.0 tok/s, TTFT 330/602 ms, TPOT 42.4/44.7 ms; C=64: 1,168.2 tok/s, TTFT 337/1294 ms, TPOT 52.5/54.5 ms; KV util and preemptions as in M3 (0 preemptions) |
+| 2026-10-18 | Kaggle Tesla T4, torch 2.11.0+cu128, transformers 5.16.1, fp32 | Greedy parity vs HF `generate()` fp32 with the Triton kernel, 120 prompts x 16 tokens, batched engine (`scripts/compare_hf.py --engine batched --device cuda --dtype float32 --attention triton`) | 0 mismatches / 1,920 tokens; max prefill logit abs diff 9.73e-05; engine run 4.7 s, 64 steps, 0 preemptions; 75.0 s total |
 | 2026-10-18 | Kaggle Tesla T4, torch 2.11.0+cu128, transformers 5.16.1, fp16 | Greedy parity vs HF `generate()` fp16, 120 prompts x 16 tokens, batched engine (`scripts/compare_hf.py --engine batched --device cuda`) | with the kernel: 7 mismatching prompts; without (PyTorch attention): 6, the same 6 plus "I think the most important skill for an engineer is"; every divergence at an HF top-2 margin <= 0.0156; max prefill logit abs diff 0.151 (M1 path, fp16) |
 
-Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`, `results/m3_hf_compare.json`, `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`, `results/m4_profile_cuda.json`, `results/m4_profile_kernel_cuda.json`, `results/m4_bench_cuda.json`, `results/m4_hf_compare_cuda.json`, `results/m3_hf_compare_cuda.json` (the HF baseline file was transcribed from the notebook screenshot; its tok/s values equal tokens / seconds. The two T4 `hf_compare` files hold the exact summary and the mismatching prompts only, transcribed from the pasted output).
+Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`, `results/m3_hf_compare.json`, `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`, `results/m4_profile_cuda.json`, `results/m4_profile_kernel_cuda.json`, `results/m4_bench_cuda.json`, `results/m4_hf_compare_cuda.json`, `results/m3_hf_compare_cuda.json`, `results/m4_hf_compare_fp32_cuda.json` (the HF baseline file was transcribed from the notebook screenshot; its tok/s values equal tokens / seconds. The T4 `hf_compare` files hold the exact summary and the mismatching prompts only, transcribed from the pasted output).
 
 M3 T4 analysis (written at M3 from the numbers alone; M4 step 1 then confirmed it with the profiler):
 - TinyServe / HF throughput: 1.01x at C=1, 0.37x at C=8, 0.21x at C=32, 0.20x at C=64. The target (>= 3x HF at C=32) is not met.
@@ -154,8 +160,8 @@ M4 T4 analysis (from the M4 step 1 and step 3 profiles):
 
 - Resolved 2026-10-18: the block allocator (core algorithm) is scaffolded as plain-Python blanks for me to fill, like M1.
 - Resolved 2026-10-18 (kernel tolerance): the Triton kernel must match the PyTorch reference within atol = rtol = 1e-5 in fp32 and 1e-3 in fp16; both accumulate in fp32 and round once.
-- Resolved 2026-10-18 (fp16 greedy parity on the T4): 7 near-tie flips with the kernel vs 6 without, all at HF top-2 margins <= 0.0156; accepted (see Design decisions). Pending: the same check in fp32 on the T4 with the kernel, expected to be 0 mismatches.
-- Next after M4: CUDA graphs and a cheaper `build_batch` for the >= 3x target, or M5 first? Decide from the step-time breakdown.
+- Resolved 2026-10-18 (fp16 greedy parity on the T4): 7 near-tie flips with the kernel vs 6 without, all at HF top-2 margins <= 0.0156; accepted (see Design decisions). The same check in fp32 on the T4 with the kernel: 0 mismatches / 1,920 tokens (resolved 2026-10-18).
+- Resolved 2026-10-18: M5 (prefix cache) comes before CUDA graphs and a cheaper `build_batch`; those stay open for the >= 3x HF target at C=32.
 - Profile one C=64 step (torch profiler) at the start of M4 to confirm that per-sequence attention dominates before writing the kernel. Resolved 2026-10-18 (M4 step 1): confirmed, see Benchmark results.
 
 - Resolved 2026-10-17: torch 2.14.1 on PyPI has a cp314 win_amd64 wheel.

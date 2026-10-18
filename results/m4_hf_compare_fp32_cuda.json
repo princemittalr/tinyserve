@@ -1,0 +1,20 @@
+{
+  "summary": {
+    "date": "2026-10-18",
+    "hardware": "Tesla T4, CUDA 12.8, torch 2.11.0+cu128",
+    "dtype": "float32",
+    "engine": "batched",
+    "attention": "triton",
+    "prompts": 120,
+    "max_new_tokens": 16,
+    "tokens_compared": 1920,
+    "mismatches": 0,
+    "max_prefill_logit_abs_diff": 9.72747802734375e-05,
+    "seconds": 75.0,
+    "max_num_seqs": 32,
+    "batched_engine_seconds": 4.7
+  },
+  "engine_log": "batched engine: 120 prompts in 4.7 s, 64 steps, 0 preemptions",
+  "mismatches": [],
+  "note": "Transcribed by the mentor from the pasted notebook output (scripts/compare_hf.py --engine batched --device cuda --dtype float32 --attention triton): the summary and engine line are exact; all 120 prompts printed OK, so per-prompt token lists are not included."
+}

@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M4 done.** A custom Triton kernel runs decode attention for the whole batch in one launch per layer, reading keys and values straight from the paged KV cache. On a T4 it makes a 64-sequence decode step 18.5x faster, and the engine now outruns Hugging Face `generate()` at every concurrency tested (2.59x at 64 concurrent requests, 1.72x at 32; the 3x target at 32 is not met yet). Greedy output is token-identical to HF on 120 prompts in fp32 on CPU; in fp16 on the T4 a few near-ties flip (see Benchmarks). Next: the radix prefix cache (M5). See [PROGRESS.md](PROGRESS.md).
+> Status: **M4 done.** A custom Triton kernel runs decode attention for the whole batch in one launch per layer, reading keys and values straight from the paged KV cache. On a T4 it makes a 64-sequence decode step 18.5x faster, and the engine now outruns Hugging Face `generate()` at every concurrency tested (2.59x at 64 concurrent requests, 1.72x at 32; the 3x target at 32 is not met yet). Greedy output is token-identical to HF on 120 prompts in fp32, on CPU and on the T4 with the kernel; in fp16 on the T4 a few near-ties flip (see Benchmarks). Now building: the radix prefix cache (M5). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -33,6 +33,8 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Correctness on the T4 (2026-10-18, fp16, same 120 prompts, batched engine): 7 prompts diverge
   from HF fp16 with the Triton kernel and 6 without it (the same 6 plus one). Every divergence is a
   near-tie: HF's top two logits differ by at most 0.0156, one fp16 rounding step.
+- Exactness of the kernel on the T4 (2026-10-18, fp32, same 120 prompts, batched engine with the
+  Triton kernel): 0 greedy mismatches / 1,920 tokens; max prefill logit difference 9.7e-05.
 - Throughput (2026-10-18, Kaggle T4, fp16, Qwen3-0.6B, 128-token random prompts, 128 output
   tokens each, same prompts for both):
 
@@ -63,6 +65,7 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   120 prompts (`benchmarks/prompts/m1_greedy.txt`).
 - The block allocator and block tables have Hypothesis property tests: random allocate/free
   traffic must never hand out a block twice, must reject double frees, and must not leak blocks.
+  With sharing (M5), every block's reference count must equal the number of owners holding it.
 - Paged attention and the cached model are checked against the no-cache M1 path (logits and
   greedy tokens), including blocks scattered in random order and blocks reused with stale data.
 - The continuous-batching scheduler has a Hypothesis test over random workloads (every request
