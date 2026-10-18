@@ -33,6 +33,7 @@ from transformers import AutoModelForCausalLM
 
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.config import ModelConfig
+from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3, greedy_generate, greedy_generate_paged
@@ -76,6 +77,8 @@ def main() -> None:
                         help="batched engine's decode attention (M4 kernel: triton)")  # fmt: skip
     parser.add_argument("--prefix-cache", action="store_true",
                         help="batched engine with the M5 radix prefix cache")  # fmt: skip
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="batched engine replays CUDA graphs for decode (M8)")  # fmt: skip
     parser.add_argument("--out", type=Path, default=None, help="default: results/<m2|m1>_...")
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -84,6 +87,7 @@ def main() -> None:
         milestone = {"m1": "m1", "paged": "m2", "batched": "m3"}[args.engine]
         milestone = "m4" if args.attention == "triton" else milestone
         milestone = "m5" if args.prefix_cache else milestone
+        milestone = "m8" if args.cuda_graphs else milestone
         suffix = "" if device.type == "cpu" else f"_{device.type}"
         args.out = Path(f"results/{milestone}_hf_compare{suffix}.json")
 
@@ -108,11 +112,14 @@ def main() -> None:
     cached = (0, 0)  # (prefix-cached, admitted) prompt tokens; batched engine only
     if args.engine == "batched":
         # Every prompt in one Engine run; the cache gets room for max_num_seqs of them.
+        big = KVCache(cfg, num_blocks * args.max_num_seqs, args.block_size, dtype, device)
+        graphs = DecodeGraphs(ours, big, args.max_num_seqs) if args.cuda_graphs else None
         engine = Engine(
             ours,
-            KVCache(cfg, num_blocks * args.max_num_seqs, args.block_size, dtype, device),
+            big,
             max_num_seqs=args.max_num_seqs,
             prefix_cache=args.prefix_cache,
+            decode_graphs=graphs,
         )
         t0 = time.perf_counter()
         ours_out = engine.generate(
@@ -173,6 +180,7 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "engine": args.engine,
         "attention": args.attention,
+        "cuda_graphs": args.cuda_graphs,
         "prompts": len(rows),
         "max_new_tokens": args.max_new_tokens,
         "tokens_compared": sum(int(str(r["n_tokens"])) for r in rows),

@@ -161,12 +161,16 @@ def fill_decode_inputs(
     ``build_batch``. A padding row is a one-token sequence on ``pad_block`` (the KV cache's
     padding block): token 0 at position 0, written to and read from that block's first slot.
     The values are built on the host and copied into ``dst`` in place.
+
+    Block tables are written only up to this step's longest table (padded with
+    ``pad_block``); later columns keep stale values from earlier steps. The kernel reads
+    only the first ``ceil(context_len / block_size)`` entries of a row, so it never sees
+    them, and the copy stays as small as the step instead of the buffer's full width.
     """
     n, width = dst.block_tables.shape
     if not 0 < len(items) <= n:
         raise ValueError(f"{len(items)} sequences do not fit {n} rows")
     ints: list[list[int]] = []  # per row: token, position, slot, context length
-    blocks: list[list[int]] = []
     for token, table in items:
         total = table.num_tokens
         if total < 1:
@@ -174,14 +178,15 @@ def fill_decode_inputs(
         if len(table.blocks) > width:
             raise ValueError(f"a sequence holds {len(table.blocks)} blocks, rows hold {width}")
         ints.append([token, total - 1, table.slot(total - 1), total])
-        blocks.append(table.blocks + [pad_block] * (width - len(table.blocks)))
+    used = max(len(table.blocks) for _, table in items)
+    blocks = [table.blocks + [pad_block] * (used - len(table.blocks)) for _, table in items]
     block_size = items[0][1].block_size
     for _ in range(n - len(items)):
         ints.append([0, 0, pad_block * block_size, 1])
-        blocks.append([pad_block] * width)
+        blocks.append([pad_block] * used)
     host = torch.tensor(ints, dtype=torch.int64)
     dst.token_ids.copy_(host[:, 0])
     dst.positions.copy_(host[:, 1])
     dst.slots.copy_(host[:, 2])
     dst.context_lens.copy_(host[:, 3])
-    dst.block_tables.copy_(torch.tensor(blocks, dtype=torch.int32))
+    dst.block_tables[:, :used].copy_(torch.tensor(blocks, dtype=torch.int32))

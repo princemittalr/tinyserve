@@ -12,6 +12,10 @@ also records when each token came out, which is what the M3 benchmark turns into
 and TPOT. With ``trace_steps=True`` (M7) it also records where each step's time went
 (``StepRecord``); that waits for the GPU after the forward pass, so leave it off when
 measuring throughput.
+
+With ``decode_graphs`` (M8, cuda_graphs.py), every step in which all sequences decode one
+token replays a captured CUDA graph instead of running ``forward_batch``; prefill and
+mixed steps run eagerly as before.
 """
 
 import itertools
@@ -23,6 +27,7 @@ import torch
 
 from tinyserve.batch import build_batch
 from tinyserve.block_allocator import BlockAllocator
+from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
 from tinyserve.sampling import SamplingParams, sample
@@ -67,6 +72,7 @@ class StepRecord:
     forward_ms: float  # forward_batch, until the GPU has finished it
     sample_ms: float  # sampling, plus copying the next tokens to the host
     update_ms: float  # scheduler.update(): record tokens, retire, cache blocks
+    graph: bool = False  # the forward was a CUDA graph replay (M8); build_ms then fills it
 
     @property
     def total_ms(self) -> float:
@@ -84,8 +90,14 @@ class Engine:
         prefix_cache: bool = False,
         seed: int = 0,
         trace_steps: bool = False,
+        decode_graphs: DecodeGraphs | None = None,
     ) -> None:
+        if decode_graphs is not None and (
+            decode_graphs.model is not model or decode_graphs.cache is not cache
+        ):
+            raise ValueError("decode_graphs must be captured for this engine's model and cache")
         self.model = model
+        self.decode_graphs = decode_graphs
         self.cache = cache
         self.scheduler = Scheduler(
             BlockAllocator(cache.num_blocks),
@@ -157,9 +169,20 @@ class Engine:
         # Read before update(), which releases the tables of finished sequences.
         context = sum(table.num_tokens for _, table in items)
         self._mark(marks)
-        batch = build_batch(items, device=self.cache.k.device)
-        self._mark(marks)
-        logits = self.model.forward_batch(batch, self.cache)
+        graphs = self.decode_graphs
+        use_graph = (
+            graphs is not None
+            and all(len(t) == 1 for t, _ in items)
+            and graphs.fits([table for _, table in items])
+        )
+        if graphs is not None and use_graph:
+            bucket = graphs.prepare([(t[0], table) for t, table in items])
+            self._mark(marks)
+            logits = graphs.replay(bucket, len(items))
+        else:
+            batch = build_batch(items, device=self.cache.k.device)
+            self._mark(marks)
+            logits = self.model.forward_batch(batch, self.cache)
         self._mark(marks)
         params = [self.sampling[q.seq_id] for q in seqs]
         gens = [self.generators.get(q.seq_id) for q in seqs]
@@ -186,6 +209,7 @@ class Engine:
                     forward_ms=ms[2],
                     sample_ms=ms[3],
                     update_ms=ms[4],
+                    graph=use_graph,
                 )
             )
         return finished

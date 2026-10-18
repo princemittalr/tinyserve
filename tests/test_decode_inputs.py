@@ -43,7 +43,9 @@ def test_fill_writes_each_sequence_then_padding() -> None:
     assert inp.positions.tolist() == [5, 0, 0, 0]
     assert inp.slots.tolist() == [a.slot(5), b.slot(0), 64, 64]  # padding: block 16, slot 0
     assert inp.context_lens.tolist() == [6, 1, 1, 1]
-    assert inp.block_tables.tolist() == [[*a.blocks, 16], [*b.blocks, 16, 16], [16] * 3, [16] * 3]
+    # Columns up to the longest table (2 blocks) are written; column 3 is never read.
+    assert inp.block_tables[:, :2].tolist() == [a.blocks, [*b.blocks, 16], [16] * 2, [16] * 2]
+    assert inp.block_tables[:, 2].tolist() == [0] * 4
     assert inp.block_tables.dtype == inp.context_lens.dtype == torch.int32
 
 
