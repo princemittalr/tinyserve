@@ -27,7 +27,8 @@
 - M1 step 7: HF parity tests on a tiny random Qwen3 (run in CI); `scripts/compare_hf.py` + 120 prompts for the real-model acceptance run. Config now also reads the newer `rope_parameters` layout.
 - M1 closed: acceptance run passed (see Benchmark results).
 - M2 step 1: `BlockAllocator` (free stack + used set) with 6 blanks; 14 unit tests and a Hypothesis state machine (random allocate/free traffic; checks no double hand-out, double free rejected, no leaked blocks). The blank answers came from the mentor.
-- M2 step 2: `BlockTable` (a sequence's blocks, token position -> KV-cache slot) with 5 blanks for me to fill; 18 unit tests and a Hypothesis state machine (several sequences on one allocator; no two tokens share a slot, no leak).
+- M2 step 2: `BlockTable` (a sequence's blocks, token position -> KV-cache slot) with 5 blanks; 18 unit tests and a Hypothesis state machine (several sequences on one allocator; no two tokens share a slot, no leak). I got stuck and the mentor gave the full file.
+- M2 step 3: `KVCache` (per-layer key/value tensors of token slots, written by the mentor) and `paged_gqa_attention` in `attention.py` (4 blanks; the answers were given by the mentor with the step). 13 tests compare it with the M1 reference: scattered blocks, decode, chunked prefill, a Hypothesis test over random block orders, and two sequences sharing one cache.
 
 ## Design decisions
 
@@ -61,6 +62,10 @@
 - allocate() and free() are all-or-nothing: on an error nothing changes, so the M3 scheduler can catch OutOfBlocksError and preempt safely.
 - Slot of position p = blocks[p // block_size] * block_size + p % block_size: the KV cache is addressed as one flat array of token slots, so writes in step 3 are a single scatter.
 - A block table never holds an empty block (blocks = ceil(tokens / block_size)): blocks are only taken when a token needs one.
+- KV cache stored per layer as flat token slots [num_slots, Hkv, D]: writing new tokens is one indexed assignment, and the same memory viewed as [num_blocks, block_size, Hkv, D] is the block layout the M4 kernel reads.
+- Paged attention takes the query positions as the LAST n of the sequence: one function covers prefill (n = total), decode (n = 1) and chunked prefill.
+- Paged attention gathers k/v into a contiguous copy before the math: slow, but obviously equal to the M1 reference. M4's kernel reads blocks in place instead.
+- The KV cache stores fp16 by default (fp32 on CPU in tests): it is the largest memory user after the weights.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment

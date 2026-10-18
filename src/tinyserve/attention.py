@@ -51,3 +51,55 @@ def causal_gqa_attention(
     out = torch.einsum("hij,jhd->ihd", probs, v.float())
     # TODO(you) 6: return in the same dtype as the input queries.
     return out.to(q.dtype)
+
+
+def paged_gqa_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slots: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Attention for the NEWEST ``n`` tokens of one sequence, reading k/v from the cache.
+
+    The sequence has ``total = len(slots)`` tokens so far; ``slots[p]`` is where token
+    position p's key and value live in the cache. The queries are the last ``n`` positions,
+    ``total - n .. total - 1``. Prefill passes all positions (n == total); a decode step
+    passes one query (n == 1). The new tokens' k/v must already be written to the cache.
+
+    The result must equal rows ``total - n ..`` of ``causal_gqa_attention`` on the
+    contiguous k/v; ``tests/test_paged_attention.py`` checks exactly that.
+
+    Args:
+        q: ``[n, Hq, D]``, RoPE-rotated.
+        k_cache, v_cache: ``[num_slots, Hkv, D]``, one layer of the KV cache.
+        slots: ``[total]`` int64, from the sequence's block table, in position order.
+        scale: as in ``causal_gqa_attention``.
+
+    Returns:
+        ``[n, Hq, D]`` in q's dtype.
+    """
+    n, total = q.shape[0], slots.shape[0]
+    group = q.shape[1] // k_cache.shape[1]
+
+    # TODO(you) 1-2: gather this sequence's keys and values from the cache, in position
+    # order. Indexing a tensor with a tensor of indices picks those rows: [total, Hkv, D].
+    k = k_cache[slots]
+    v = v_cache[slots]
+    k = k.repeat_interleave(group, dim=1)
+    v = v.repeat_interleave(group, dim=1)
+
+    # Absolute positions: query row i is token position start + i.
+    # TODO(you) 3: position of the first query (the queries are the LAST n positions).
+    start = total - n
+    q_pos = torch.arange(start, total, device=q.device)
+    k_pos = torch.arange(total, device=q.device)
+    # TODO(you) 4: forbidden = key position j is after query position i. Compare
+    # k_pos[None, :] with q_pos[:, None] so the result is [n, total].
+    future = k_pos[None, :] > q_pos[:, None]
+
+    scores = torch.einsum("ihd,jhd->hij", q.float(), k.float()) * scale
+    scores = scores.masked_fill(future, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.einsum("hij,jhd->ihd", probs, v.float())
+    return out.to(q.dtype)
