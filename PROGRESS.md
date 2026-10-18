@@ -6,7 +6,7 @@
 |---|---|
 | M0 Repo scaffold | done (2026-10-17) |
 | M1 Forward pass, token-identical to HF | done (2026-10-18): 0 mismatches / 1,920 tokens |
-| M2 Paged KV cache and allocator | in progress |
+| M2 Paged KV cache and allocator | done (2026-10-18): property tests pass; 0 mismatches / 1,920 tokens with the cache |
 | M3 Continuous batching and benchmark harness | not started |
 | M4 Triton paged-attention kernel | not started |
 | M5 Radix prefix cache | not started |
@@ -30,6 +30,7 @@
 - M2 step 2: `BlockTable` (a sequence's blocks, token position -> KV-cache slot) with 5 blanks; 18 unit tests and a Hypothesis state machine (several sequences on one allocator; no two tokens share a slot, no leak). I got stuck and the mentor gave the full file.
 - M2 step 3: `KVCache` (per-layer key/value tensors of token slots, written by the mentor) and `paged_gqa_attention` in `attention.py` (4 blanks; the answers were given by the mentor with the step). 13 tests compare it with the M1 reference: scattered blocks, decode, chunked prefill, a Hypothesis test over random block orders, and two sequences sharing one cache.
 - M2 step 4: `Qwen3.forward_paged` (runs only the new tokens; writes their k/v to the cache, reads history through the block table) and `greedy_generate_paged`, written by the mentor (wiring, no new algorithm). 15 tests: logits and greedy tokens identical to the M1 no-cache path for block sizes 1/4/16, blocks returned after generation and after OutOfBlocksError, stale data in reused blocks has no effect. `generate.py` and `compare_hf.py` use the cache by default (`--no-cache` / `--engine m1` for the old path).
+- M2 closed: allocator and block-table property tests pass (no double hand-out, double free rejected, no leaked blocks); greedy tokens with the paged cache match HF on all 120 prompts (see Benchmark results).
 
 ## Design decisions
 
@@ -82,8 +83,10 @@
 |---|---|---|---|
 | 2026-10-18 | Windows AMD64 laptop CPU, torch 2.14.1+cpu, fp32 | M1 greedy parity vs HF `generate()`: 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; 1047.5 s total (no KV cache) |
 | 2026-10-18 | same | `scripts/generate.py`, 5-token prompt, 20 new tokens | 6.8 s (no KV cache; correctness baseline, not a speed claim) |
+| 2026-10-18 | same | M2 greedy parity vs HF `generate()` with the paged KV cache (block size 16): 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; 692.9 s total (includes HF's own generate time) |
+| 2026-10-18 | same | `scripts/generate.py`, same prompt, 20 new tokens, paged KV cache | 3.2 s vs 6.8 s without the cache, identical token ids (single run; not a benchmark) |
 
-Raw data: `results/m1_hf_compare.json`.
+Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`.
 
 ## Open questions
 
