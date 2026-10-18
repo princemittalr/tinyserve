@@ -9,9 +9,14 @@ crossed between processes and threads (tinyserve/profiling.py: ``ttft_segments``
 
     to_handler | parse | to_engine | engine (queue + prefill) | to_loop | to_client
 
-It also reports the event loop's lag (how late a 5 ms sleep wakes up) and the engine's
-own step times while serving. Then the same runs with a shorter GIL switch interval
-(--switch-intervals): if GIL contention is the cause, the loop-side segments should shrink.
+It also reports the event loop's lag (how late a 5 ms sleep wakes up), the engine's
+own step times while serving, and a TTFT to the first TOKEN (client send -> the event
+loop has the first token), next to the client's TTFT to the first TEXT chunk: the API
+sends no chunk while a token's text is empty or half a character (step 3 added this
+after the T4 run showed a few requests whose first chunk came only at the very end).
+``--switch-intervals 5,0.5`` repeats the runs with a shorter GIL switch interval: if GIL
+contention were the cause, the loop-side segments would shrink (step 2 on the T4: they
+did not).
 
 Usage: python scripts/profile_api.py --device cuda --attention triton
 """
@@ -47,17 +52,30 @@ def analyse(results: list[Any], trace: dict[str, Any], seconds: float, c: int) -
              for s in trace["steps"]]  # fmt: skip
     lag = trace["loop_lag_ms"]
     worst = sorted(range(len(results)), key=lambda i: ttft[i], reverse=True)[:3]
+    # The first token, as the server's event loop had it, on the client's clock.
+    token_ttft = [(by_id[r.id]["first_seen"] - r.sent) * 1e3 for r in results]
+    late = [i for i, s in enumerate(segs) if s["to_client"] > 1000]
     return {
         "concurrency": c,
         "num_requests": len(results),
         "output_tok_per_s": sum(r.completion_tokens for r in results) / seconds,
         "ttft_ms": stats(ttft),
+        "ttft_first_token_ms": stats(token_ttft),
+        "first_text_over_1s_after_first_token": len(late),
         "segments_ms": {name: stats([s[name] for s in segs]) for name in TTFT_SEGMENTS},
         "steps_to_first_token": stats([float(w) for w in waited]),
         "loop_lag_ms": stats(lag) | {"over_10ms": sum(x > 10 for x in lag) / len(lag)},
         "engine_decode_steps": summarize_steps([s for s in steps if s.num_prefill_seqs == 0]),
         "engine_prefill_steps": summarize_steps([s for s in steps if s.num_prefill_seqs > 0]),
-        "slowest_requests": [{"ttft_ms": ttft[i], **segs[i]} for i in worst],
+        "slowest_requests": [
+            {
+                "ttft_ms": ttft[i],
+                **segs[i],
+                "chunks": len(results[i].chunk_times),
+                "text_head": results[i].text[:40],
+            }
+            for i in worst
+        ],
     }
 
 
@@ -74,9 +92,14 @@ def show(row: dict[str, Any], interval: str) -> None:
     print("   segment ms: " + " | ".join(
         f"{n} {seg[n]['p50']:.1f} / {seg[n]['p99']:.1f}" for n in TTFT_SEGMENTS
     ) + "   (p50 / p99)")  # fmt: skip
+    tt = row["ttft_first_token_ms"]
+    print(f"   TTFT to the first token p50/p99 {tt['p50']:.0f} / {tt['p99']:.0f} ms; "
+          f"{row['first_text_over_1s_after_first_token']} of {row['num_requests']} requests "
+          f"got their first text over 1 s after their first token")  # fmt: skip
     for w in row["slowest_requests"]:
         print(f"   slow: TTFT {w['ttft_ms']:.0f} ms = " +
-              " + ".join(f"{n} {w[n]:.0f}" for n in TTFT_SEGMENTS))  # fmt: skip
+              " + ".join(f"{n} {w[n]:.0f}" for n in TTFT_SEGMENTS) +
+              f" | {w['chunks']} chunks, text starts {w['text_head']!r}")  # fmt: skip
 
 
 def main() -> None:
@@ -85,7 +108,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
     parser.add_argument("--concurrency", default="32,64")
-    parser.add_argument("--switch-intervals", default="5,0.5",
+    parser.add_argument("--switch-intervals", default="5",
                         help="GIL switch intervals to run, ms (Python's default is 5)")  # fmt: skip
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--input-len", type=int, default=128)

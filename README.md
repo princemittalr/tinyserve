@@ -94,9 +94,11 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   | 32 | 766.4 / 723.8 | 5.6% | 315 / 498 ms | 586 / 5,607 ms | 39.5 / 40.5 ms |
   | 64 | 1,205.9 / 1,124.0 | 6.8% | 326 / 667 ms | 1,242 / 7,294 ms | 50.4 / 52.2 ms |
 
-  Streaming adds about 1 ms per token. Time to first token is the weak spot under load; the
-  likely cause (not yet profiled) is the engine thread and the HTTP event loop sharing one Python
-  interpreter. Greedy text through the API (fp32, kernel, prefix cache, 120 prompts at once, half
+  Streaming adds about 1 ms per token. Time to first token is the weak spot under load. Profiled
+  in M7 (`scripts/profile_api.py`), it is not the GIL: the event loop is never more than 9 ms
+  late. The median gap is requests arriving mid-step and waiting for it to end (~100 ms at 32
+  streams). The p99 is a few requests on random-token prompts whose first text arrives only with
+  their last token (inferred: their output decodes to nothing visible until then). Greedy text through the API (fp32, kernel, prefix cache, 120 prompts at once, half
   streamed) is identical to HF `generate()`, and the chat template is identical to Qwen3's own.
   Raw data: `results/m6_api_bench_cuda.json`, `results/m6_engine_bench_cuda.json`,
   `results/m6_api_hf_compare_float32_cuda.json`.
