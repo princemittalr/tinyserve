@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M2 done.** Generation uses a paged KV cache, and its greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). Next: continuous batching (M3). See [PROGRESS.md](PROGRESS.md).
+> Status: **M3 in progress.** A continuous-batching scheduler (with preemption by recompute) runs many requests through the paged KV cache at once, and its greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). Next: the first T4 benchmark. See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -28,8 +28,9 @@ ruff check . && ruff format --check . && mypy && pytest
 Every number here comes from a logged run with date and hardware; see [PROGRESS.md](PROGRESS.md).
 
 - Correctness (2026-10-18, laptop CPU, fp32): 0 greedy mismatches vs HF over 120 prompts x 16 tokens,
-  both without a KV cache (M1) and with the paged KV cache (M2).
-- No throughput numbers yet: speed is measured from M3, with batching.
+  without a KV cache (M1), with the paged KV cache (M2), and with all 120 prompts batched
+  through the continuous-batching engine (M3).
+- No throughput numbers yet: `scripts/benchmark.py` exists, but no T4 run has been recorded.
 
 ## How it's tested
 
@@ -53,7 +54,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Single GPU only. No tensor parallelism, no quantization, not for deployment.
 - Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
 - Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
-- One sequence at a time: batching many requests is M3.
+- Greedy decoding only; temperature and top-p sampling arrive with the API in M6.
+- Attention runs one sequence at a time inside each batched step (the M4 kernel does all
+  sequences in one launch); the linear layers and MLP are batched.
 - Paged attention copies each sequence's keys and values out of the cache before the math.
   It is simple and testable, not fast; the M4 Triton kernel will read the blocks in place.
 

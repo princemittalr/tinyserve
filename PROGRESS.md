@@ -34,6 +34,8 @@
 - M3 step 1: `Batch` / `build_batch` (`batch.py`) flatten many sequences' new tokens into one `[T]` batch, and `Qwen3.forward_batch` runs them in one pass, returning only each sequence's last-token logits. Written by the mentor (wiring, no new algorithm). 8 tests: a mixed prefill + decode batch, chunked prefill (Hypothesis) and 8 lockstep greedy steps all match M1's no-cache path; batch order does not matter.
 - M3 step 2: `Sequence` state (`sequence.py`, written by the mentor) and the continuous-batching `Scheduler` (`scheduler.py`, 9 blanks; the mentor gave the answers and then the full file): FCFS admission under max_num_seqs, a token budget and free blocks; preemption by recompute when the cache is full. 15 tests: admission limits, no queue-jumping, newest-first eviction, a Hypothesis test over random workloads (every request finishes with the right output, no leaked blocks, no livelock), and the tiny model run through the scheduler matches M1 greedy with and without preemptions.
 - M3 step 3: `Engine` (`engine.py`, written by the mentor; serving-loop plumbing): each step runs `schedule()`, one `forward_batch` and `update()`, and records when every output token came out (TTFT, TPOT) plus KV-cache utilization per step. 8 tests: outputs match M1 greedy with a roomy cache, one sequence at a time, and a tight cache that forces preemptions; requests can join mid-run; finished requests leave at once; EOS; timing bookkeeping. `compare_hf.py --engine batched` runs every prompt through the engine at once.
+- M3 step 3 check (real model): all 120 prompts through the engine at once (max 32 in flight) give HF's greedy tokens exactly (see Benchmark results).
+- M3 step 4: benchmark harness, written by the mentor (benchmark plumbing): `bench.py` (closed-loop driver at a fixed concurrency; output tok/s, TTFT and TPOT p50/p99, KV utilization mean/max; `percentile` checked against numpy by Hypothesis) and `scripts/benchmark.py` (synthetic random-token workload, concurrency 1/8/32/64, JSON report). 10 tests. No GPU numbers yet: the first T4 run is the next step.
 
 ## Design decisions
 
@@ -85,6 +87,10 @@
 - Requests whose longest possible length exceeds the batch token budget or the whole cache are rejected at `add()`: after a preemption they could never be re-admitted.
 - The engine records one timestamp per output token, not just per request: TTFT, TPOT and their percentiles all come from the same raw data.
 - The engine's clock is injectable: timing tests use a fake counter instead of sleeping or asserting on real time.
+- Benchmark is closed-loop at a fixed concurrency (a new request as soon as one finishes): concurrency is then a controlled variable, matching the M3 criteria (1/8/32/64).
+- Benchmark requests ignore EOS and all produce exactly `--output-len` tokens: runs at different concurrencies (and against HF) do the same work.
+- Benchmark prompts are random token ids from a fixed seed: the work per request is exact and reproducible; the text content does not change the cost of a forward pass.
+- TPOT is averaged per request first, then p50/p99 are taken across requests: one number per request, so long requests don't dominate the percentiles.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
@@ -100,8 +106,9 @@
 | 2026-10-18 | same | `scripts/generate.py`, 5-token prompt, 20 new tokens | 6.8 s (no KV cache; correctness baseline, not a speed claim) |
 | 2026-10-18 | same | M2 greedy parity vs HF `generate()` with the paged KV cache (block size 16): 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; 692.9 s total (includes HF's own generate time) |
 | 2026-10-18 | same | `scripts/generate.py`, same prompt, 20 new tokens, paged KV cache | 3.2 s vs 6.8 s without the cache, identical token ids (single run; not a benchmark) |
+| 2026-10-18 | same | M3 greedy parity vs HF `generate()`, all 120 prompts through the continuous-batching engine at once (max 32 in flight, block size 16): 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; engine run 45.2 s, 64 steps, 0 preemptions (single run; CPU, not a benchmark) |
 
-Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`.
+Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`, `results/m3_hf_compare.json`.
 
 ## Open questions
 
