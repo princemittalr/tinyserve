@@ -5,7 +5,7 @@
 | Milestone | Status |
 |---|---|
 | M0 Repo scaffold | done (2026-10-17) |
-| M1 Forward pass, token-identical to HF | in progress (step 4: SwiGLU MLP) |
+| M1 Forward pass, token-identical to HF | in progress (step 5: causal GQA attention) |
 | M2 Paged KV cache and allocator | not started |
 | M3 Continuous batching and benchmark harness | not started |
 | M4 Triton paged-attention kernel | not started |
@@ -21,7 +21,8 @@
 - M1 step 1: `ModelConfig` parsed from config.json, unsupported features rejected. Verified on the real Qwen3-0.6B config.json.
 - M1 step 2: torch added; strict safetensors loader, synthetic-checkpoint tests, `scripts/inspect_weights.py`. Real checkpoint (2026-10-17, laptop): 310 tensors, 596,049,920 parameters (440,467,456 without the embedding), all finite in fp16; largest |weight| 192.0.
 - M1 step 3: spec tests and skeletons for `rms_norm`, `rope_cos_sin`, `apply_rope` in `layers.py`. I attempted it, got stuck, and used the mentor's solution; I can explain each line.
-- M1 step 4: SwiGLU MLP (`swiglu_mlp`), three blanks filled in by me, 5 spec tests.
+- M1 step 4: SwiGLU MLP (`swiglu_mlp`), 5 spec tests; the three blanks were answered by the mentor.
+- M1 step 5: reference causal grouped-query attention (`attention.py`), 8 spec tests incl. a match against PyTorch SDPA.
 
 ## Design decisions
 
@@ -42,6 +43,8 @@
 - RoPE uses the rotate-half layout (pair i with i + D/2): it is what Qwen3 was trained with; interleaved pairs give wrong tokens.
 - RoPE takes explicit positions per token: in a continuous batch every sequence is at a different position.
 - Linear layers use `F.linear(x, w)` on the checkpoint's [out, in] weights: no transposed copies, so memory stays at 1x.
+- Reference attention is plain PyTorch (einsum + mask + softmax in fp32): the paged cache (M2) and Triton kernel (M4) are tested against it.
+- GQA maps query head h to kv head h // (Hq/Hkv) (`repeat_interleave`, not `repeat`): that is how Qwen3 groups heads.
 - CI installs CPU-only torch: no GPU there, and the default Linux wheel pulls ~3 GB of CUDA libraries.
 
 ## Environment
