@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M4 done.** A custom Triton kernel runs decode attention for the whole batch in one launch per layer, reading keys and values straight from the paged KV cache. On a T4 it makes a 64-sequence decode step 18.5x faster, and the engine now outruns Hugging Face `generate()` at every concurrency tested (2.59x at 64 concurrent requests, 1.72x at 32; the 3x target at 32 is not met yet). Greedy output is token-identical to HF on 120 prompts in fp32, on CPU and on the T4 with the kernel; in fp16 on the T4 a few near-ties flip (see Benchmarks). Now building: the radix prefix cache (M5). See [PROGRESS.md](PROGRESS.md).
+> Status: **M5 done.** A radix-tree prefix cache lets requests that share a prompt prefix reuse its keys and values instead of recomputing them. On a T4, with 4 shared 1,024-token prefixes, it cuts median time to first token from 232 to 42 ms for one user and the 99th percentile from 8.9 to 2.0 s at 32 concurrent users, and raises throughput 2.24x there (the median at 32 users got worse; see Benchmarks). M4's Triton kernel runs decode attention for the whole batch in one launch per layer (2.59x HF `generate()` throughput at 64 concurrent requests, 1.72x at 32; the 3x target at 32 is not met yet). Greedy output is token-identical to HF in fp32, on CPU and on the T4, with and without the prefix cache; in fp16 a few near-ties flip. Next: the streaming API (M6). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -51,6 +51,21 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   overhead of the small non-attention kernels (GPU busy 44% of a step). HF uses static batches,
   so it reports no TTFT or TPOT. Raw data: `results/m4_bench_cuda.json`,
   `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`, `results/m4_profile*_cuda.json`.
+- Prefix cache (2026-10-18, Kaggle T4, fp16, Triton kernel): 4 random 1,024-token prefixes, each
+  request one of them plus its own 64-token suffix, 64 output tokens, closed loop, cache off vs on
+  on the same prompts (`scripts/bench_prefix.py`):
+
+  | Concurrency | tok/s off / on | TTFT p50 off / on | TTFT p99 off / on | TPOT p50 off / on | prompt tokens from cache |
+  |---|---|---|---|---|---|
+  | 1 | 27.6 / 29.5 | 232 / 42 ms | 234 / 236 ms | 33.1 / 32.9 ms | 71% |
+  | 8 | 121.4 / 188.0 | 266 / 111 ms | 1,944 / 1,138 ms | 61.7 / 37.9 ms | 82% |
+  | 32 | 149.4 / 335.1 | 346 / 704 ms | 8,928 / 1,994 ms | 207.3 / 81.7 ms | 91% |
+
+  Only the first request of each prefix misses. p99 at C=1 is one of those misses. At C=32 the
+  median TTFT got worse; the likely cause (not yet profiled) is that hits arrive in large
+  synchronized waves whose prefills each attend over 1,088 cached tokens one sequence at a time.
+  fp32 greedy parity with the cache on 24 chat prompts sharing a system prompt: 0 mismatches /
+  384 tokens. Raw data: `results/m5_prefix_bench_cuda.json`, `results/m5_hf_compare_fp32_cuda.json`.
 
 ## How it's tested
 
