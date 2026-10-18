@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M1, forward pass.** The forward pass and greedy generation run (no KV cache yet); token-level comparison with HF is next. See [PROGRESS.md](PROGRESS.md).
+> Status: **M1 done.** Greedy output is token-identical to Hugging Face `generate()` on 120 prompts (fp32, CPU). Next: paged KV cache (M2). See [PROGRESS.md](PROGRESS.md).
 
 ## Planned features
 
@@ -25,7 +25,10 @@ ruff check . && ruff format --check . && mypy && pytest
 
 ## Benchmarks
 
-None yet. Every number here will come from a logged run with date and hardware.
+Every number here comes from a logged run with date and hardware; see [PROGRESS.md](PROGRESS.md).
+
+- Correctness (2026-10-18, laptop CPU, fp32): 0 greedy mismatches vs HF over 120 prompts x 16 tokens.
+- No throughput numbers yet: M1 has no KV cache, so speed is not meaningful until M3.
 
 ## How it's tested
 

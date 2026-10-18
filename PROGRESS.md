@@ -5,7 +5,7 @@
 | Milestone | Status |
 |---|---|
 | M0 Repo scaffold | done (2026-10-17) |
-| M1 Forward pass, token-identical to HF | in progress (step 7: HF comparison on 120 prompts; result pending) |
+| M1 Forward pass, token-identical to HF | done (2026-10-18): 0 mismatches / 1,920 tokens |
 | M2 Paged KV cache and allocator | not started |
 | M3 Continuous batching and benchmark harness | not started |
 | M4 Triton paged-attention kernel | not started |
@@ -25,6 +25,7 @@
 - M1 step 5: reference causal grouped-query attention (`attention.py`), 8 spec tests incl. a match against PyTorch SDPA. Blank answers came from the mentor.
 - M1 step 6: `Qwen3` forward pass (28 layers, no KV cache) and `greedy_generate`; tiny-random-model tests; `scripts/generate.py` demo. First real run (2026-10-18, laptop CPU, fp32): "The capital of France is" -> " Paris. The capital of Italy is Rome. ...", 20 tokens in 6.8 s.
 - M1 step 7: HF parity tests on a tiny random Qwen3 (run in CI); `scripts/compare_hf.py` + 120 prompts for the real-model acceptance run. Config now also reads the newer `rope_parameters` layout.
+- M1 closed: acceptance run passed (see Benchmark results).
 
 ## Design decisions
 
@@ -60,7 +61,12 @@
 
 ## Benchmark results
 
-None yet.
+| Date | Hardware | What | Result |
+|---|---|---|---|
+| 2026-10-18 | Windows AMD64 laptop CPU, torch 2.14.1+cpu, fp32 | M1 greedy parity vs HF `generate()`: 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; 1047.5 s total (no KV cache) |
+| 2026-10-18 | same | `scripts/generate.py`, 5-token prompt, 20 new tokens | 6.8 s (no KV cache; correctness baseline, not a speed claim) |
+
+Raw data: `results/m1_hf_compare.json`.
 
 ## Open questions
 
