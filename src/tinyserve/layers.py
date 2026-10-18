@@ -58,7 +58,7 @@ def rope_cos_sin(
         i.e. the first half and second half of the last dim hold the same angles.
         Compute angles in float32 or better: positions reach 40960.
     """
-    two_i = torch.arange(0, head_dim, 2, dtype=torch.float64)
+    two_i = torch.arange(0, head_dim, 2, dtype=torch.float64, device=positions.device)
     inv_freq = theta ** (-two_i / head_dim)
     angles = torch.outer(positions.to(torch.float64), inv_freq)
     angles = torch.cat([angles, angles], dim=-1)

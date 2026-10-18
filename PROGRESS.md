@@ -37,6 +37,7 @@
 - M3 step 3 check (real model): all 120 prompts through the engine at once (max 32 in flight) give HF's greedy tokens exactly (see Benchmark results).
 - M3 step 4: benchmark harness, written by the mentor (benchmark plumbing): `bench.py` (closed-loop driver at a fixed concurrency; output tok/s, TTFT and TPOT p50/p99, KV utilization mean/max; `percentile` checked against numpy by Hypothesis) and `scripts/benchmark.py` (synthetic random-token workload, concurrency 1/8/32/64, JSON report). 10 tests. No GPU numbers yet: the first T4 run is the next step.
 - M3 step 5: `scripts/bench_hf.py`, the HF `generate()` baseline on the same seeded prompts (static batches of C, fp16 on the T4), and Kaggle notebook cells for the first T4 run. `synthetic_prompts` and `num_requests_for` moved into `bench.py` so both scripts run exactly the same inputs; requests per level default to 4 per concurrency slot (at least 16). Written by the mentor (benchmark plumbing). 2 new tests.
+- M3 step 6: first T4 run (Kaggle). HF baseline ran; our benchmark crashed: `rope_cos_sin` built its frequency table on the CPU while the positions were on the GPU ("Expected all tensors to be on the same device"). Cause: `torch.arange` without `device=`; CPU-only tests could not see it. Fix (mentor): create it on `positions.device`. New `tests/test_devices.py` runs the forward paths on PyTorch's `meta` device, which refuses to mix with CPU tensors, so a missing `device=` now fails on the laptop and in CI; plus a `gpu` test that runs the engine on CUDA and compares with CPU greedy.
 
 ## Design decisions
 
@@ -94,6 +95,7 @@
 - TPOT is averaged per request first, then p50/p99 are taken across requests: one number per request, so long requests don't dominate the percentiles.
 - HF baseline is static batching (batches of C run to completion) with the same prompts and fixed output length: that is what `generate()` offers, and identical inputs make the throughput comparison fair. Only tok/s is compared; HF's per-token times are not observable.
 - Requests per benchmark level scale with concurrency (4 per slot, at least 16): concurrency 64 runs several waves, and concurrency 1 does not take an hour.
+- Device bugs are caught on CPU by running the model on the `meta` device: it has no data, but it refuses to mix with CPU tensors, so any tensor created without `device=` fails a laptop test instead of a GPU run.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
@@ -110,6 +112,7 @@
 | 2026-10-18 | same | M2 greedy parity vs HF `generate()` with the paged KV cache (block size 16): 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; 692.9 s total (includes HF's own generate time) |
 | 2026-10-18 | same | `scripts/generate.py`, same prompt, 20 new tokens, paged KV cache | 3.2 s vs 6.8 s without the cache, identical token ids (single run; not a benchmark) |
 | 2026-10-18 | same | M3 greedy parity vs HF `generate()`, all 120 prompts through the continuous-batching engine at once (max 32 in flight, block size 16): 120 prompts x 16 tokens | 0 mismatches / 1,920 tokens; max prefill logit abs diff 1.23e-4; engine run 45.2 s, 64 steps, 0 preemptions (single run; CPU, not a benchmark) |
+| 2026-10-18 | Kaggle Tesla T4, torch 2.11.0+cu128, transformers 5.16.1, fp16, sdpa | HF `generate()` baseline, static batches of C, 128-token random prompts, 128 output tokens each (`scripts/bench_hf.py`) | C=1: 25.2 tok/s (16 requests, 81.4 s); C=8: 193.3 tok/s (32, 21.2 s); C=32: 415.6 tok/s (128, 39.4 s); C=64: 451.3 tok/s (256, 72.6 s) |
 
 Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`, `results/m3_hf_compare.json`.
 
@@ -121,4 +124,4 @@ Raw data: `results/m1_hf_compare.json`, `results/m2_hf_compare.json`, `results/m
 - Resolved 2026-10-17: torch 2.14.1 on PyPI has a cp314 win_amd64 wheel.
 - Dev tools use `>=` ranges, so CI may get a newer ruff than the laptop. Pin exact versions if that ever breaks CI.
 - Resolved 2026-10-17: tensor names and shapes verified, `test_real_checkpoint.py` passes on the real files.
-- Kaggle's preinstalled torch/CUDA version vs. the T4 (sm_75): check in the first GPU step.
+- Resolved 2026-10-18: Kaggle's preinstalled torch 2.11.0+cu128 (CUDA 12.8) runs on the T4 (compute capability 7.5); install tinyserve with `--no-deps` so it doesn't replace that torch.
