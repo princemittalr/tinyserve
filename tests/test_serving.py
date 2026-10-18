@@ -17,7 +17,13 @@ from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3, greedy_generate
 from tinyserve.sampling import SamplingParams
 from tinyserve.sequence import SeqStatus
-from tinyserve.serving import AsyncEngine, EngineDeadError, QueueFullError, StreamOutput
+from tinyserve.serving import (
+    AsyncEngine,
+    EngineDeadError,
+    QueueFullError,
+    RequestTrace,
+    StreamOutput,
+)
 
 PROMPTS = [[1], [5, 9, 2], [3, 8, 11, 2, 7, 7, 1], [4, 4, 6, 1, 2], [9, 30, 12, 5, 6, 2, 8]]
 NUM_BLOCKS = 64
@@ -108,8 +114,8 @@ async def collect(ae: AsyncEngine, prompt: list[int], n: int, **kw: object) -> l
     return [out async for out in ae.generate(prompt, n, **kw)]  # type: ignore[arg-type]
 
 
-def serve(e: Engine, **kw: int) -> AsyncEngine:
-    ae = AsyncEngine(e, **kw)
+def serve(e: Engine, max_requests: int = 256, trace: bool = False) -> AsyncEngine:
+    ae = AsyncEngine(e, max_requests, trace)
     ae.start()
     return ae
 
@@ -277,3 +283,54 @@ def test_shutdown_fails_open_requests() -> None:
                 pass
 
     asyncio.run(main())
+
+
+# --- tracing (M7) ----------------------------------------------------------------------
+
+
+def test_tracing_times_each_request_in_order() -> None:
+    e = Engine(tiny_model(), KVCache(CFG, NUM_BLOCKS, 4, dtype=torch.float32), trace_steps=True)
+    ae = serve(e, trace=True)
+
+    async def main() -> None:
+        await asyncio.gather(*(collect(ae, p, 5) for p in PROMPTS[:3]))
+        await asyncio.sleep(0.03)  # let the lag probe take a few samples
+
+    asyncio.run(main())
+    t = ae.take_trace()
+    ae.shutdown()
+    assert len(t["requests"]) == 3
+    for r in t["requests"]:
+        assert r.received is None  # only the HTTP layer sets it
+        assert r.submitted <= r.added <= r.first_token <= r.first_seen
+        assert r.first_token_step > r.added_at_step
+    assert t["loop_lag_ms"] and all(x > -1 for x in t["loop_lag_ms"])
+    assert len(t["steps"]) == e.num_steps
+    again = ae.take_trace()  # taking it clears it
+    assert again == {"requests": [], "loop_lag_ms": [], "steps": []}
+
+
+def test_tracing_keeps_aborted_requests_and_uses_the_callers_trace() -> None:
+    ae = serve(Engine(tiny_model(), KVCache(CFG, 256, 4, dtype=torch.float32)), trace=True)
+    mine = RequestTrace(tag="cmpl-x", received=0.0)
+
+    async def main() -> None:
+        stream = ae.generate(PROMPTS[2], 900, trace=mine)
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(main())
+    t = ae.take_trace()
+    ae.shutdown()
+    assert t["requests"] == [mine]
+    assert mine.first_seen is not None and mine.first_token is not None
+
+
+def test_no_tracing_by_default() -> None:
+    ae = serve(engine())
+    mine = RequestTrace(tag="cmpl-x")
+    outs = asyncio.run(collect(ae, PROMPTS[1], 3, trace=mine))
+    ae.shutdown()
+    assert len(outs) == 3
+    assert ae.traces == [] and ae.loop_lag_ms == []
+    assert mine.submitted is None

@@ -74,12 +74,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=0, help="for requests without a seed")
     parser.add_argument("--ignore-eos", action="store_true",
                         help="benchmarks only: every request runs to max_tokens")  # fmt: skip
+    parser.add_argument("--trace-requests", action="store_true",
+                        help="profiling: time requests and steps, serve /debug/trace")  # fmt: skip
+    parser.add_argument("--switch-interval-ms", type=float, default=None,
+                        help="profiling: how often Python offers the GIL to another "
+                             "thread (default 5 ms)")  # fmt: skip
     args = parser.parse_args(argv)
 
     if not is_loopback(args.host) and not args.allow_remote:
         sys.exit(f"refusing to bind to {args.host}: the API has no authentication. "
                  "Pass --allow-remote if you really want that.")  # fmt: skip
 
+    if args.switch_interval_ms is not None:
+        sys.setswitchinterval(args.switch_interval_ms / 1e3)
     dtype = getattr(torch, args.dtype or ("float32" if args.device == "cpu" else "float16"))
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, args.device), args.attention)
@@ -88,16 +95,19 @@ def main(argv: list[str] | None = None) -> None:
     num_blocks = int(args.kv_gib * 2**30 // per_block)
     cache = KVCache(cfg, num_blocks, args.block_size, dtype, args.device)
     engine = Engine(model, cache, args.max_num_seqs, args.max_batch_tokens,
-                    prefix_cache=args.prefix_cache, seed=args.seed)  # fmt: skip
+                    prefix_cache=args.prefix_cache, seed=args.seed,
+                    trace_steps=args.trace_requests)  # fmt: skip
     limits = Limits(max_prompt_tokens=args.max_prompt_tokens, max_tokens_cap=args.max_tokens_cap)
     tok = QwenTokenizer(args.model_dir / "tokenizer.json")
-    ae = AsyncEngine(engine, max_requests=args.max_requests)
+    ae = AsyncEngine(engine, max_requests=args.max_requests, trace=args.trace_requests)
     eos = frozenset() if args.ignore_eos else eos_ids(args.model_dir)
     app = create_app(ae, tok, args.model_dir.name, cfg.vocab_size, eos, limits)
     print(f"{args.device} {dtype}, {args.attention} decode attention, prefix cache "
           f"{'on' if args.prefix_cache else 'off'}, KV cache {num_blocks} blocks x "
           f"{args.block_size} tokens ({cache.memory_bytes / 2**30:.2f} GiB)"
-          f"{', EOS ignored' if args.ignore_eos else ''}; "
+          f"{', EOS ignored' if args.ignore_eos else ''}"
+          f"{', tracing' if args.trace_requests else ''}, "
+          f"GIL switch interval {sys.getswitchinterval() * 1e3:g} ms; "
           f"serving {args.model_dir.name!r} on http://{args.host}:{args.port}",
           flush=True)  # fmt: skip
     ae.start()

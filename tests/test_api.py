@@ -402,3 +402,25 @@ def test_disconnect_aborts_the_request(stream: bool) -> None:
     assert not e.seqs
     assert e.num_steps < 500  # aborted, not run to its 900 tokens
     assert e.scheduler.allocator.num_free == 256
+
+
+def test_debug_trace_is_404_without_tracing(client: TestClient) -> None:
+    error_of(client.get("/debug/trace"), 404)
+
+
+def test_debug_trace_names_each_request_by_its_response_id() -> None:
+    cache = KVCache(CFG, 64, 4, dtype=torch.float32)
+    ae = AsyncEngine(Engine(tiny_model(), cache, trace_steps=True), trace=True)
+    ae.start()
+    c = TestClient(create_app(ae, TOK, NAME, CFG.vocab_size))
+    events = post_stream(c, "/v1/completions", {"prompt": "abc", "max_tokens": 4})
+    plain = c.post("/v1/completions", json={"prompt": "abc", "max_tokens": 4}).json()
+    t = c.get("/debug/trace").json()
+    ae.shutdown()
+    by_id = {r["tag"]: r for r in t["requests"]}
+    assert set(by_id) == {events[0]["id"], plain["id"]}
+    for r in by_id.values():
+        assert r["received"] <= r["submitted"] <= r["added"] <= r["first_token"]
+        assert r["first_token"] <= r["first_seen"]
+    assert t["steps"] and all(s["total_ms"] > 0 for s in t["steps"])
+    assert c.get("/debug/trace").json()["requests"] == []

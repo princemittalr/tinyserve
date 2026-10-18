@@ -18,14 +18,20 @@ is no work instead of spinning. Outputs go back with ``loop.call_soon_threadsafe
 the one thread-safe way into an asyncio queue.
 
 This layer only moves token ids; text (detokenize.py) and HTTP (api.py) sit on top.
+
+With ``trace=True`` (M7) it also times each request across the two threads
+(``RequestTrace``) and measures how late the event loop wakes up (``loop_lag_ms``): the
+pieces of a time to first token that the engine alone cannot see.
 """
 
 import asyncio
 import contextlib
 import queue
 import threading
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -50,6 +56,30 @@ class StreamOutput:
     num_output_tokens: int  # generated so far, including token_ids
 
 
+@dataclass
+class RequestTrace:
+    """When one request crossed each boundary, in ``time.perf_counter()`` seconds.
+
+    ``perf_counter`` is a system-wide monotonic clock (CLOCK_MONOTONIC on Linux, QPC on
+    Windows), so a client process on the same machine can compare its own times with these.
+
+        received     the HTTP handler started (set by api.py; None outside HTTP)
+        submitted    the event loop put the "add" command on the engine's queue
+        added        the engine thread took it and added the request (between steps)
+        first_token  the engine thread handed over the first output, after its step
+        first_seen   the event loop picked that output up from the request's queue
+    """
+
+    tag: str = ""
+    received: float | None = None
+    submitted: float | None = None
+    added: float | None = None
+    added_at_step: int | None = None  # engine.num_steps when it was added
+    first_token: float | None = None
+    first_token_step: int | None = None  # engine.num_steps after the step that made it
+    first_seen: float | None = None
+
+
 @dataclass(eq=False)
 class _Request:
     prompt: list[int]
@@ -61,10 +91,11 @@ class _Request:
     seq_id: int | None = None  # set by the engine thread once added
     sent: int = 0  # output tokens already delivered
     done: bool = False  # engine thread: finished, aborted or rejected
+    trace: RequestTrace | None = None
 
 
 class AsyncEngine:
-    def __init__(self, engine: Engine, max_requests: int = 256) -> None:
+    def __init__(self, engine: Engine, max_requests: int = 256, trace: bool = False) -> None:
         if max_requests <= 0:
             raise ValueError(f"max_requests must be positive, got {max_requests}")
         self.engine = engine
@@ -75,6 +106,10 @@ class AsyncEngine:
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, name="tinyserve-engine", daemon=True)
         self._started = False
+        self.trace = trace
+        self.traces: list[RequestTrace] = []  # finished requests, oldest first (if trace)
+        self.loop_lag_ms: list[float] = []  # how late each lag probe woke up (if trace)
+        self._lag_task: asyncio.Task[None] | None = None
 
     # --- event loop side ----------------------------------------------------------------
 
@@ -93,12 +128,37 @@ class AsyncEngine:
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
+    def take_trace(self) -> dict[str, list[Any]]:
+        """Event loop side, tracing only: hand over and forget what was recorded so far:
+        finished requests, event-loop lag samples and the engine's steps."""
+        steps = self.engine.step_records
+        n = len(steps) if steps is not None else 0  # the engine thread may append more
+        out: dict[str, list[Any]] = {
+            "requests": self.traces,
+            "loop_lag_ms": self.loop_lag_ms,
+            "steps": steps[:n] if steps is not None else [],
+        }
+        self.traces, self.loop_lag_ms = [], []
+        if steps is not None:
+            del steps[:n]
+        return out
+
+    async def _probe_lag(self, period: float = 0.005) -> None:
+        """Sleep ``period`` again and again and record how much later than asked the loop
+        woke up: the time something else (another callback, or the engine thread holding
+        the GIL) kept it from running."""
+        while True:
+            start = time.perf_counter()
+            await asyncio.sleep(period)
+            self.loop_lag_ms.append((time.perf_counter() - start - period) * 1e3)
+
     async def generate(
         self,
         prompt: list[int],
         max_new_tokens: int,
         sampling: SamplingParams | None = None,
         eos_ids: frozenset[int] = frozenset(),
+        trace: RequestTrace | None = None,
     ) -> AsyncGenerator[StreamOutput, None]:
         """Stream one request's tokens, one ``StreamOutput`` per engine step.
 
@@ -106,7 +166,8 @@ class AsyncEngine:
         ``ValueError`` if the engine rejects the request (e.g. it can never fit), and
         ``EngineDeadError`` if the engine thread is not running. If the caller stops
         early (``aclose``, or its task is cancelled because the client disconnected),
-        the request is aborted and its KV-cache blocks are freed.
+        the request is aborted and its KV-cache blocks are freed. With tracing on, the
+        request's times are kept in ``trace`` (a new one if not given) once it ends.
         """
         if not self.is_alive:
             raise EngineDeadError("engine thread is not running") from self._error
@@ -121,12 +182,19 @@ class AsyncEngine:
             sampling or SamplingParams(),
             asyncio.get_running_loop(),
         )
+        if self.trace:
+            if self._lag_task is None or self._lag_task.done():  # one probe per loop
+                self._lag_task = req.loop.create_task(self._probe_lag())
+            req.trace = trace or RequestTrace()
+            req.trace.submitted = time.perf_counter()
         self.num_requests += 1
         finished = False
         try:
             self._commands.put(("add", req))
             while True:
                 item = await req.out.get()
+                if req.trace is not None and req.trace.first_seen is None:
+                    req.trace.first_seen = time.perf_counter()
                 if isinstance(item, BaseException):
                     finished = True  # the engine thread already dropped it
                     raise item
@@ -139,6 +207,8 @@ class AsyncEngine:
             self.num_requests -= 1
             if not finished:
                 self._commands.put(("abort", req))
+            if req.trace is not None:
+                self.traces.append(req.trace)
 
     # --- engine thread ------------------------------------------------------------------
 
@@ -185,6 +255,9 @@ class AsyncEngine:
                 self._send(req, e)
                 return
             self._live[req.seq_id] = req
+            if req.trace is not None:
+                req.trace.added = time.perf_counter()
+                req.trace.added_at_step = self.engine.num_steps
         elif kind == "abort" and not req.done and req.seq_id is not None:
             req.done = True
             self.engine.abort(req.seq_id)
@@ -206,6 +279,9 @@ class AsyncEngine:
                 req.done = True
                 self.engine.release(seq_id)
                 del self._live[seq_id]
+            if req.trace is not None and req.trace.first_token is None:
+                req.trace.first_token = time.perf_counter()
+                req.trace.first_token_step = self.engine.num_steps
             self._send(req, StreamOutput(new, reason, len(seq.prompt), len(seq.output)))
 
     @staticmethod

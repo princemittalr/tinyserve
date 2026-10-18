@@ -21,6 +21,7 @@ from tinyserve.config import ModelConfig
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
+from tinyserve.profiling import ttft_segments
 from tinyserve.weights import expected_shapes, load_weights
 
 
@@ -55,7 +56,8 @@ def offline_text(model_dir: Path, prompt: list[int], n: int) -> str:
 
 def test_server_over_http(model_dir: Path) -> None:
     prompt = byte_level_bpe().encode("the capital of France is").ids
-    args = ["--model-dir", str(model_dir), "--device", "cpu", "--kv-gib", "0.01"]
+    args = ["--model-dir", str(model_dir), "--device", "cpu", "--kv-gib", "0.01",
+            "--trace-requests"]  # fmt: skip
     with running_server(args, free_port(), timeout=120) as url:
         body = {"prompt": prompt, "max_tokens": 12, "temperature": 0}
 
@@ -67,6 +69,7 @@ def test_server_over_http(model_dir: Path) -> None:
         plain = httpx.post(f"{url}/v1/completions", json=body, timeout=60).json()
         refused = httpx.post(f"{url}/v1/completions", json={**body, "max_tokens": 10**6})
         models = httpx.get(f"{url}/v1/models").json()
+        trace = httpx.get(f"{url}/debug/trace").json()
 
     want = offline_text(model_dir, prompt, 12)
     assert streamed.text == plain["choices"][0]["text"] == want
@@ -74,6 +77,14 @@ def test_server_over_http(model_dir: Path) -> None:
     assert streamed.ttft > 0 and streamed.tpot is not None and streamed.tpot > 0
     assert refused.status_code == 400
     assert models["data"][0]["id"] == model_dir.name
+    # The server's trace of the streamed request splits the client's TTFT exactly: the
+    # client and the server process read the same perf_counter clock.
+    by_id = {r["tag"]: r for r in trace["requests"]}
+    assert streamed.id.startswith("cmpl-") and plain["id"] in by_id
+    segs = ttft_segments(streamed.sent, streamed.chunk_times[0], by_id[streamed.id])
+    assert all(v >= 0 for v in segs.values()), segs
+    assert sum(segs.values()) == pytest.approx(streamed.ttft * 1e3)
+    assert trace["steps"] and trace["loop_lag_ms"]
 
 
 def test_server_refuses_a_public_host(model_dir: Path) -> None:

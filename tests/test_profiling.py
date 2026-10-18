@@ -13,6 +13,7 @@ from tinyserve.block_allocator import BlockAllocator
 from tinyserve.engine import Engine, StepRecord
 from tinyserve.kv_cache import KVCache
 from tinyserve.profiling import (
+    TTFT_SEGMENTS,
     attention_replaced,
     decode_tables,
     fill_to_decode,
@@ -21,6 +22,7 @@ from tinyserve.profiling import (
     profile_summary,
     summarize_steps,
     time_ms,
+    ttft_segments,
 )
 
 CPU = torch.device("cpu")
@@ -137,3 +139,15 @@ def test_gpu_time_ms_is_zero_without_gpu_rows() -> None:
     with profile(activities=[ProfilerActivity.CPU], acc_events=True) as prof:
         m.forward_batch(batch, cache)
     assert gpu_time_ms(prof, lambda name: True) == 0.0
+
+
+def test_ttft_segments_split_the_whole_ttft_in_order() -> None:
+    trace = {"received": 1.0, "submitted": 1.5, "added": 3.0, "first_token": 6.0,
+             "first_seen": 6.25, "tag": "cmpl-x"}  # fmt: skip
+    segs = ttft_segments(sent=0.5, first_chunk=7.0, trace=trace)
+    assert list(segs) == list(TTFT_SEGMENTS)
+    assert segs == {"to_handler": 500.0, "parse": 500.0, "to_engine": 1500.0,
+                    "engine": 3000.0, "to_loop": 250.0, "to_client": 750.0}  # fmt: skip
+    assert sum(segs.values()) == 6500.0
+    with pytest.raises(ValueError, match="missing"):
+        ttft_segments(0.0, 1.0, {**trace, "added": None})

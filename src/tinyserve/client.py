@@ -4,6 +4,7 @@ Used by the benchmark and parity scripts and by the end-to-end test, so they all
 the server the way any outside client would: over a real socket, as SSE.
 """
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -51,6 +52,7 @@ class StreamResult:
     finish_reason: str | None
     completion_tokens: int
     sent: float  # perf_counter() when the request was sent
+    id: str = ""  # the response's id ("cmpl-..."), to find the server's trace of it
     chunk_times: list[float] = field(default_factory=list)  # when each choice chunk arrived
 
     @property
@@ -88,6 +90,7 @@ async def stream_completion(
             event = json.loads(line[6:])
             if "error" in event:
                 raise RuntimeError(event["error"]["message"])
+            result.id = result.id or event.get("id", "")
             if event.get("usage"):
                 result.completion_tokens = event["usage"]["completion_tokens"]
             for choice in event["choices"]:  # empty for the usage chunk
@@ -96,3 +99,23 @@ async def stream_completion(
                 result.finish_reason = choice["finish_reason"] or result.finish_reason
     result.text = "".join(pieces)
     return result
+
+
+async def closed_loop(
+    url: str, prompts: list[list[int]], output_len: int, concurrency: int
+) -> tuple[list[StreamResult], float]:
+    """``concurrency`` client tasks; each streams its next greedy request as soon as the
+    last one has finished (the M3 closed loop, over HTTP). Returns results and seconds."""
+    todo = list(reversed(prompts))
+    results: list[StreamResult] = []
+    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
+    async with httpx.AsyncClient(timeout=None, limits=limits) as client:
+
+        async def user() -> None:
+            while todo:
+                body = {"prompt": todo.pop(), "max_tokens": output_len, "temperature": 0}
+                results.append(await stream_completion(client, url, body))
+
+        start = time.perf_counter()
+        await asyncio.gather(*(user() for _ in range(concurrency)))
+        return results, time.perf_counter() - start

@@ -74,8 +74,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   | 32 | 149.4 / 335.1 | 346 / 704 ms | 8,928 / 1,994 ms | 207.3 / 81.7 ms | 91% |
 
   Only the first request of each prefix misses. p99 at C=1 is one of those misses. At C=32 the
-  median TTFT got worse; the likely cause (not yet profiled) is that hits arrive in large
-  synchronized waves whose prefills each attend over 1,088 cached tokens one sequence at a time.
+  median TTFT got worse. Profiled in M7: hits arrive in waves of up to 25 prefills in one step
+  (645-685 ms), and 77% of such a step is prefill attention over the 1,024 cached tokens, run one
+  sequence at a time in PyTorch.
   fp32 greedy parity with the cache on 24 chat prompts sharing a system prompt: 0 mismatches /
   384 tokens. In fp32, outputs with the cache on and off are identical for 128 / 128 requests at
   C=32 (fp16: 124 / 128, rounding). Raw data: `results/m5_prefix_bench_cuda.json`,
@@ -99,6 +100,15 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   streamed) is identical to HF `generate()`, and the chat template is identical to Qwen3's own.
   Raw data: `results/m6_api_bench_cuda.json`, `results/m6_engine_bench_cuda.json`,
   `results/m6_api_hf_compare_float32_cuda.json`.
+
+- Where a decode step's time goes (2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
+  `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
+  at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
+  320 GB/s) is 3.8 / 4.3 / 5.9 / 8.1 ms. At C=32 the GPU runs kernels for 16.7 ms of a 34.2 ms
+  forward pass (1,851 kernel launches per step), so about half the time it waits for Python to
+  launch the next one; `build_batch` adds 3.2 ms. The GEMMs reach 176 GB/s (55% of the T4's
+  spec), the decode kernel 89 GB/s (it loads each k/v twice). Raw data:
+  `results/m7_engine_profile_cuda.json`, `results/m7_prefix_steps_cuda.json`.
 
 ## How it's tested
 

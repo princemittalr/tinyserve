@@ -21,13 +21,16 @@ A client that disconnects is aborted: for a stream, Starlette cancels the respon
 task; for a plain request, the handler checks for a disconnect after every step. Either
 way ``AsyncEngine.generate`` closes and the request's KV-cache blocks are freed.
 There is no authentication, which is why ``scripts/serve.py`` binds to 127.0.0.1.
+
+    GET  /debug/trace           (M7, only when the AsyncEngine traces) per-request times,
+                                event-loop lag and engine steps since the last call
 """
 
 import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol, TypeVar
 
 from fastapi import FastAPI, Request
@@ -36,7 +39,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tinyserve.detokenize import IncrementalDetokenizer
 from tinyserve.sampling import SamplingParams
-from tinyserve.serving import AsyncEngine, EngineDeadError, QueueFullError, StreamOutput
+from tinyserve.serving import (
+    AsyncEngine,
+    EngineDeadError,
+    QueueFullError,
+    RequestTrace,
+    StreamOutput,
+)
 
 
 class TextTokenizer(Protocol):
@@ -173,12 +182,12 @@ def create_app(
         return max_tokens, SamplingParams(req.temperature, req.top_p, req.seed)
 
     async def start(
-        prompt_ids: list[int], max_tokens: int, params: SamplingParams
+        prompt_ids: list[int], max_tokens: int, params: SamplingParams, trace: RequestTrace
     ) -> AsyncGenerator[StreamOutput, None]:
         """Begin generating and wait for the first output, so that errors become HTTP
         status codes before any response (or stream) has started."""
         try:
-            stream = engine.generate(prompt_ids, max_tokens, params, eos_ids)
+            stream = engine.generate(prompt_ids, max_tokens, params, eos_ids, trace)
             first = await anext(stream)
         except QueueFullError as e:
             raise APIError(429, str(e), "server_overloaded") from None
@@ -220,10 +229,11 @@ def create_app(
         req: _Common,
         prompt_ids: list[int],
         chat: bool,
+        received: float,
     ) -> Response:
         max_tokens, params = prepare(req, prompt_ids)
-        outs = await start(prompt_ids, max_tokens, params)
         rid = f"{'chatcmpl' if chat else 'cmpl'}-{uuid.uuid4().hex}"
+        outs = await start(prompt_ids, max_tokens, params, RequestTrace(rid, received))
         head: dict[str, Any] = {
             "id": rid,
             "object": "chat.completion.chunk" if chat else "text_completion",
@@ -307,16 +317,29 @@ def create_app(
 
     @app.post("/v1/completions")
     async def completions(request: Request) -> Response:
+        received = time.perf_counter()
         req = await parse(request, CompletionRequest)
         prompt = req.prompt
         ids = tokenizer.encode(prompt) if isinstance(prompt, str) else list(prompt)
-        return await respond(request, req, ids, chat=False)
+        return await respond(request, req, ids, chat=False, received=received)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        received = time.perf_counter()
         req = await parse(request, ChatRequest)
         ids = tokenizer.encode(chat_template(req.messages))
-        return await respond(request, req, ids, chat=True)
+        return await respond(request, req, ids, chat=True, received=received)
+
+    @app.get("/debug/trace")
+    async def debug_trace() -> Response:
+        if not engine.trace:
+            raise APIError(404, "tracing is off; start the server with --trace-requests")
+        t = engine.take_trace()
+        return JSONResponse({
+            "requests": [asdict(r) for r in t["requests"]],
+            "loop_lag_ms": t["loop_lag_ms"],
+            "steps": [{**asdict(s), "total_ms": s.total_ms} for s in t["steps"]],
+        })  # fmt: skip
 
     return app
 

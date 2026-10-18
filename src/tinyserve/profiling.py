@@ -14,12 +14,15 @@ layer. These helpers test that guess directly instead of inferring it:
     prefill_items       batch inputs of sequences that prefill after a cached prefix (M5).
     fill_to_decode      admit requests and run their prefills, so every later step decodes.
     summarize_steps     mean phase times of an engine's ``StepRecord`` list (M7).
+    ttft_segments       one HTTP request's time to first token, split where it crossed
+                        from the client to the event loop to the engine thread and back.
 """
 
 import statistics
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 from torch.profiler import DeviceType, profile
@@ -162,3 +165,29 @@ def summarize_steps(records: list[StepRecord]) -> dict[str, float]:
     out["num_tokens"] = sum(r.num_tokens for r in records) / n
     out["context_tokens"] = sum(r.context_tokens for r in records) / n
     return out
+
+
+# Where a request's time to first token went, in order; they add up to the whole TTFT.
+TTFT_SEGMENTS = ("to_handler", "parse", "to_engine", "engine", "to_loop", "to_client")
+
+
+def ttft_segments(sent: float, first_chunk: float, trace: dict[str, Any]) -> dict[str, float]:
+    """Split one request's TTFT (client clock: ``sent`` -> ``first_chunk``) at the times
+    the server recorded (a ``RequestTrace`` as a dict), in ms:
+
+        to_handler  client sends -> HTTP handler starts (socket, uvicorn, a busy loop)
+        parse       handler -> "add" queued (body parsing, validation, tokenising)
+        to_engine   queued -> the engine thread adds it (it only looks between steps)
+        engine      added -> first token out: waiting for admission, then the prefill
+        to_loop     first token -> the event loop picks it up
+        to_client   -> the first SSE chunk reaches the client (detokenise, send, parse)
+
+    Both processes read ``time.perf_counter``, one system-wide clock on Linux and Windows.
+    """
+    points = [sent, trace["received"], trace["submitted"], trace["added"],
+              trace["first_token"], trace["first_seen"], first_chunk]  # fmt: skip
+    if any(p is None for p in points):
+        raise ValueError(f"trace is missing a time: {trace}")
+    return {
+        name: (b - a) * 1e3 for name, a, b in zip(TTFT_SEGMENTS, points, points[1:], strict=False)
+    }

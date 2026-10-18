@@ -17,34 +17,14 @@ import argparse
 import asyncio
 import datetime as dt
 import json
-import time
 from pathlib import Path
 from typing import Any
 
-import httpx
 import torch
 
 from tinyserve.bench import num_requests_for, percentile, synthetic_prompts
-from tinyserve.client import StreamResult, running_server, stream_completion
+from tinyserve.client import StreamResult, closed_loop, running_server
 from tinyserve.config import ModelConfig
-
-
-async def closed_loop(
-    url: str, prompts: list[list[int]], output_len: int, concurrency: int
-) -> tuple[list[StreamResult], float]:
-    todo = list(reversed(prompts))
-    results: list[StreamResult] = []
-    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
-    async with httpx.AsyncClient(timeout=None, limits=limits) as client:
-
-        async def user() -> None:
-            while todo:
-                body = {"prompt": todo.pop(), "max_tokens": output_len, "temperature": 0}
-                results.append(await stream_completion(client, url, body))
-
-        start = time.perf_counter()
-        await asyncio.gather(*(user() for _ in range(concurrency)))
-        return results, time.perf_counter() - start
 
 
 def summarise(results: list[StreamResult], seconds: float, concurrency: int) -> dict[str, Any]:
