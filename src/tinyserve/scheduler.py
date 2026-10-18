@@ -209,6 +209,23 @@ class Scheduler:
         # TODO(you) 7: put it at the FRONT of the waiting queue (it arrived before them).
         self.waiting.appendleft(seq)
 
+    def abort(self, seq: Sequence) -> None:
+        """Drop a request between steps (its client went away, M6); free its blocks now.
+
+        A running sequence's full blocks go into the prefix cache first, like at finish:
+        their k/v are complete, and a retry of the same request can reuse them. Aborting a
+        finished sequence does nothing.
+        """
+        if seq.status is SeqStatus.FINISHED:
+            return
+        if seq.status is SeqStatus.RUNNING:
+            self._cache_blocks(seq)
+            self.running.remove(seq)
+        else:
+            self.waiting.remove(seq)  # a waiting sequence holds no blocks
+        seq.table.release()
+        seq.status = SeqStatus.FINISHED
+
     def update(self, seqs: list[Sequence], next_tokens: list[int]) -> list[Sequence]:
         """Record each sequence's new token; retire and return the ones that finished."""
         finished = []

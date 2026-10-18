@@ -24,7 +24,7 @@ from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
 from tinyserve.sampling import SamplingParams, sample
 from tinyserve.scheduler import Scheduler
-from tinyserve.sequence import Sequence
+from tinyserve.sequence import SeqStatus, Sequence
 
 
 @dataclass
@@ -99,6 +99,19 @@ class Engine:
 
     def has_work(self) -> bool:
         return self.scheduler.has_work()
+
+    def abort(self, seq_id: int) -> None:
+        """Stop a request between steps and free its blocks (no-op if it already finished)."""
+        self.scheduler.abort(self.seqs[seq_id])
+        self.generators.pop(seq_id, None)
+
+    def release(self, seq_id: int) -> None:
+        """Forget a finished request. A server calls this so its records do not grow forever;
+        the benchmarks keep them to compute TTFT and TPOT afterwards."""
+        if self.seqs[seq_id].status is not SeqStatus.FINISHED:
+            raise ValueError(f"request {seq_id} has not finished; abort it first")
+        del self.seqs[seq_id], self.times[seq_id], self.sampling[seq_id]
+        self.generators.pop(seq_id, None)
 
     def step(self) -> list[Sequence]:
         """Run one model step. Returns the sequences that finished in it."""

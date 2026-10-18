@@ -103,6 +103,10 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   softmax(logits / temperature) and the renormalised top-p nucleus, a Hypothesis test checks the
   top-p set is the smallest most likely one, and a seeded request must give the same tokens
   alone, in a mixed batch, and when it is preempted and recomputed.
+- The serving loop runs real asyncio clients against the engine thread: streamed tokens equal
+  greedy output, concurrent clients share steps, a client that disconnects (or is still queued)
+  is aborted and every block comes back, and a crashed engine fails every open request.
+  Streamed text must equal the full decode for random UTF-8 cut into random byte tokens.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
