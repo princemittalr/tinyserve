@@ -21,14 +21,23 @@ are KV-cache blocks for them. One step of the engine is:
      fit, instead of skipping ahead to smaller ones, so a long request can't be starved
      by a stream of short ones.
 
+With ``prefix_cache=True`` (M5) the scheduler also owns a ``RadixCache``:
+  - admission first looks up the sequence's tokens in the cache and adopts the matched
+    blocks, so only the tokens after the cached prefix are prefilled;
+  - a sequence that finishes or is preempted puts its full blocks into the cache, so a
+    later request with the same prefix (or the preempted sequence itself) can reuse them;
+  - when blocks run short, cached blocks nobody is using are evicted (LRU) before any
+    running sequence is preempted.
+
 Like the allocator, this is plain Python with no tensors. ``tests/test_scheduler.py``
-is the spec.
+and ``tests/test_prefix_scheduler.py`` are the spec.
 """
 
 from collections import deque
 
 from tinyserve.block_allocator import BlockAllocator
 from tinyserve.block_table import BlockTable
+from tinyserve.radix_cache import RadixCache
 from tinyserve.sequence import SeqStatus, Sequence
 
 
@@ -39,6 +48,8 @@ class Scheduler:
         block_size: int,
         max_num_seqs: int = 64,
         max_batch_tokens: int = 2048,
+        *,
+        prefix_cache: bool = False,
     ) -> None:
         self.allocator = allocator
         self.block_size = block_size
@@ -47,6 +58,11 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []  # in admission order: oldest first
         self.num_preemptions = 0
+        self.cache = RadixCache(allocator, block_size) if prefix_cache else None
+        # Prompt tokens at admission (preempted sequences count again when re-admitted),
+        # and how many of them came from the prefix cache instead of being prefilled.
+        self.num_admitted_tokens = 0
+        self.num_cached_tokens = 0
 
     def add(
         self,
@@ -80,8 +96,24 @@ class Scheduler:
 
     @property
     def kv_utilization(self) -> float:
-        """Fraction of KV-cache blocks in use right now."""
+        """Fraction of KV-cache blocks in use right now (cached-only blocks included)."""
         return self.allocator.num_used / self.allocator.num_blocks
+
+    def _evict(self, n: int) -> int:
+        """Ask the prefix cache to free ``n`` blocks; returns how many it freed."""
+        return self.cache.evict(n) if self.cache is not None else 0
+
+    def _cache_blocks(self, seq: Sequence) -> None:
+        """Put the sequence's full blocks into the prefix cache (before releasing them).
+
+        Every token in the table has its k/v written: the table only grows in
+        ``schedule()``, and the forward pass that fills those slots runs before the next
+        ``update()`` or ``schedule()`` can get here.
+        """
+        if self.cache is None:
+            return
+        full = seq.table.num_tokens // self.block_size
+        self.cache.insert(seq.tokens[: full * self.block_size], seq.table.blocks[:full])
 
     def schedule(self) -> list[Sequence]:
         """Pick this step's sequences and append their pending tokens to their tables.
@@ -104,6 +136,9 @@ class Scheduler:
             # TODO(you) 1: loop while this sequence's pending tokens need more NEW blocks
             # than are free. (BlockTable.blocks_needed, allocator.num_free)
             while seq.table.blocks_needed(len(seq.pending())) > self.allocator.num_free:
+                short = seq.table.blocks_needed(len(seq.pending())) - self.allocator.num_free
+                if self._evict(short):
+                    continue  # unused cached blocks go before any running sequence
                 if queue:
                     # TODO(you) 2: take the NEWEST remaining running sequence off the queue.
                     self._preempt(queue.pop())
@@ -112,7 +147,8 @@ class Scheduler:
                     fits = False
                     break
             if fits:
-                seq.table.append(len(seq.pending()))
+                seq.num_scheduled = len(seq.pending())
+                seq.table.append(seq.num_scheduled)
                 self.running.append(seq)
 
     def _admit_waiting(self) -> None:
@@ -120,24 +156,50 @@ class Scheduler:
         budget = self.max_batch_tokens - len(self.running)  # each running seq brings 1 token
         while self.waiting:
             seq = self.waiting[0]
-            n = len(seq.pending())
             # TODO(you) 3: stop if the batch already has the maximum number of sequences.
             if len(self.running) >= self.max_num_seqs:
                 break
+            hit = self._adopt_cached_prefix(seq)
+            n = len(seq.pending())
             # TODO(you) 4: stop if this sequence's n tokens don't fit in the token budget.
             if n > budget:
+                seq.table.release()  # give back the adopted blocks; they stay cached
                 break
             # TODO(you) 5: stop if the cache doesn't have enough free blocks for n tokens.
-            if seq.table.blocks_needed(n) > self.allocator.num_free:
+            short = seq.table.blocks_needed(n) - self.allocator.num_free
+            if short > 0 and self._evict(short) < short:
+                seq.table.release()
                 break
             self.waiting.popleft()
+            seq.num_scheduled = n
             seq.table.append(n)
             seq.status = SeqStatus.RUNNING
             self.running.append(seq)
             budget -= n
+            self.num_admitted_tokens += len(seq.tokens)
+            self.num_cached_tokens += hit
+
+    def _adopt_cached_prefix(self, seq: Sequence) -> int:
+        """Start ``seq``'s empty table with its longest cached prefix; return its tokens.
+
+        At least one token is always left to compute: its logits are what samples the
+        next token. Whole blocks only, so a 7-token prompt with block size 4 can reuse at
+        most 4 tokens.
+        """
+        if self.cache is None:
+            return 0
+        limit = (len(seq.tokens) - 1) // self.block_size * self.block_size
+        hit = self.cache.match_prefix(seq.tokens[:limit])
+        seq.table.adopt(hit)
+        return seq.table.num_tokens
 
     def _preempt(self, seq: Sequence) -> None:
-        """Evict a running sequence; it will be recomputed when admitted again."""
+        """Evict a running sequence; it will be recomputed when admitted again.
+
+        With the prefix cache its full blocks are cached first, so the recompute can
+        reuse whatever of them has not been evicted by then.
+        """
+        self._cache_blocks(seq)
         # TODO(you) 6: give all of its blocks back to the allocator.
         seq.table.release()
         seq.status = SeqStatus.WAITING
@@ -153,6 +215,7 @@ class Scheduler:
             seq.output.append(tok)
             # TODO(you) 8: has this sequence hit EOS or max_new_tokens? (a Sequence method)
             if seq.is_done():
+                self._cache_blocks(seq)
                 # TODO(you) 9: free its blocks.
                 seq.table.release()
                 seq.status = SeqStatus.FINISHED

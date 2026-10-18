@@ -8,6 +8,8 @@ go into the next forward pass:
     running, after a step:  pending = the one token just generated  (decode)
     after preemption:       the table was released, so pending = prompt + output
                             (recompute: the k/v are rebuilt by one prefill)
+    prefix cache hit (M5):  the table starts with cached blocks, so pending = only
+                            the tokens after the cached prefix
 """
 
 from dataclasses import dataclass, field
@@ -32,6 +34,9 @@ class Sequence:
     output: list[int] = field(default_factory=list)
     status: SeqStatus = SeqStatus.WAITING
     num_preemptions: int = 0
+    # Tokens appended to the table by the last schedule(): this step's input is the last
+    # num_scheduled tokens. Less than the prompt when a cached prefix was reused (M5).
+    num_scheduled: int = 0
 
     def __post_init__(self) -> None:
         if not self.prompt:

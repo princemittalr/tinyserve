@@ -47,8 +47,10 @@ def check_invariants(s: Scheduler) -> None:
         assert q.table.blocks == []  # waiting sequences hold no cache memory
 
 
-def sched(num_blocks: int = 64, block_size: int = 4, **kw: int) -> Scheduler:
-    return Scheduler(BlockAllocator(num_blocks), block_size, **kw)
+def sched(
+    num_blocks: int = 64, block_size: int = 4, prefix_cache: bool = False, **kw: int
+) -> Scheduler:
+    return Scheduler(BlockAllocator(num_blocks), block_size, prefix_cache=prefix_cache, **kw)
 
 
 # --- add ----------------------------------------------------------------------------------

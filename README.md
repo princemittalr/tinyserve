@@ -69,6 +69,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - The radix prefix cache has a Hypothesis test that plays the scheduler with colliding random
   prompts and random eviction: every match must return blocks computed for exactly the query's
   prefix, blocks a running sequence uses are never evicted, and no block leaks.
+- With the prefix cache on, the scheduler and engine must give exactly the same outputs as without
+  it (fake model, and M1 greedy on the tiny Qwen3, incl. tight caches with eviction and
+  preemption and the Triton kernel path), and run fewer prompt tokens.
 - Paged attention and the cached model are checked against the no-cache M1 path (logits and
   greedy tokens), including blocks scattered in random order and blocks reused with stale data.
 - The continuous-batching scheduler has a Hypothesis test over random workloads (every request
@@ -88,6 +91,8 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Single GPU only. No tensor parallelism, no quantization, not for deployment.
 - Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
 - Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
+- The prefix cache reuses whole blocks only (16 tokens by default), and never a prompt's last
+  token; eviction drops whole leaves of the tree.
 - Greedy decoding only; temperature and top-p sampling arrive with the API in M6.
 - The Triton kernel covers decode only. Prefill attention still runs one sequence at a time in
   PyTorch and copies that sequence's keys and values out of the cache first.

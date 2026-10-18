@@ -51,11 +51,16 @@ class Engine:
         max_num_seqs: int = 64,
         max_batch_tokens: int = 2048,
         clock: Callable[[], float] = time.perf_counter,
+        prefix_cache: bool = False,
     ) -> None:
         self.model = model
         self.cache = cache
         self.scheduler = Scheduler(
-            BlockAllocator(cache.num_blocks), cache.block_size, max_num_seqs, max_batch_tokens
+            BlockAllocator(cache.num_blocks),
+            cache.block_size,
+            max_num_seqs,
+            max_batch_tokens,
+            prefix_cache=prefix_cache,
         )
         self.clock = clock
         self.seqs: dict[int, Sequence] = {}
@@ -79,18 +84,14 @@ class Engine:
     def step(self) -> list[Sequence]:
         """Run one model step. Returns the sequences that finished in it."""
         s = self.scheduler
-        # Before scheduling, note how much of each running sequence is cached. After
-        # schedule() every scheduled sequence is fully cached, so its input is everything
-        # past that mark. Sequences admitted from the waiting queue have nothing cached.
-        # (A sequence preempted in this schedule() is never re-admitted in it: preemption
-        # frees k blocks to give one to an older sequence, and recomputing needs >= k.)
-        before = {q.seq_id: q.table.num_tokens for q in s.running}
         seqs = s.schedule()
         if not seqs:
             # add() rejects requests that can never fit, so this would be a scheduler bug.
             raise RuntimeError("scheduler made no progress with requests still queued")
         self.kv_utilization.append(s.kv_utilization)
-        items = [(q.tokens[before.get(q.seq_id, 0) :], q.table) for q in seqs]
+        # Each sequence's input is what schedule() just appended to its table: a whole
+        # prompt, the part after a cached prefix (M5), or one decode token.
+        items = [(q.tokens[-q.num_scheduled :], q.table) for q in seqs]
         batch = build_batch(items, device=self.cache.k.device)
         next_tokens = self.model.forward_batch(batch, self.cache).argmax(-1).tolist()
         now = self.clock()

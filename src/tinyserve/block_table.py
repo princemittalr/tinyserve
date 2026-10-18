@@ -57,6 +57,20 @@ class BlockTable:
         self.num_tokens += n
         return [self.slot(pos) for pos in range(start, start + n)]
 
+    def adopt(self, blocks: list[int]) -> None:
+        """Start an empty table with cached blocks that already hold its first tokens (M5).
+
+        ``blocks`` come from ``RadixCache.match_prefix``: full blocks whose k/v are the
+        sequence's first ``len(blocks) * block_size`` tokens. The table becomes one more
+        owner of each (``allocator.share``), so the cache cannot evict them while the
+        sequence uses them; ``release`` drops that ownership like any other block.
+        """
+        if self.blocks:
+            raise ValueError("adopt() needs an empty table")
+        self.allocator.share(blocks)
+        self.blocks = list(blocks)
+        self.num_tokens = len(blocks) * self.block_size
+
     def slot(self, pos: int) -> int:
         """KV-cache slot of token position ``pos`` (see the table in the module docstring)."""
         if not 0 <= pos < self.num_tokens:
