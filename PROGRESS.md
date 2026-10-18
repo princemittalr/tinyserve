@@ -26,7 +26,8 @@
 - M1 step 6: `Qwen3` forward pass (28 layers, no KV cache) and `greedy_generate`; tiny-random-model tests; `scripts/generate.py` demo. First real run (2026-10-18, laptop CPU, fp32): "The capital of France is" -> " Paris. The capital of Italy is Rome. ...", 20 tokens in 6.8 s.
 - M1 step 7: HF parity tests on a tiny random Qwen3 (run in CI); `scripts/compare_hf.py` + 120 prompts for the real-model acceptance run. Config now also reads the newer `rope_parameters` layout.
 - M1 closed: acceptance run passed (see Benchmark results).
-- M2 step 1: `BlockAllocator` (free stack + used set) skeleton with 7 blanks for me to fill; 14 unit tests and a Hypothesis state machine (random allocate/free traffic; checks no double hand-out, double free rejected, no leaked blocks).
+- M2 step 1: `BlockAllocator` (free stack + used set) with 6 blanks; 14 unit tests and a Hypothesis state machine (random allocate/free traffic; checks no double hand-out, double free rejected, no leaked blocks). The blank answers came from the mentor.
+- M2 step 2: `BlockTable` (a sequence's blocks, token position -> KV-cache slot) with 5 blanks for me to fill; 18 unit tests and a Hypothesis state machine (several sequences on one allocator; no two tokens share a slot, no leak).
 
 ## Design decisions
 
@@ -58,6 +59,8 @@
 - Free blocks are a list used as a stack: allocate and free are O(1) per block, and a just-freed block is reused first.
 - Used blocks are tracked in a set: the double-free check is O(1) instead of scanning the free list.
 - allocate() and free() are all-or-nothing: on an error nothing changes, so the M3 scheduler can catch OutOfBlocksError and preempt safely.
+- Slot of position p = blocks[p // block_size] * block_size + p % block_size: the KV cache is addressed as one flat array of token slots, so writes in step 3 are a single scatter.
+- A block table never holds an empty block (blocks = ceil(tokens / block_size)): blocks are only taken when a token needs one.
 - M2 starts without reference counts; the M5 prefix cache, where sequences share blocks, will add them.
 
 ## Environment
