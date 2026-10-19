@@ -12,12 +12,14 @@ layer. These helpers test that guess directly instead of inferring it:
                         time(real) - time(stand-in) is the cost of attention as written.
     profile_summary     op calls, kernel launches and GPU kernel time from torch.profiler.
     gpu_time_ms         GPU time of the kernels whose name matches, e.g. only the GEMMs.
+    is_gemm             whether a kernel is a matrix multiply (cuBLAS GEMM or GEMV).
     prefill_items       batch inputs of sequences that prefill after a cached prefix (M5).
     fill_to_decode      admit requests and run their prefills, so every later step decodes.
     summarize_steps     mean phase times of an engine's ``StepRecord`` list (M7).
     ttft_segments       one HTTP request's time to first token, split where it crossed
                         from the client to the event loop to the engine thread and back.
-    GpuSampler          the GPU's SM clock, power and temperature while a block runs (M10).
+    GpuSampler          the GPU's clocks, power, temperature and the reasons the driver
+                        held the clock down, while a block runs (M10).
 """
 
 import statistics
@@ -26,7 +28,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import TracebackType
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch.profiler import DeviceType, profile
@@ -75,14 +77,17 @@ def time_ms(
     return statistics.median(times)
 
 
-def loop_ms(fn: Callable[[], object], device: torch.device, iters: int = 100) -> float:
-    """Mean time of ``fn()`` over ``iters`` calls launched back to back, in milliseconds.
+def loop_ms(fn: Callable[[], object], device: torch.device, iters: int = 100,
+            warmup: int = 3) -> float:  # fmt: skip
+    """Mean time of ``fn()`` over ``iters`` calls launched back to back, in milliseconds,
+    after ``warmup`` untimed calls.
 
     For a kernel that runs for tens of microseconds, ``time_ms``'s synchronisation around
     each call costs about as much as the kernel; here the GPU runs the calls one after
-    another and only the whole loop waits, so launches overlap the kernels in flight.
+    another and only the whole loop waits, so launches overlap the kernels in flight. A
+    GPU that was idle runs at a low clock for a while: give a long ``warmup`` then.
     """
-    for _ in range(3):
+    for _ in range(warmup):
         fn()
     _sync(device)
     start = time.perf_counter()
@@ -148,6 +153,13 @@ def gpu_time_ms(prof: profile, match: Callable[[str], bool]) -> float:
     rows = prof.key_averages()
     gpu = [r for r in rows if r.device_type != DeviceType.CPU and match(r.key)]
     return float(sum(r.self_device_time_total for r in gpu)) / 1e3
+
+
+def is_gemm(name: str) -> bool:
+    """A matrix-multiply kernel. cuBLAS runs a 1-row product as a GEMV (``gemv2T_kernel``,
+    ``gemvx``), not a GEMM, so matching "gemm" alone misses every GEMM at batch 1 (M10)."""
+    lower = name.lower()
+    return "gemm" in lower or "gemv" in lower
 
 
 def prefill_items(
@@ -219,15 +231,21 @@ def ttft_segments(sent: float, first_chunk: float, trace: dict[str, Any]) -> dic
 
 
 class GpuSampler:
-    """Samples the GPU's SM clock (MHz), power draw (W) and temperature (C) with
-    ``nvidia-smi`` every ``interval_ms`` while the ``with`` block runs (M10).
+    """Samples the GPU with ``nvidia-smi`` every ``interval_ms`` while the ``with`` block
+    runs (M10): SM and memory clocks (MHz), power draw (W), temperature (C) and the
+    reasons the driver gave for holding the clock below its maximum.
 
     A T4 is capped at 70 W and lowers its clock under load or when hot, so two runs of the
     same kernel can differ by the clock alone; this records the clock next to a timing.
     Without ``nvidia-smi`` (or on a CPU) ``samples`` stays empty and ``summary()`` is {}.
     """
 
-    QUERY = "clocks.sm,power.draw,temperature.gpu"
+    QUERY = "clocks.sm,clocks.mem,power.draw,temperature.gpu,clocks_event_reasons.active"
+    # The bits of clocks_event_reasons.active (nvidia-smi --help-query-gpu).
+    REASONS: ClassVar[dict[int, str]] = {
+        0x1: "idle", 0x2: "app_clocks", 0x4: "sw_power_cap", 0x8: "hw_slowdown",
+        0x10: "sync_boost", 0x20: "sw_thermal", 0x40: "hw_thermal", 0x80: "hw_power_brake",
+        0x100: "display_clocks"}  # fmt: skip
 
     def __init__(self, device_index: int = 0, interval_ms: int = 50,
                  command: list[str] | None = None) -> None:  # fmt: skip
@@ -235,7 +253,7 @@ class GpuSampler:
             "nvidia-smi", f"--id={device_index}", f"--query-gpu={self.QUERY}",
             "--format=csv,noheader,nounits", f"--loop-ms={interval_ms}",
         ]  # fmt: skip
-        self.samples: list[tuple[float, float, float]] = []
+        self.samples: list[tuple[float, float, float, float, int]] = []
         self._proc: subprocess.Popen[str] | None = None
 
     def __enter__(self) -> "GpuSampler":
@@ -253,15 +271,31 @@ class GpuSampler:
         out, _ = self._proc.communicate()
         for line in out.splitlines():
             try:
-                clock, power, temp = (float(x) for x in line.split(","))
+                *fields, reasons = (x.strip() for x in line.split(","))
+                sm, mem, power, temp = (float(x) for x in fields)
+                self.samples.append((sm, mem, power, temp, int(reasons, 16)))
             except ValueError:  # "[N/A]", a header, a line cut off by terminate()
                 continue
-            self.samples.append((clock, power, temp))
 
-    def summary(self) -> dict[str, float]:
+    def summary(self) -> dict[str, Any]:
+        """Means and minimums, and for each reason the share of samples that gave it."""
         if not self.samples:
             return {}
-        clock, power, temp = zip(*self.samples, strict=True)
-        return {"samples": len(clock), "sm_mhz_mean": statistics.mean(clock),
-                "sm_mhz_min": min(clock), "power_w_mean": statistics.mean(power),
-                "temp_c_max": max(temp)}  # fmt: skip
+        sm, mem, power, temp, reasons = zip(*self.samples, strict=True)
+        held = {name: sum(1 for r in reasons if r & bit) / len(reasons)
+                for bit, name in self.REASONS.items() if any(r & bit for r in reasons)}  # fmt: skip
+        return {"samples": len(sm), "sm_mhz_mean": statistics.mean(sm),
+                "sm_mhz_min": min(sm), "mem_mhz_mean": statistics.mean(mem),
+                "mem_mhz_min": min(mem), "power_w_mean": statistics.mean(power),
+                "temp_c_max": max(temp), "clock_held_by": held}  # fmt: skip
+
+    @staticmethod
+    def describe(g: dict[str, Any]) -> str:
+        """One line for ``summary()``'s result."""
+        if not g:
+            return "no nvidia-smi"
+        held = ", ".join(f"{k} {v:.0%}" for k, v in g["clock_held_by"].items()) or "nothing"
+        return (f"SM {g['sm_mhz_mean']:.0f} MHz (min {g['sm_mhz_min']:.0f}), memory "
+                f"{g['mem_mhz_mean']:.0f} MHz (min {g['mem_mhz_min']:.0f}), "
+                f"{g['power_w_mean']:.1f} W, {g['temp_c_max']:.0f} C, "
+                f"clock held by: {held}")  # fmt: skip

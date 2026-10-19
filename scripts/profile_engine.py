@@ -58,6 +58,7 @@ from tinyserve.profiling import (
     attention_replaced,
     fill_to_decode,
     gpu_time_ms,
+    is_gemm,
     prefill_items,
     profile_summary,
     summarize_steps,
@@ -155,7 +156,7 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
     s = profile_summary(prof, wall)
     per_step = {key: s[key] / k for key in ("aten_calls", "kernel_launches", "graph_launches",
                                              "gpu_kernel_ms", "wall_ms")}  # fmt: skip
-    gemm_ms = gpu_time_ms(prof, lambda name: "gemm" in name.lower()) / k
+    gemm_ms = gpu_time_ms(prof, is_gemm) / k  # GEMV too: batch 1 runs no GEMM (M10)
     # Split-K (M9) adds a merge kernel per layer; it is part of decode attention.
     attn_ms = gpu_time_ms(prof, lambda name: "paged_decode" in name or "merge_splits" in name) / k
     w_bytes = weight_bytes(cfg, elem)

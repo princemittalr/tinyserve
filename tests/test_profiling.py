@@ -23,6 +23,7 @@ from tinyserve.profiling import (
     decode_tables,
     fill_to_decode,
     gpu_time_ms,
+    is_gemm,
     loop_ms,
     prefill_items,
     profile_summary,
@@ -163,13 +164,22 @@ def test_ttft_segments_split_the_whole_ttft_in_order() -> None:
 def test_gpu_sampler_parses_what_nvidia_smi_prints() -> None:
     # A stand-in for nvidia-smi: two samples, a line it cannot parse, then it keeps running
     # until the sampler stops it, as nvidia-smi --loop-ms does.
-    script = ("import sys, time; print('1590, 69.50, 71'); print('[N/A], 70.1, 72'); "
-              "print('1215, 70.25, 74', flush=True); time.sleep(30)")  # fmt: skip
+    script = ("import sys, time; print('1590, 5000, 69.50, 71, 0x0000000000000004'); "
+              "print('[N/A], 5000, 70.1, 72, 0x0'); "
+              "print('1215, 4800, 70.25, 74, 0x0000000000000044', flush=True); "
+              "time.sleep(30)")  # fmt: skip
     with GpuSampler(command=[sys.executable, "-c", script]) as s:
         time.sleep(1.0)
-    assert s.samples == [(1590.0, 69.5, 71.0), (1215.0, 70.25, 74.0)]
-    assert s.summary() == {"samples": 2, "sm_mhz_mean": 1402.5, "sm_mhz_min": 1215.0,
-                           "power_w_mean": 69.875, "temp_c_max": 74.0}  # fmt: skip
+    assert s.samples == [(1590.0, 5000.0, 69.5, 71.0, 0x4), (1215.0, 4800.0, 70.25, 74.0, 0x44)]
+    g = s.summary()
+    assert g == {"samples": 2, "sm_mhz_mean": 1402.5, "sm_mhz_min": 1215.0,
+                 "mem_mhz_mean": 4900.0, "mem_mhz_min": 4800.0, "power_w_mean": 69.875,
+                 "temp_c_max": 74.0,
+                 "clock_held_by": {"sw_power_cap": 1.0, "hw_thermal": 0.5}}  # fmt: skip
+    line = GpuSampler.describe(g)
+    assert "SM 1402 MHz (min 1215)" in line and "memory 4900 MHz (min 4800)" in line
+    assert line.endswith("clock held by: sw_power_cap 100%, hw_thermal 50%")
+    assert GpuSampler.describe({}) == "no nvidia-smi"
 
 
 def test_gpu_sampler_without_nvidia_smi_records_nothing() -> None:
@@ -188,3 +198,18 @@ def test_loop_ms_is_the_mean_over_back_to_back_calls() -> None:
     ms = loop_ms(call, CPU, iters=10)
     assert len(calls) == 3 + 10  # 3 warm-up calls, then the timed loop
     assert 2.0 <= ms < 20.0
+    calls.clear()
+    loop_ms(call, CPU, iters=2, warmup=7)
+    assert len(calls) == 7 + 2
+
+
+def test_is_gemm_counts_cublas_gemv_kernels() -> None:
+    # Kernel names as the T4 profiles print them: at batch 1 cuBLAS picks a GEMV.
+    for name in ("turing_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+                 "void gemv2T_kernel_val<int, int, __half, __half, float, 128, 16, 4, 4>",
+                 "void gemvx::kernel<int, int, __half, __half, float, false, true>",
+                 "cutlass_75_tensorop_f16_s1688gemm_f16_256x64_32x2_tn_align8"):  # fmt: skip
+        assert is_gemm(name), name
+    for name in ("_paged_decode_grouped_kernel", "_rms_norm_rows_kernel",
+                 "void at::native::vectorized_elementwise_kernel<4, ...>"):  # fmt: skip
+        assert not is_gemm(name), name
