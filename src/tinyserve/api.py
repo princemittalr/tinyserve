@@ -13,9 +13,16 @@ Limits, each with the error a client gets back (OpenAI's error shape):
     request body over ``max_body_bytes``            413
     prompt over ``max_prompt_tokens``               400
     max_tokens over ``max_tokens_cap``              400
-    a field out of range, or a feature not built   400 (n > 1, stop, logprobs, echo)
+    n over ``max_n``, more than 4 stop strings     400
+    a field out of range, or a feature not built   400 (logprobs, echo, penalties)
     ``max_requests`` already in flight              429 (AsyncEngine)
     engine thread dead                              503
+
+``stop`` (M9): up to 4 strings; the answer ends before the first one that appears, which
+is not returned (``StopMatcher``), with finish_reason "stop", and the engine request is
+aborted there. ``n`` (M9): n engine requests for the same prompt, one per choice, run
+side by side; with a ``seed``, choice i samples with seed + i. Usage counts the prompt
+once and every choice's tokens.
 
 A client that disconnects is aborted: for a stream, Starlette cancels the response
 task; for a plain request, the handler checks for a disconnect after every step. Either
@@ -26,10 +33,11 @@ There is no authentication, which is why ``scripts/serve.py`` binds to 127.0.0.1
                                 event-loop lag and engine steps since the last call
 """
 
+import asyncio
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol, TypeVar
 
@@ -37,7 +45,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from tinyserve.detokenize import IncrementalDetokenizer
+from tinyserve.detokenize import IncrementalDetokenizer, StopMatcher
 from tinyserve.sampling import SamplingParams
 from tinyserve.serving import (
     AsyncEngine,
@@ -59,6 +67,7 @@ class Limits:
     max_prompt_tokens: int = 4096
     max_tokens_cap: int = 1024  # the most a request may ask for
     default_max_tokens: int = 256  # when the request does not say
+    max_n: int = 8  # choices per request (M9)
 
 
 # --- request bodies -------------------------------------------------------------------
@@ -80,9 +89,9 @@ class _Common(BaseModel):
     seed: int | None = Field(None, ge=0, lt=2**63)
     stream: bool = False
     stream_options: StreamOptions | None = None
+    n: int = Field(1, ge=1)
+    stop: str | list[str] | None = None
     # Not implemented: accepted only at their "off" values.
-    n: Literal[1] = 1
-    stop: None = None
     logprobs: Literal[False, None] = None
     echo: Literal[False] = False
     presence_penalty: Literal[0] = 0
@@ -169,6 +178,12 @@ def create_app(
             raise APIError(404, f"model {req.model!r} not found; this server runs {model_name!r}")
         return req
 
+    def stops(req: _Common) -> list[str]:
+        out = [req.stop] if isinstance(req.stop, str) else list(req.stop or [])
+        if len(out) > 4 or any(not s for s in out):
+            raise APIError(400, "stop: at most 4 strings, none of them empty")
+        return out
+
     def prepare(req: _Common, prompt_ids: list[int]) -> tuple[int, SamplingParams]:
         n = len(prompt_ids)
         if n > limits.max_prompt_tokens:
@@ -179,6 +194,8 @@ def create_app(
         max_tokens = req.max_tokens or limits.default_max_tokens
         if max_tokens > limits.max_tokens_cap:
             raise APIError(400, f"max_tokens is {max_tokens}, the limit is {limits.max_tokens_cap}")
+        if req.n > limits.max_n:
+            raise APIError(400, f"n is {req.n}, the limit is {limits.max_n}")
         return max_tokens, SamplingParams(req.temperature, req.top_p, req.seed)
 
     async def start(
@@ -207,21 +224,75 @@ def create_app(
         return chain()
 
     async def texts(
-        outs: AsyncIterator[StreamOutput],
-    ) -> AsyncGenerator[tuple[str, StreamOutput], None]:
-        """Each output with the new text it completes (flushed at the end)."""
-        detok = IncrementalDetokenizer(tokenizer.decode)
-        async for out in outs:
-            text = detok.push(out.token_ids)
-            if out.finish_reason is not None:
-                text += detok.flush()
-            yield text, out
+        index: int, outs: AsyncGenerator[StreamOutput, None], stop: list[str]
+    ) -> AsyncGenerator[tuple[int, str, str | None, StreamOutput], None]:
+        """Choice ``index``'s outputs as (index, new text, finish reason, output).
 
-    def usage(out: StreamOutput) -> dict[str, int]:
+        Text is flushed at the end; with stop strings it ends before the first one, and
+        leaving early closes ``outs``, which aborts the engine request."""
+        detok, matcher = IncrementalDetokenizer(tokenizer.decode), StopMatcher(stop)
+        try:
+            async for out in outs:
+                text = detok.push(out.token_ids)
+                if out.finish_reason is not None:
+                    text += detok.flush()
+                text = matcher.push(text)
+                if matcher.stopped:
+                    yield index, text, "stop", out
+                    return
+                if out.finish_reason is not None:
+                    text += matcher.flush()
+                yield index, text, out.finish_reason, out
+        finally:
+            await outs.aclose()
+
+    async def merged(
+        gens: list[AsyncGenerator[tuple[int, str, str | None, StreamOutput], None]],
+    ) -> AsyncGenerator[tuple[int, str, str | None, StreamOutput], None]:
+        """The items of several choices' generators, in the order they arrive (n > 1)."""
+        if len(gens) == 1:
+            try:
+                async for item in gens[0]:
+                    yield item
+            finally:
+                await gens[0].aclose()
+            return
+        q: asyncio.Queue[Any] = asyncio.Queue()
+        end = object()
+
+        async def pump(g: AsyncGenerator[Any, None]) -> None:
+            try:
+                async for item in g:
+                    await q.put(item)
+                await q.put(end)
+            except Exception as e:  # e.g. EngineDeadError: hand it to the consumer
+                await q.put(e)
+
+        tasks = [asyncio.create_task(pump(g)) for g in gens]
+        try:
+            left = len(gens)
+            while left:
+                item = await q.get()
+                if item is end:
+                    left -= 1
+                elif isinstance(item, Exception):
+                    raise item
+                else:
+                    yield item
+        finally:  # done, failed or abandoned: stop every choice, which aborts its request
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for g in gens:
+                await g.aclose()
+
+    def usage(lasts: dict[int, StreamOutput]) -> dict[str, int]:
+        prompt = next(iter(lasts.values())).num_prompt_tokens  # counted once, as OpenAI does
+        completion = sum(out.num_output_tokens for out in lasts.values())
         return {
-            "prompt_tokens": out.num_prompt_tokens,
-            "completion_tokens": out.num_output_tokens,
-            "total_tokens": out.num_prompt_tokens + out.num_output_tokens,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
         }
 
     async def respond(
@@ -232,8 +303,21 @@ def create_app(
         received: float,
     ) -> Response:
         max_tokens, params = prepare(req, prompt_ids)
+        stop = stops(req)
         rid = f"{'chatcmpl' if chat else 'cmpl'}-{uuid.uuid4().hex}"
-        outs = await start(prompt_ids, max_tokens, params, RequestTrace(rid, received))
+        gens = []
+        try:
+            for i in range(req.n):  # one engine request per choice
+                seed = None if params.seed is None else params.seed + i
+                p = SamplingParams(params.temperature, params.top_p, seed)
+                tag = rid if req.n == 1 else f"{rid}-{i}"
+                outs = await start(prompt_ids, max_tokens, p, RequestTrace(tag, received))
+                gens.append(texts(i, outs, stop))
+        except APIError:
+            for g in gens:
+                await g.aclose()
+            raise
+        choices = merged(gens)
         head: dict[str, Any] = {
             "id": rid,
             "object": "chat.completion.chunk" if chat else "text_completion",
@@ -241,13 +325,15 @@ def create_app(
             "model": model_name,
         }
 
-        def choice(text: str | None, reason: str | None, first: bool = False) -> dict[str, Any]:
+        def choice(
+            i: int, text: str | None, reason: str | None, first: bool = False
+        ) -> dict[str, Any]:
             if not chat:
-                return {"index": 0, "text": text or "", "logprobs": None, "finish_reason": reason}
+                return {"index": i, "text": text or "", "logprobs": None, "finish_reason": reason}
             delta: dict[str, str] = {"role": "assistant"} if first else {}
             if text is not None:
                 delta["content"] = text
-            return {"index": 0, "delta": delta, "logprobs": None, "finish_reason": reason}
+            return {"index": i, "delta": delta, "logprobs": None, "finish_reason": reason}
 
         if req.stream:
             include_usage = req.stream_options is not None and req.stream_options.include_usage
@@ -256,53 +342,59 @@ def create_app(
                 def sse(obj: dict[str, Any]) -> str:
                     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-                last: StreamOutput | None = None
+                lasts: dict[int, StreamOutput] = {}
                 try:
-                    if chat:  # OpenAI opens a chat stream with the role
-                        yield sse({**head, "choices": [choice("", None, first=True)]})
-                    async for text, out in texts(outs):
-                        last = out
-                        if text or out.finish_reason is not None:
-                            c = choice(text or None, out.finish_reason)  # chat's last delta: {}
+                    if chat:  # OpenAI opens a chat stream with the role, per choice
+                        for i in range(req.n):
+                            yield sse({**head, "choices": [choice(i, "", None, first=True)]})
+                    async for i, text, reason, out in choices:
+                        lasts[i] = out
+                        if text or reason is not None:
+                            c = choice(i, text or None, reason)  # chat's last delta: {}
                             yield sse({**head, "choices": [c]})
                 except EngineDeadError as e:  # mid-stream: the status code is already sent
                     yield sse({"error": {"message": str(e), "type": "server_error"}})
                     return
                 finally:
-                    await outs.aclose()  # also on a disconnect: abort, free the blocks
-                if include_usage and last is not None:
-                    yield sse({**head, "choices": [], "usage": usage(last)})
+                    await choices.aclose()  # also on a disconnect: abort, free the blocks
+                if include_usage and lasts:
+                    yield sse({**head, "choices": [], "usage": usage(lasts)})
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        pieces: list[str] = []
-        last = None
+        pieces: dict[int, list[str]] = {i: [] for i in range(req.n)}
+        reasons: dict[int, str] = {}
+        outs_last: dict[int, StreamOutput] = {}
         try:
-            async for text, out in texts(outs):
-                pieces.append(text)
-                last = out
+            async for i, text, reason, out in choices:
+                pieces[i].append(text)
+                outs_last[i] = out
+                if reason is not None:
+                    reasons[i] = reason
                 if await request.is_disconnected():
-                    break  # nobody to answer: leaving the loop aborts the request
+                    break  # nobody to answer: leaving the loop aborts every choice
         except EngineDeadError as e:
             raise APIError(503, str(e), "server_error") from None
         finally:
-            await outs.aclose()
-        if last is None or last.finish_reason is None:
+            await choices.aclose()
+        if len(reasons) < req.n:
             return Response(status_code=499)  # client closed the request (nginx's code)
-        text = "".join(pieces)
         if chat:
-            ch = {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "logprobs": None,
-                "finish_reason": last.finish_reason,
-            }
-            body = {**head, "object": "chat.completion", "choices": [ch], "usage": usage(last)}
+            chs = [
+                {
+                    "index": i,
+                    "message": {"role": "assistant", "content": "".join(pieces[i])},
+                    "logprobs": None,
+                    "finish_reason": reasons[i],
+                }
+                for i in range(req.n)
+            ]
+            body = {**head, "object": "chat.completion", "choices": chs}
         else:
-            ch = choice(text, last.finish_reason)
-            body = {**head, "choices": [ch], "usage": usage(last)}
-        return JSONResponse(body)
+            chs = [choice(i, "".join(pieces[i]), reasons[i]) for i in range(req.n)]
+            body = {**head, "choices": chs}
+        return JSONResponse({**body, "usage": usage(outs_last)})
 
     @app.get("/health")
     async def health() -> Response:

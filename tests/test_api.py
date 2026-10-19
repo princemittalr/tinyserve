@@ -241,8 +241,10 @@ def test_seeded_sampling_is_reproducible_and_matches_the_engine(client: TestClie
         ({"prompt": "x", "temperature": -1}, 400, "temperature"),
         ({"prompt": "x", "temperature": 2.5}, 400, "temperature"),
         ({"prompt": "x", "top_p": 0}, 400, "top_p"),
-        ({"prompt": "x", "n": 2}, 400, "n"),
-        ({"prompt": "x", "stop": ["\n"]}, 400, "stop"),
+        ({"prompt": "x", "n": 9}, 400, "the limit is 8"),
+        ({"prompt": "x", "n": 0}, 400, "n"),
+        ({"prompt": "x", "stop": ["a", "b", "c", "d", "e"]}, 400, "stop"),
+        ({"prompt": "x", "stop": ""}, 400, "stop"),
         ({"prompt": "x", "echo": True}, 400, "echo"),
         ({"prompt": "x", "presence_penalty": 0.5}, 400, "presence_penalty"),
         ({"prompt": ""}, 400, "prompt"),
@@ -424,3 +426,114 @@ def test_debug_trace_names_each_request_by_its_response_id() -> None:
         assert r["first_token"] <= r["first_seen"]
     assert t["steps"] and all(s["total_ms"] > 0 for s in t["steps"])
     assert c.get("/debug/trace").json()["requests"] == []
+
+
+# --- stop strings and n > 1 (M9) ---------------------------------------------------------
+
+
+def cut(text: str, stops: list[str]) -> str:
+    """``text`` up to the stop string that is complete first (StopMatcher's rule)."""
+    found = [(i + len(s), i) for s in stops if (i := text.find(s)) >= 0]
+    return text[: min(found)[1]] if found else text
+
+
+def test_stop_string_ends_the_answer_before_it(client: TestClient) -> None:
+    full = greedy_text("hello", 20)
+    stop = full[6:8]  # a stop string the greedy answer is sure to contain
+    body = {"prompt": "hello", "max_tokens": 20, "temperature": 0, "stop": stop}
+    r = client.post("/v1/completions", json=body).json()
+    (choice,) = r["choices"]
+    assert choice["text"] == cut(full, [stop]) and choice["finish_reason"] == "stop"
+    assert r["usage"]["completion_tokens"] < 20  # stopped early, not run to max_tokens
+    chunks = post_stream(client, "/v1/completions", body)
+    assert "".join(ch["choices"][0]["text"] for ch in chunks) == choice["text"]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_stop_list_and_a_stop_that_never_appears(client: TestClient) -> None:
+    full = greedy_text("abc", 16)
+    stops = ["@@", full[9:11], full[4:6]]  # "@@" is not even in the alphabet
+    body = {"prompt": "abc", "max_tokens": 16, "temperature": 0, "stop": stops}
+    choice = client.post("/v1/completions", json=body).json()["choices"][0]
+    assert choice["text"] == cut(full, stops) and choice["finish_reason"] == "stop"
+    body["stop"] = ["@@"]
+    choice = client.post("/v1/completions", json=body).json()["choices"][0]
+    assert choice["text"] == full and choice["finish_reason"] == "length"
+
+
+def test_chat_stop_string(client: TestClient) -> None:
+    msgs = [{"role": "user", "content": "tell me"}]
+    full = greedy_text(qwen3_chat_prompt([ChatMessage.model_validate(m) for m in msgs]), 12)
+    body = {"messages": msgs, "max_tokens": 12, "temperature": 0, "stop": [full[5]]}
+    msg = client.post("/v1/chat/completions", json=body).json()["choices"][0]["message"]
+    assert msg["content"] == cut(full, [full[5]])
+
+
+def test_stop_aborts_the_engine_request() -> None:
+    app, e, ae = served()
+    full = TOK.decode(greedy_generate(tiny_model(), TOK.encode("abc"), 12))
+    c = TestClient(app)
+    r = c.post("/v1/completions", json={"prompt": "abc", "max_tokens": 900, "temperature": 0,
+                                        "stop": full[8:10]})  # fmt: skip
+    wait_until_released(e)
+    ae.shutdown()
+    assert r.json()["choices"][0]["finish_reason"] == "stop"
+    assert not e.seqs and e.num_steps < 50  # not run to its 900 tokens
+    assert e.scheduler.allocator.num_free == 256
+
+
+def test_n_choices_sample_with_seed_plus_i(client: TestClient) -> None:
+    body = {"prompt": "dice", "max_tokens": 8, "temperature": 1.5, "seed": 11, "n": 3}
+    r = client.post("/v1/completions", json=body).json()
+    e = Engine(tiny_model(), KVCache(CFG, 64, 4, dtype=torch.float32))
+    want = [
+        TOK.decode(e.generate([TOK.encode("dice")], 8, sampling=SamplingParams(1.5, 1.0, s))[0])
+        for s in (11, 12, 13)
+    ]
+    assert [c["index"] for c in r["choices"]] == [0, 1, 2]
+    assert [c["text"] for c in r["choices"]] == want
+    assert len(set(want)) > 1
+    assert r["usage"] == {"prompt_tokens": 4, "completion_tokens": 24, "total_tokens": 28}
+    chunks = post_stream(client, "/v1/completions", body)
+    for i in range(3):  # each index's chunks add up to that choice
+        mine = [ch["choices"][0] for ch in chunks if ch["choices"][0]["index"] == i]
+        assert "".join(c["text"] for c in mine) == want[i]
+        assert mine[-1]["finish_reason"] == "length"
+
+
+def test_streamed_chat_with_n_opens_every_choice(client: TestClient) -> None:
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5, "n": 2,
+            "temperature": 0, "stream_options": {"include_usage": True}}  # fmt: skip
+    *chunks, last = post_stream(client, "/v1/chat/completions", body)
+    firsts = [ch["choices"][0] for ch in chunks[:2]]
+    assert firsts == [{"index": i, "delta": {"role": "assistant", "content": ""},
+                       "logprobs": None, "finish_reason": None} for i in range(2)]  # fmt: skip
+    texts = ["".join(ch["choices"][0]["delta"].get("content", "") for ch in chunks
+                     if ch["choices"][0]["index"] == i) for i in range(2)]  # fmt: skip
+    assert texts[0] == texts[1] != ""  # greedy: both choices alike
+    assert last["usage"]["completion_tokens"] == 10
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_disconnect_aborts_every_choice(stream: bool) -> None:
+    app, e, ae = served()
+
+    async def main() -> None:
+        body = {"prompt": "abc", "max_tokens": 900, "stream": stream, "n": 3}
+        call = Call(app, "/v1/completions", body)
+        if not stream:
+            call.hang_up.set()  # gone right after sending the request
+            await call.run()
+            assert call.status == 499
+            return
+        task = asyncio.create_task(call.run())
+        while len(call.chunks) < 4:
+            await asyncio.sleep(0.001)
+        call.hang_up.set()
+        await task
+
+    asyncio.run(main())
+    wait_until_released(e)
+    ae.shutdown()
+    assert not e.seqs and e.num_steps < 500
+    assert e.scheduler.allocator.num_free == 256

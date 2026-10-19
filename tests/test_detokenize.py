@@ -1,11 +1,14 @@
 """Spec for incremental detokenisation (M6): the streamed pieces must add up to exactly
 the text of the whole output, and never contain a half-decoded character."""
 
+from itertools import pairwise
+
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from tinyserve.detokenize import REPLACEMENT, IncrementalDetokenizer
+from tinyserve.detokenize import REPLACEMENT, IncrementalDetokenizer, StopMatcher
 
 
 def stream(detok: IncrementalDetokenizer, ids: list[int], sizes: list[int]) -> list[str]:
@@ -91,3 +94,59 @@ def test_window_stays_short() -> None:
     for _ in range(100):
         d.push([0])
     assert max(seen) <= 2
+
+
+# --- stop strings (M9) ------------------------------------------------------------------
+
+
+def stop_stream(stops: list[str], pieces: list[str]) -> tuple[str, bool]:
+    """Push the pieces until a stop; the text returned in all and whether it stopped."""
+    m, out = StopMatcher(stops), []
+    for p in pieces:
+        out.append(m.push(p))
+        if m.stopped:
+            return "".join(out), True
+    return "".join(out) + m.flush(), False
+
+
+def test_stop_string_split_across_pushes() -> None:
+    m = StopMatcher(["\n\n"])
+    assert m.push("a\n") == "a"  # the "\n" might start a stop: held back
+    assert m.push("\nb") == "" and m.stopped
+    assert m.push("more") == "" and m.flush() == ""
+
+
+def test_held_back_tail_is_released_when_it_is_not_a_stop() -> None:
+    m = StopMatcher(["END"])
+    assert m.push("xxE") == "xx"
+    assert m.push("Nd") == "ENd"  # "EN" + "d" can no longer become "END"
+    assert m.push("EN") == "" and m.flush() == "EN" and not m.stopped
+
+
+def test_earliest_stop_wins() -> None:
+    assert stop_stream(["cd", "b"], ["abcd"]) == ("a", True)
+    assert stop_stream(["bc", "abcd"], ["ab", "cd"]) == ("a", True)  # "bc" ends first
+    assert stop_stream(["a", "\naa"], ["\naa"]) == ("\n", True)
+
+
+def test_empty_stop_string_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        StopMatcher(["x", ""])
+
+
+@settings(max_examples=2000, deadline=None)
+@given(
+    text=st.text(alphabet="ab\n", max_size=30),
+    stops=st.lists(st.text(alphabet="ab\n", min_size=1, max_size=4), max_size=3),
+    cuts=st.lists(st.integers(0, 30), max_size=8),
+)
+def test_streamed_stop_equals_cutting_the_whole_text(
+    text: str, stops: list[str], cuts: list[int]
+) -> None:
+    # However the text is split into pushes, the result is the whole text cut before
+    # the stop string that is complete first.
+    bounds = sorted({0, len(text), *(c for c in cuts if c <= len(text))})
+    pieces = [text[a:b] for a, b in pairwise(bounds)]
+    found = [(i + len(s), i) for s in stops if (i := text.find(s)) >= 0]
+    want = (text[: min(found)[1]], True) if found else (text, False)
+    assert stop_stream(stops, pieces) == want
