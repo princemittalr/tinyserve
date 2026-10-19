@@ -244,4 +244,4 @@ TinyServe was built step by step with an AI mentor. [PROGRESS.md](PROGRESS.md) r
 
 ## License
 
-MIT, as declared in [`pyproject.toml`](pyproject.toml).
+[MIT](LICENSE).
