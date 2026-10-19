@@ -1,6 +1,8 @@
 """The profiling helpers behind scripts/profile_step.py (M4) and scripts/profile_engine.py
 (M7), on a tiny random Qwen3."""
 
+import sys
+import time
 from dataclasses import replace
 
 import pytest
@@ -16,10 +18,12 @@ from tinyserve.engine import Engine, StepRecord
 from tinyserve.kv_cache import KVCache
 from tinyserve.profiling import (
     TTFT_SEGMENTS,
+    GpuSampler,
     attention_replaced,
     decode_tables,
     fill_to_decode,
     gpu_time_ms,
+    loop_ms,
     prefill_items,
     profile_summary,
     summarize_steps,
@@ -154,3 +158,33 @@ def test_ttft_segments_split_the_whole_ttft_in_order() -> None:
     assert sum(segs.values()) == 6500.0
     with pytest.raises(ValueError, match="missing"):
         ttft_segments(0.0, 1.0, {**trace, "added": None})
+
+
+def test_gpu_sampler_parses_what_nvidia_smi_prints() -> None:
+    # A stand-in for nvidia-smi: two samples, a line it cannot parse, then it keeps running
+    # until the sampler stops it, as nvidia-smi --loop-ms does.
+    script = ("import sys, time; print('1590, 69.50, 71'); print('[N/A], 70.1, 72'); "
+              "print('1215, 70.25, 74', flush=True); time.sleep(30)")  # fmt: skip
+    with GpuSampler(command=[sys.executable, "-c", script]) as s:
+        time.sleep(1.0)
+    assert s.samples == [(1590.0, 69.5, 71.0), (1215.0, 70.25, 74.0)]
+    assert s.summary() == {"samples": 2, "sm_mhz_mean": 1402.5, "sm_mhz_min": 1215.0,
+                           "power_w_mean": 69.875, "temp_c_max": 74.0}  # fmt: skip
+
+
+def test_gpu_sampler_without_nvidia_smi_records_nothing() -> None:
+    with GpuSampler(command=["tinyserve-no-such-binary"]) as s:
+        pass
+    assert s.samples == [] and s.summary() == {}
+
+
+def test_loop_ms_is_the_mean_over_back_to_back_calls() -> None:
+    calls: list[float] = []
+
+    def call() -> None:
+        calls.append(time.perf_counter())
+        time.sleep(0.002)
+
+    ms = loop_ms(call, CPU, iters=10)
+    assert len(calls) == 3 + 10  # 3 warm-up calls, then the timed loop
+    assert 2.0 <= ms < 20.0

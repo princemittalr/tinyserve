@@ -7,6 +7,7 @@ layer. These helpers test that guess directly instead of inferring it:
     decode_tables       B sequences that each have ``context_len`` tokens cached and one
                         new token, i.e. the shape of every step once all requests decode.
     time_ms             median wall time of a call, waiting for the GPU before and after.
+    loop_ms             mean time of a call run back to back, for short kernels (M10).
     attention_replaced  swaps the model's attention for a stand-in that returns q, so
                         time(real) - time(stand-in) is the cost of attention as written.
     profile_summary     op calls, kernel launches and GPU kernel time from torch.profiler.
@@ -16,12 +17,15 @@ layer. These helpers test that guess directly instead of inferring it:
     summarize_steps     mean phase times of an engine's ``StepRecord`` list (M7).
     ttft_segments       one HTTP request's time to first token, split where it crossed
                         from the client to the event loop to the engine thread and back.
+    GpuSampler          the GPU's SM clock, power and temperature while a block runs (M10).
 """
 
 import statistics
+import subprocess
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from types import TracebackType
 from typing import Any
 
 import torch
@@ -69,6 +73,23 @@ def time_ms(
         _sync(device)
         times.append((time.perf_counter() - start) * 1e3)
     return statistics.median(times)
+
+
+def loop_ms(fn: Callable[[], object], device: torch.device, iters: int = 100) -> float:
+    """Mean time of ``fn()`` over ``iters`` calls launched back to back, in milliseconds.
+
+    For a kernel that runs for tens of microseconds, ``time_ms``'s synchronisation around
+    each call costs about as much as the kernel; here the GPU runs the calls one after
+    another and only the whole loop waits, so launches overlap the kernels in flight.
+    """
+    for _ in range(3):
+        fn()
+    _sync(device)
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    _sync(device)
+    return (time.perf_counter() - start) * 1e3 / iters
 
 
 def _identity_attention(
@@ -195,3 +216,52 @@ def ttft_segments(sent: float, first_chunk: float, trace: dict[str, Any]) -> dic
     return {
         name: (b - a) * 1e3 for name, a, b in zip(TTFT_SEGMENTS, points, points[1:], strict=False)
     }
+
+
+class GpuSampler:
+    """Samples the GPU's SM clock (MHz), power draw (W) and temperature (C) with
+    ``nvidia-smi`` every ``interval_ms`` while the ``with`` block runs (M10).
+
+    A T4 is capped at 70 W and lowers its clock under load or when hot, so two runs of the
+    same kernel can differ by the clock alone; this records the clock next to a timing.
+    Without ``nvidia-smi`` (or on a CPU) ``samples`` stays empty and ``summary()`` is {}.
+    """
+
+    QUERY = "clocks.sm,power.draw,temperature.gpu"
+
+    def __init__(self, device_index: int = 0, interval_ms: int = 50,
+                 command: list[str] | None = None) -> None:  # fmt: skip
+        self.command = command or [
+            "nvidia-smi", f"--id={device_index}", f"--query-gpu={self.QUERY}",
+            "--format=csv,noheader,nounits", f"--loop-ms={interval_ms}",
+        ]  # fmt: skip
+        self.samples: list[tuple[float, float, float]] = []
+        self._proc: subprocess.Popen[str] | None = None
+
+    def __enter__(self) -> "GpuSampler":
+        try:
+            self._proc = subprocess.Popen(self.command, stdout=subprocess.PIPE, text=True)
+        except OSError:  # no nvidia-smi
+            self._proc = None
+        return self
+
+    def __exit__(self, kind: type[BaseException] | None, err: BaseException | None,
+                 tb: TracebackType | None) -> None:  # fmt: skip
+        if self._proc is None:
+            return
+        self._proc.terminate()
+        out, _ = self._proc.communicate()
+        for line in out.splitlines():
+            try:
+                clock, power, temp = (float(x) for x in line.split(","))
+            except ValueError:  # "[N/A]", a header, a line cut off by terminate()
+                continue
+            self.samples.append((clock, power, temp))
+
+    def summary(self) -> dict[str, float]:
+        if not self.samples:
+            return {}
+        clock, power, temp = zip(*self.samples, strict=True)
+        return {"samples": len(clock), "sm_mhz_mean": statistics.mean(clock),
+                "sm_mhz_min": min(clock), "power_w_mean": statistics.mean(power),
+                "temp_c_max": max(temp)}  # fmt: skip
