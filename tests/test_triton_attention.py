@@ -28,6 +28,7 @@ pytest.importorskip("triton", reason="Triton is not installed (no Windows wheels
 from tinyserve.attention import paged_decode_attention_ref, paged_gqa_attention
 from tinyserve.triton_attention import (
     MAX_SPLITS,
+    launch_paged_decode_grouped,
     launch_paged_decode_split,
     num_splits_for,
     paged_decode_attention,
@@ -255,6 +256,46 @@ def test_any_number_of_splits_gives_the_same_result(splits: int, lens: list[int]
     out = launch_paged_decode_split(*c.args(), c.scale, c.block_size, num_splits=splits)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+# --- tiles of several blocks per loop iteration (M11) ----------------------------------------
+
+
+@pytest.mark.parametrize("tile", [(1, 2), (2, 4), (4, 8), (8, 8)])
+@pytest.mark.parametrize("splits", [1, 3])
+@pytest.mark.parametrize("lens", [[1], [17, 300, 33], [64, 2], [5, 4, 13]])
+def test_every_tile_gives_the_same_result(
+    tile: tuple[int, int], splits: int, lens: list[int]
+) -> None:
+    # A tile that overhangs its range or the sequence must mask those rows: the table
+    # padding after each sequence's blocks points at a NaN block, and the blocks of the
+    # next range belong to another split.
+    c = make_case(lens, 4, 2, head_dim=32, block_size=4, seed=tile[0] + splits)
+    ref = paged_decode_attention_ref(*c.args(), c.scale, c.block_size)
+    out = launch_paged_decode_split(*c.args(), c.scale, c.block_size, splits, tile)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+    grouped = launch_paged_decode_grouped(*c.args(), c.scale, c.block_size, tile)
+    torch.testing.assert_close(grouped, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("tile", [(3, 4), (2, 3), (0, 4)])
+def test_rejects_a_tile_that_is_not_powers_of_2(tile: tuple[int, int]) -> None:
+    c = make_case([3], 4, 2, head_dim=32, block_size=4)
+    with pytest.raises(ValueError, match="powers of 2"):
+        launch_paged_decode_split(*c.args(), c.scale, c.block_size, 2, tile)
+    with pytest.raises(ValueError, match="powers of 2"):
+        launch_paged_decode_grouped(*c.args(), c.scale, c.block_size, tile)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("tile", [(2, 4), (4, 8), (8, 8)])
+def test_tiles_at_qwen3_shapes_on_gpu(tile: tuple[int, int]) -> None:
+    # The C=32 decode step of the M3 workload, fp16: 32 sequences of ~161 tokens.
+    c = make_case([161 + i for i in range(32)], dtype=torch.float16, seed=3)
+    ref = paged_decode_attention_ref(*c.args(), c.scale, c.block_size)
+    out = launch_paged_decode_split(*c.args(), c.scale, c.block_size, None, tile)
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.gpu

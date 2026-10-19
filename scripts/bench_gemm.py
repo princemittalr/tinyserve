@@ -14,7 +14,11 @@ gate_up, down) and the output head, on the real weights (28 different layers, so
 T4's 4 MB L2 cannot hold one layer's weights for the next). It reports ms per step and
 GB/s. If the merged GEMMs are clearly faster, merging the weights is the next step.
 
-Usage (T4): python scripts/bench_gemm.py
+M11: ``--blas cublas,cublaslt`` repeats everything with each of PyTorch's BLAS back ends
+(``torch.backends.cuda.preferred_blas_library``). cuBLASLt picks its kernels by its own
+heuristics, so on these skinny shapes it may reach a bandwidth cuBLAS does not.
+
+Usage (T4): python scripts/bench_gemm.py [--blas cublas,cublaslt]
 """
 
 import argparse
@@ -65,6 +69,7 @@ def main() -> None:
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
     parser.add_argument("--batches", default="1,2,4,8,32,64")
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--blas", default="cublas", help="comma-separated: cublas, cublaslt")
     parser.add_argument("--out", type=Path, default=Path("results/m10_gemm_cuda.json"))
     args = parser.parse_args()
     dev, dtype = torch.device("cuda"), torch.float16
@@ -81,25 +86,29 @@ def main() -> None:
     head = w["model.embed_tokens.weight"] if cfg.tie_word_embeddings else w["lm_head.weight"]
 
     rows = []
-    for m in (int(b) for b in args.batches.split(",")):
-        inputs = {n: torch.randn(m, n, device=dev, dtype=dtype)
-                  for n in {cfg.hidden_size, cfg.q_size, cfg.intermediate_size}}  # fmt: skip
+    for blas in args.blas.split(","):
+        torch.backends.cuda.preferred_blas_library(blas)
+        print(f"BLAS: {blas}")
+        for m in (int(b) for b in args.batches.split(",")):
+            inputs = {n: torch.randn(m, n, device=dev, dtype=dtype)
+                      for n in {cfg.hidden_size, cfg.q_size, cfg.intermediate_size}}  # fmt: skip
 
-        def timed(ws: list[torch.Tensor], inputs: dict[int, torch.Tensor] = inputs
-                  ) -> dict[str, float]:  # fmt: skip
-            return time_gemms(ws, inputs, args.iters)
+            def timed(ws: list[torch.Tensor], inputs: dict[int, torch.Tensor] = inputs
+                      ) -> dict[str, float]:  # fmt: skip
+                return time_gemms(ws, inputs, args.iters)
 
-        each = {k: timed(mats[k]) for k in KINDS}
-        all7 = timed([x for i in layers for x in (mats[k][i] for k in KINDS)])
-        all4 = timed([x for i in layers for x in (merged[k][i] for k in merged)])
-        lm = timed([head])
-        rows.append({"m": m, "each": each, "separate": all7, "merged": all4, "head": lm})
-        print(f"M={m:<3} 7 GEMMs/layer {all7['ms']:.2f} ms ({all7['gbps']:.0f} GB/s) | merged "
-              f"4/layer {all4['ms']:.2f} ms ({all4['gbps']:.0f} GB/s), "
-              f"{1 - all4['ms'] / all7['ms']:.0%} less | head {lm['ms']:.2f} ms "
-              f"({lm['gbps']:.0f} GB/s)", flush=True)  # fmt: skip
-        print("      each kind over 28 layers, ms (GB/s): " + ", ".join(
-            f"{k} {e['ms']:.2f} ({e['gbps']:.0f})" for k, e in each.items()))  # fmt: skip
+            each = {k: timed(mats[k]) for k in KINDS}
+            all7 = timed([x for i in layers for x in (mats[k][i] for k in KINDS)])
+            all4 = timed([x for i in layers for x in (merged[k][i] for k in merged)])
+            lm = timed([head])
+            rows.append({"blas": blas, "m": m, "each": each, "separate": all7, "merged": all4,
+                         "head": lm})  # fmt: skip
+            print(f"M={m:<3} 7 GEMMs/layer {all7['ms']:.2f} ms ({all7['gbps']:.0f} GB/s) | merged "
+                  f"4/layer {all4['ms']:.2f} ms ({all4['gbps']:.0f} GB/s), "
+                  f"{1 - all4['ms'] / all7['ms']:.0%} less | head {lm['ms']:.2f} ms "
+                  f"({lm['gbps']:.0f} GB/s)", flush=True)  # fmt: skip
+            print("      each kind over 28 layers, ms (GB/s): " + ", ".join(
+                f"{k} {e['ms']:.2f} ({e['gbps']:.0f})" for k, e in each.items()))  # fmt: skip
     report = {"date": dt.date.today().isoformat(), "hardware": torch.cuda.get_device_name(),
               "torch": torch.__version__, "rows": rows}  # fmt: skip
     args.out.parent.mkdir(parents=True, exist_ok=True)

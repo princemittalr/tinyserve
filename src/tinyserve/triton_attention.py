@@ -44,6 +44,14 @@ on CPU, chunked prefill at C=8 is the one run that needed variants no earlier pr
 in that session had compiled; it is also the run with the unexplained ~450 ms stall.
 Now ``stride_bt`` and ``num_splits`` are plain ints (``NO_SPECIALIZE``) and the merge
 kernel always pads to ``MAX_SPLITS``, so each kernel compiles once per dtype.
+
+M11: the grouped and split kernels share ``_attend_blocks``, which walks a range of
+blocks ``TILE_BLOCKS`` at a time. With 1 it is M8's loop: load one 16-token block, do
+its math, load the next. Triton overlaps a loop's next loads with the current math only
+with ``cp.async``, which sm_75 does not have, so on the T4 each iteration waits on
+memory; at C=32 a sequence of ~161 tokens is 11 such waits per layer. A tile of several
+blocks puts all their loads in flight at once (the online softmax is the same math over
+a longer row). ``DECODE_TILE`` holds the tile and the warps the launches use.
 """
 
 import torch
@@ -52,6 +60,10 @@ import triton.language as tl
 
 # Integer arguments whose value changes between steps: never specialize on them (above).
 NO_SPECIALIZE = ["stride_bt", "num_splits"]
+
+# (cache blocks per loop iteration, warps per program) for the grouped and split kernels
+# (M11). (1, 4) is the loop and launch M8-M10 measured.
+DECODE_TILE = (1, 4)
 
 
 @triton.jit(do_not_specialize=NO_SPECIALIZE)
@@ -121,6 +133,56 @@ def _paged_decode_kernel(
     tl.store(out_ptr + seq * stride_ob + head * stride_oh + d, out.to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _attend_blocks(
+    q,  # [GROUP, D] float32: the query heads of one kv head
+    m,  # [GROUP] running max, sum_exp [GROUP] and acc [GROUP, D]: carried in and out
+    sum_exp,
+    acc,
+    k_ptr,
+    v_ptr,
+    bt_row_ptr,  # this sequence's block-table row
+    kv_head,
+    ctx_len,
+    first,  # blocks [first, last) of the sequence
+    last,
+    scale,
+    stride_ks,
+    stride_kh,
+    TILE_BLOCKS: tl.constexpr,  # cache blocks per loop iteration (M11), a power of 2
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """The online softmax over blocks [first, last), TILE_BLOCKS blocks per iteration.
+
+    Row r of a tile is token r % BLOCK_SIZE of block j0 + r // BLOCK_SIZE. Rows past
+    ``last`` (the tile's end overhangs the range) or past ``ctx_len`` are masked; a tile
+    always starts at a block below ``last``, so its first row is valid and m stays finite.
+    """
+    d = tl.arange(0, HEAD_DIM)
+    r = tl.arange(0, TILE_BLOCKS * BLOCK_SIZE)
+    t = r % BLOCK_SIZE
+    for j0 in range(first, last, TILE_BLOCKS):
+        j = j0 + r // BLOCK_SIZE  # [TILE] the block of each row
+        in_range = j < last
+        block = tl.load(bt_row_ptr + j, mask=in_range, other=0)
+        valid = in_range & (j * BLOCK_SIZE + t < ctx_len)
+        slot = block * BLOCK_SIZE + t
+        off = slot[:, None] * stride_ks + kv_head * stride_kh + d[None, :]  # [TILE, D]
+        k = tl.load(k_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
+        # [GROUP, TILE]: each query head's dot product with each key of the tile.
+        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
+        s = tl.where(valid[None, :], s, float("-inf"))
+        m_new = tl.maximum(m, tl.max(s, axis=1))
+        alpha = tl.exp(m - m_new)  # [GROUP]
+        p = tl.exp(s - m_new[:, None])  # [GROUP, TILE]
+        sum_exp = sum_exp * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+        m = m_new
+    return m, sum_exp, acc
+
+
 @triton.jit(do_not_specialize=NO_SPECIALIZE)
 def _paged_decode_grouped_kernel(
     q_ptr,  # [B, Hq, D]
@@ -140,12 +202,13 @@ def _paged_decode_grouped_kernel(
     GROUP: tl.constexpr,  # query heads per kv head (a power of 2)
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    TILE_BLOCKS: tl.constexpr,
 ):
     """M8: the same online softmax, one program per (sequence, KV head) instead of per
     query head. The GROUP query heads that share a kv head are handled together: each
     block of k/v is loaded once and used for all of them, where ``_paged_decode_kernel``
     loads it GROUP times (once per query-head program). Everything per head (m, sum_exp,
-    acc, the scores) gains a leading [GROUP] axis."""
+    acc, the scores) gains a leading [GROUP] axis. The loop is ``_attend_blocks`` (M11)."""
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
     ctx_len = tl.load(context_lens_ptr + seq)
@@ -153,32 +216,17 @@ def _paged_decode_grouped_kernel(
     g = tl.arange(0, GROUP)
     heads = kv_head * GROUP + g  # [GROUP]: the query heads that read this kv head
     d = tl.arange(0, HEAD_DIM)
-    t = tl.arange(0, BLOCK_SIZE)
     q_off = seq * stride_qb + heads[:, None] * stride_qh + d[None, :]  # [GROUP, D]
     q = tl.load(q_ptr + q_off).to(tl.float32)
 
     m = tl.full([GROUP], float("-inf"), tl.float32)
     sum_exp = tl.zeros([GROUP], tl.float32)
     acc = tl.zeros([GROUP, HEAD_DIM], tl.float32)
-
-    num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
-    for j in range(0, num_blocks):
-        block = tl.load(block_tables_ptr + seq * stride_bt + j)
-        valid = j * BLOCK_SIZE + t < ctx_len
-        slot = block * BLOCK_SIZE + t
-        off = slot[:, None] * stride_ks + kv_head * stride_kh + d[None, :]  # [BLOCK_SIZE, D]
-        k = tl.load(k_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
-        v = tl.load(v_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
-
-        # [GROUP, BLOCK_SIZE]: each query head's dot product with each key of the block.
-        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
-        s = tl.where(valid[None, :], s, float("-inf"))
-        m_new = tl.maximum(m, tl.max(s, axis=1))
-        alpha = tl.exp(m - m_new)  # [GROUP]
-        p = tl.exp(s - m_new[:, None])  # [GROUP, BLOCK_SIZE]
-        sum_exp = sum_exp * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
-        m = m_new
+    m, sum_exp, acc = _attend_blocks(
+        q, m, sum_exp, acc, k_ptr, v_ptr, block_tables_ptr + seq * stride_bt, kv_head,
+        ctx_len, 0, tl.cdiv(ctx_len, BLOCK_SIZE), scale, stride_ks, stride_kh,
+        TILE_BLOCKS, BLOCK_SIZE, HEAD_DIM,
+    )  # fmt: skip
 
     out = acc / sum_exp[:, None]
     o_off = seq * stride_ob + heads[:, None] * stride_oh + d[None, :]
@@ -206,6 +254,7 @@ def _paged_decode_split_kernel(
     GROUP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    TILE_BLOCKS: tl.constexpr,
 ):
     """M9: the grouped kernel's loop over one of num_splits contiguous ranges of the
     sequence's blocks; the partial results go to m / l / acc, not to the output."""
@@ -217,7 +266,6 @@ def _paged_decode_split_kernel(
     g = tl.arange(0, GROUP)
     heads = kv_head * GROUP + g
     d = tl.arange(0, HEAD_DIM)
-    t = tl.arange(0, BLOCK_SIZE)
     q_off = seq * stride_qb + heads[:, None] * stride_qh + d[None, :]
     q = tl.load(q_ptr + q_off).to(tl.float32)
 
@@ -229,21 +277,11 @@ def _paged_decode_split_kernel(
     per_split = tl.cdiv(num_blocks, num_splits)
     first = split * per_split
     last = tl.minimum(first + per_split, num_blocks)  # a range past the end is empty
-    for j in range(first, last):
-        block = tl.load(block_tables_ptr + seq * stride_bt + j)
-        valid = j * BLOCK_SIZE + t < ctx_len
-        slot = block * BLOCK_SIZE + t
-        off = slot[:, None] * stride_ks + kv_head * stride_kh + d[None, :]
-        k = tl.load(k_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
-        v = tl.load(v_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
-        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
-        s = tl.where(valid[None, :], s, float("-inf"))
-        m_new = tl.maximum(m, tl.max(s, axis=1))
-        alpha = tl.exp(m - m_new)
-        p = tl.exp(s - m_new[:, None])
-        sum_exp = sum_exp * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
-        m = m_new
+    m, sum_exp, acc = _attend_blocks(
+        q, m, sum_exp, acc, k_ptr, v_ptr, block_tables_ptr + seq * stride_bt, kv_head,
+        ctx_len, first, last, scale, stride_ks, stride_kh,
+        TILE_BLOCKS, BLOCK_SIZE, HEAD_DIM,
+    )  # fmt: skip
 
     part = (seq * NUM_Q_HEADS + heads) * num_splits + split  # [GROUP]
     tl.store(m_ptr + part, m)
@@ -407,8 +445,12 @@ def launch_paged_decode_grouped(
     context_lens: torch.Tensor,
     scale: float,
     block_size: int,
+    tile: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """The grouped kernel's launch alone: no checks, no host sync (CUDA-graph safe)."""
+    """The grouped kernel's launch alone: no checks, no host sync (CUDA-graph safe).
+
+    ``tile`` is (blocks per iteration, warps), default ``DECODE_TILE``."""
+    tile_blocks, warps = check_tile(tile or DECODE_TILE)
     b, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     out = torch.empty_like(q)
@@ -422,8 +464,18 @@ def launch_paged_decode_grouped(
         GROUP=num_q_heads // num_kv_heads,
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
+        TILE_BLOCKS=tile_blocks,
+        num_warps=warps,
     )  # fmt: skip
     return out
+
+
+def check_tile(tile: tuple[int, int]) -> tuple[int, int]:
+    """``tile`` if both numbers are powers of 2 (tl.arange and Triton need that)."""
+    blocks, warps = tile
+    if blocks < 1 or blocks & (blocks - 1) or warps < 1 or warps & (warps - 1):
+        raise ValueError(f"tile blocks and warps must be powers of 2, got {tile}")
+    return tile
 
 
 # Split-K: aim for this many programs per decode launch, and never split a sequence's
@@ -481,10 +533,12 @@ def launch_paged_decode_split(
     scale: float,
     block_size: int,
     num_splits: int | None = None,
+    tile: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """The split-K launches alone: no checks, no host sync (CUDA-graph safe).
 
-    ``num_splits`` defaults to ``num_splits_for(B, Hkv, max_blocks)``."""
+    ``num_splits`` defaults to ``num_splits_for(B, Hkv, max_blocks)``, ``tile`` (blocks
+    per iteration, warps) to ``DECODE_TILE``."""
     b, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     splits = num_splits or num_splits_for(b, num_kv_heads, block_tables.shape[1])
@@ -492,8 +546,9 @@ def launch_paged_decode_split(
         raise ValueError(f"num_splits must be 1..{MAX_SPLITS}, got {splits}")
     if splits == 1:
         return launch_paged_decode_grouped(
-            q, k_cache, v_cache, block_tables, context_lens, scale, block_size
+            q, k_cache, v_cache, block_tables, context_lens, scale, block_size, tile
         )
+    tile_blocks, warps = check_tile(tile or DECODE_TILE)
     dev = q.device
     m = torch.empty((b, num_q_heads, splits), dtype=torch.float32, device=dev)
     l = torch.empty_like(m)  # noqa: E741
@@ -509,6 +564,8 @@ def launch_paged_decode_split(
         GROUP=num_q_heads // num_kv_heads,
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
+        TILE_BLOCKS=tile_blocks,
+        num_warps=warps,
     )  # fmt: skip
     out = torch.empty_like(q)
     _merge_splits_kernel[(b, num_q_heads)](

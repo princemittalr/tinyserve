@@ -57,11 +57,13 @@ def specs(dt: str) -> list[tuple[str, Any, dict[str, str], dict[str, Any], int]]
     split = {**decode, "m_ptr": "*fp32", "l_ptr": "*fp32", "acc_ptr": "*fp32"}
     del split["out_ptr"]
     rows, block_n, warps = tp.DEFAULT_TILE
+    tile = {**group, "TILE_BLOCKS": ta.DECODE_TILE[0]}
     return [
         ("decode (M4)", ta._paged_decode_kernel, decode, group, 4),
-        ("decode grouped (M8)", ta._paged_decode_grouped_kernel, decode, group, 4),
+        ("decode grouped (M8)", ta._paged_decode_grouped_kernel, decode, tile,
+         ta.DECODE_TILE[1]),
         ("decode split (M9)", ta._paged_decode_split_kernel, split,
-         {"NUM_Q_HEADS": HQ, **group}, 4),
+         {"NUM_Q_HEADS": HQ, **tile}, ta.DECODE_TILE[1]),
         ("merge splits (M9)", ta._merge_splits_kernel,
          {"m_ptr": "*fp32", "l_ptr": "*fp32", "acc_ptr": "*fp32", "out_ptr": p},
          {"NUM_Q_HEADS": HQ, "SPLITS_PAD": ta.MAX_SPLITS, "HEAD_DIM": D}, 4),
@@ -132,7 +134,26 @@ def main() -> None:
             except Exception as e:  # report every kernel, then fail
                 failed += 1
                 print(f"{dt} {name:<24} FAILED: {str(e).splitlines()[-1]}")
+    if arch == 75:
+        print_tiles()
     sys.exit(1 if failed else 0)
+
+
+# The tiles scripts/bench_decode_tile.py times (M11), and those it skips because they spill.
+TILES = ((1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (2, 8), (4, 2), (4, 4), (4, 8), (8, 2),
+         (8, 4), (8, 8))  # fmt: skip
+
+
+def print_tiles() -> None:
+    """Registers and spills of the grouped decode kernel at each tile, fp16 (a report: a
+    tile over the spill limit is not used, so it does not fail the check)."""
+    _, kernel, types, constexprs, _ = specs("fp16")[1]
+    for blocks, warps in TILES:
+        try:
+            line = check(kernel, types, {**constexprs, "TILE_BLOCKS": blocks}, warps)
+        except RuntimeError as e:
+            line = f"{str(e).splitlines()[-1]} (over the limit)"
+        print(f"decode tile {blocks}x{warps}: {line}")
 
 
 if __name__ == "__main__":
