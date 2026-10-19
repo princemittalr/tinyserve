@@ -1,7 +1,7 @@
-# TinyServe on a T4: where the time goes (M7-M10)
+# TinyServe on a T4: where the time goes (M7-M11)
 
 Every number below comes from a logged run on a Kaggle Tesla T4 (2026-10-18 and 2026-10-19),
-fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed, section 7 what M9 changed and section 8 what M10 answered. Raw data is in `results/`; each table names its file. Anything not measured is
+fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed, section 7 what M9 changed, section 8 what M10 answered and section 9 what M11 changed. Raw data is in `results/`; each table names its file. Anything not measured is
 marked *inferred* or *projected*.
 
 ## 1. The roofline: the fastest a decode step could run
@@ -322,6 +322,67 @@ text, held until their last token, as section 3 found in M7.
 registers and no spill (sm_75: no `mma`, 255 registers, 936 bytes spilled). Its speed needs an
 A100-class GPU, which Kaggle and free Colab do not have, so it is out of scope.
 
+## 9. What M11 changed
+
+M11 took the last open question that a free T4 can answer: the C=32 decode step at 14.4 ms
+against a 5.9 ms floor, with the decode kernel at 95 GB/s and the GEMMs at 173.
+
+**The floor was measured first.** Every floor so far divided by the T4's 320 GB/s spec. A
+plain read of 512 MiB (`x.sum()`) reaches 275 GB/s on this T4 and a copy 233-235, in two
+sessions, with the clock held by the 70 W power cap. At 275 GB/s the C=32 floor is 6.9 ms.
+
+**The decode kernel was latency-bound, and the fix was fewer warps, not wider tiles.** The
+hypothesis was that one 16-token block per loop iteration leaves each iteration waiting on
+memory (sm_75 has no `cp.async`, so Triton does not overlap the next loads with the current
+math). The kernels gained a tile: `TILE_BLOCKS` blocks per iteration, and the warps per
+program. Timed alone (one layer, fp16, the engine's split count, median of 3 rotated rounds),
+wider tiles were slower at every batch above 1, and fewer warps faster:
+
+| ms per layer | 1x4 (M10) | 1x2 | 1x1 | 1x1 speed-up |
+|---|---|---|---|---|
+| B=32, 160 tokens | 0.249 | 0.149 | 0.101 | 2.45x |
+| B=64, 160 tokens | 0.471 | 0.317 | 0.216 | 2.18x |
+| B=32, 1,024 tokens | 1.442 | 1.067 | 0.633 | 2.28x |
+| B=8, 1,024 tokens | 0.364 | 0.242 | 0.170 | 2.15x |
+| B=1, 1,024 tokens | 0.087 | 0.088 | 0.085 | 1.02x |
+
+(run 2; run 1 had the same order with other absolute times.) The *inferred* mechanism, from
+the register counts Triton compiles to on Kaggle: an SM holds 64 K registers, 32 warps and 16
+programs. At 4 warps the kernel fits 6 programs per SM, 240 on 40 SMs, so C=32's 256 programs
+(32 sequences x 8 kv heads) run in 2 waves and C=64's in 3; at 1 warp it fits 15, 600, so both
+run in one. Fewer waves would also explain why the gain grows with the batch, as measured.
+The counters that would confirm this are blocked on Kaggle.
+
+End to end (same code, tiles alternating 1x4, 1x2, 1x1, 1x1, 1x2, 1x4 in one session):
+
+| C | 1x4 | 1x2 | 1x1 | 1x1 gain |
+|---|---|---|---|---|
+| 1 | 141.9 | 143.5 | 144.2 | +1.6% |
+| 8 | 813.9 | 868.8 | 894.6 | +9.9% |
+| 16 | 1,216.9 | 1,355.1 | 1,421.1 | +16.8% |
+| 32 | 1,638.9 | 1,900.1 | 2,090.8 | +27.6% |
+| 64 | 2,068.1 | 2,448.3 | 2,705.6 | +30.8% |
+
+With 1x1 the C=32 step is 12.5 ms (forward 11.6): GEMMs 6.8 ms at 174 GB/s, the decode kernel
+2.4 ms at 212 GB/s (77% of the measured read ceiling). fp32 greedy vs HF: 0 mismatches / 1,920
+tokens at batch 32 and at batch 8; fp16: 5 near-ties at margins <= 0.0625.
+
+**The GEMMs stay with cuBLAS.** cuBLASLt was 4.6% faster at 32 rows and 2% slower at 64, and
+PyTorch's back-end choice is process-wide, so it is not adopted. Both reach about 61-63% of
+the 275 GB/s ceiling at 32 rows. A Triton GEMM was not tried: at 32 rows a decode GEMM does 32
+FLOPs per weight byte, so at 300 GB/s it needs ~9.6 TFLOPS, and Triton has only the T4's fp32
+FMA units (8.1 TFLOPS) before sm_80.
+
+**A measurement fix.** `check_t4_compile.py` had compiled the kernels without the hints a real
+launch gives Triton (which pointers and strides are multiples of 16), so its loads were not
+vectorized and its register counts were not those of the engine's launches. It now passes
+them and prints programs per SM, which is what the mechanism above rests on.
+
+**What stays open, finally.** Why the fused kernels slowed the decode kernel inside a step in
+M10 needs GPU counters; whether one warp per program is right on other GPUs, and the prefill
+kernel on sm_80, need other hardware. Neither is available for free, so both are recorded as
+limitations, not as work left.
+
 ## How to reproduce
 
 Kaggle T4, after the repo's notebook cell 1 (clone, `pip install --no-deps -e .`, weights):
@@ -374,4 +435,17 @@ M10 (one session, after cell 1; `PYTHONPATH=<older checkout>/src` runs the bench
 !python scripts/bench_gemm.py
 !python scripts/profile_api.py --device cuda --attention triton_split --prefill-attention batched --cuda-graphs --fused-kernels --concurrency 32
 !python scripts/check_t4_compile.py --arch 80
+```
+
+M11 (one session each, after cell 1; `--decode-tile` compares tiles on the same code):
+
+```
+!python scripts/check_t4_compile.py
+!python scripts/bench_decode_tile.py
+!python scripts/bench_gemm.py --batches 1,8,32,64 --blas cublas,cublaslt,cublaslt,cublas
+!for t in 1x4 1x2 1x1 1x1 1x2 1x4; do python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels --concurrency 1,8,16,32,64 --decode-tile $t; done
+!python scripts/compare_hf.py --engine batched --device cuda --dtype float32 --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels
+!python scripts/bench_hf.py --device cuda --concurrency 1,8,16,32,64
+!python scripts/bench_api.py --device cuda --attention triton_split --prefill-attention batched --cuda-graphs --fused-kernels
+!python scripts/profile_engine.py --device cuda --attention triton_split --cuda-graphs --prefill-attention batched --fused-kernels --concurrency 1,32
 ```

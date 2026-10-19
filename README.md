@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M10 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events, `stop`, `n`, logprobs) with a paged KV cache, continuous batching with optional chunked prefill, a radix prefix cache, Triton decode, prefill and fused norm / RoPE kernels, and CUDA graphs for decode steps. On a T4 its default GPU setup runs 1,604 tok/s at 32 concurrent sequences (3.86x HF `generate()`) and 141 tok/s for a single sequence, where vLLM 0.32 ran 136 in the same session. Over HTTP: 1,496 tok/s at C=32. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8, M9 and M10 changed, and the comparison with vLLM. See [PROGRESS.md](PROGRESS.md).
+> Status: **done (M0-M11).** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events, `stop`, `n`, logprobs) with a paged KV cache, continuous batching with optional chunked prefill, a radix prefix cache, Triton decode, prefill and fused norm / RoPE kernels, and CUDA graphs for decode steps. On a T4 its default GPU setup runs 2,064 tok/s at 32 concurrent sequences (4.98x HF `generate()` in the same session) and 144 tok/s for a single sequence (vLLM 0.32 ran 136 in an M10 session, against TinyServe's 141 then). Over HTTP: 1,915 tok/s at C=32. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8 to M11 changed, and the comparison with vLLM. See [PROGRESS.md](PROGRESS.md).
 
 ## Features
 
@@ -193,6 +193,25 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   with F: 0 mismatches / 1,920 tokens at batch 32 and at batch 8; fp16: 6 near-ties (HF top-2
   margin <= 0.0625). Numbers transcribed from the printed output.
 
+- M11 (2026-10-19, Kaggle T4, fp16, the M3 workload, `scripts/benchmark.py`): the decode
+  kernels at one warp per program instead of four. Run 2 compared the tiles on the same code
+  (`--decode-tile`), 1x4, 1x2, 1x1, 1x1, 1x2, 1x4 in one session (mean of two runs each; every
+  1x1 run beat every other run); run 3 is the new default next to HF in one session:
+
+  | Concurrency | 1x4 (M10's kernel) | 1x1 | gain | run 3 | run 3 / HF |
+  |---|---|---|---|---|---|
+  | 1 | 141.9 | 144.2 | +1.6% | 144.2 | 6.03x |
+  | 8 | 813.9 | 894.6 | +9.9% | 888.1 | 4.83x |
+  | 16 | 1,216.9 | 1,421.1 | +16.8% | 1,407.7 | 4.18x |
+  | 32 | 1,638.9 | 2,090.8 | +27.6% | 2,063.7 | 4.98x |
+  | 64 | 2,068.1 | 2,705.6 | +30.8% | 2,685.4 | 5.96x |
+
+  At C=32 the decode kernel now takes 2.4 ms of a 12.5 ms step (M10: 5.3 of 14.4), 212 GB/s
+  (M10: 95). Over HTTP: 139.5 / 825.6 / 1,914.5 / 2,379.5 tok/s at C = 1 / 8 / 32 / 64. fp32
+  greedy: 0 mismatches / 1,920 tokens at batch 32 and at batch 8; fp16: 5 near-ties (HF top-2
+  margin <= 0.0625). The T4 reads 275 GB/s at best on a plain 512 MiB read (copy: 233-235), not
+  its 320 GB/s spec. Numbers transcribed from the printed output.
+
 - Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
   `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
   at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
@@ -300,6 +319,8 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   variant per dtype after all of them. The merged q/k/v and gate/up matrices hold the original
   rows, the separate weights are views of them (one copy), and the padded output head returns
   exactly the given rows' logits.
+- M11: the decode kernels at every tile of 1-8 blocks per loop iteration, with ranges and
+  sequences that end mid-tile, equal the reference, and the default tile gives M10's result.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -324,12 +345,17 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   block-table width; prefill and mixed steps run eagerly.
 - Chunked prefill is opt-in: it lowers the median TTFT (62 vs 184 ms at 32 streams) and the
   longest gap between tokens at 32 and 64 streams, but costs 1-3% throughput and raises TTFT p99.
-- A decode step at 32 streams is 14.4 ms against a 5.9 ms roofline floor: cuBLAS reaches
-  173 GB/s on the GEMMs and the decode kernel 95 GB/s of the T4's 320. Inside a step with the
-  fused kernels the decode kernel takes ~1 ms longer than without them (they still save ~4.3 ms
-  per step); why was not identified, since GPU performance counters are blocked on Kaggle.
-- The Triton prefill kernel was compiled for sm_80 (tensor cores, no spills) but never run on
-  such a GPU.
+- A decode step at 32 streams is 12.5 ms against a roofline floor of 6.9 ms at the 275 GB/s a
+  plain read reaches on the T4 (5.9 ms at the 320 GB/s spec). The GEMMs take 6.8 ms at 174 GB/s
+  with cuBLAS, and cuBLASLt is no better overall (-4.6% at 32 rows, +2% at 64); a Triton GEMM
+  was not tried, since at 32 rows without tensor cores (none in Triton before sm_80) it would
+  need ~9.6 TFLOPS of fp32 FMA, above the T4's 8.1. The decode kernel takes 2.4 ms at 212 GB/s.
+- Final, not measurable on free hardware (Kaggle blocks GPU performance counters): in M10, with
+  the 4-warp decode kernel, the fused kernels made it ~1 ms slower inside a step while saving
+  ~4.3 ms; why was not identified. Why one warp per program is fastest is inferred from
+  register counts (programs per SM), not measured.
+- Final: the Triton prefill kernel was compiled for sm_80 (tensor cores, no spills) but never
+  run on such a GPU; Kaggle and free Colab have none.
 - Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
   one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
   decodes to empty text gets only at its end.
