@@ -65,10 +65,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--fused-kernels", action="store_true")
     args = parser.parse_args()
     levels = [int(c) for c in args.concurrency.split(",")]
     milestone = "m8" if args.cuda_graphs else "m6"
-    milestone = "m9" if args.chunked_prefill else milestone
+    milestone = "m9" if args.chunked_prefill or args.fused_kernels else milestone
     out = args.out or Path(f"results/{milestone}_api_bench_{args.device.split(':')[0]}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
@@ -81,7 +82,8 @@ def main() -> None:
         "--prefill-attention", args.prefill_attention,
         "--max-batch-tokens", str(args.max_batch_tokens),
     ] + (["--cuda-graphs"] if args.cuda_graphs else []) + (
-        ["--chunked-prefill"] if args.chunked_prefill else [])  # fmt: skip
+        ["--chunked-prefill"] if args.chunked_prefill else []) + (
+        ["--fused-kernels"] if args.fused_kernels else [])  # fmt: skip
 
     rows = []
     with running_server(serve_args, args.port) as url:
@@ -112,6 +114,7 @@ def main() -> None:
         "prefill_attention": args.prefill_attention,
         "cuda_graphs": args.cuda_graphs,
         "chunked_prefill": args.chunked_prefill,
+        "fused_kernels": args.fused_kernels,
         "max_batch_tokens": args.max_batch_tokens,
         "transport": "HTTP /v1/completions, SSE stream, token-id prompts, EOS ignored",
         "args": {k: str(v) for k, v in vars(args).items()},

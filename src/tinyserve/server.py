@@ -89,6 +89,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--switch-interval-ms", type=float, default=None,
                         help="profiling: how often Python offers the GIL to another "
                              "thread (default 5 ms)")  # fmt: skip
+    parser.add_argument("--fused-kernels", action="store_true",
+                        help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
     args = parser.parse_args(argv)
     if args.cuda_graphs and args.attention == "torch":
         parser.error("--cuda-graphs needs a Triton --attention (triton, triton_grouped, ...)")
@@ -102,7 +104,8 @@ def main(argv: list[str] | None = None) -> None:
     dtype = getattr(torch, args.dtype or ("float32" if args.device == "cpu" else "float16"))
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     weights = load_weights(args.model_dir, cfg, dtype, args.device)
-    model = Qwen3(cfg, weights, args.attention, prefill_attention=args.prefill_attention)
+    model = Qwen3(cfg, weights, args.attention, prefill_attention=args.prefill_attention,
+                  fused_kernels=args.fused_kernels)  # fmt: skip
     elem = torch.empty((), dtype=dtype).element_size()
     per_block = 2 * cfg.num_layers * args.block_size * cfg.num_kv_heads * cfg.head_dim * elem
     num_blocks = int(args.kv_gib * 2**30 // per_block)
@@ -126,7 +129,8 @@ def main(argv: list[str] | None = None) -> None:
             else "eager (no CUDA)"
         )
     print(f"{args.device} {dtype}, {args.attention} decode attention, "
-          f"{args.prefill_attention} prefill attention, CUDA graphs {graph_note}, chunked "
+          f"{args.prefill_attention} prefill attention, fused kernels "
+          f"{'on' if args.fused_kernels else 'off'}, CUDA graphs {graph_note}, chunked "
           f"prefill {'on' if args.chunked_prefill else 'off'} ({args.max_batch_tokens} tokens "
           f"per step), prefix cache "
           f"{'on' if args.prefix_cache else 'off'}, KV cache {num_blocks} blocks x "

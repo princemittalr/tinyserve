@@ -16,10 +16,14 @@ Two paths share the same layers and differ only in attention:
     ``forward_decode`` (M8): a decode step with fixed shapes and no host syncs, from
         buffers filled in advance (``DecodeInputs``), so a CUDA graph can capture it
         (cuda_graphs.py). Same layers, same kernel; only how the inputs arrive differs.
+
+With ``fused_kernels=True`` (M9, triton_fused.py) the paged paths run the hidden-state
+RMSNorms as one Triton launch each, and the q/k head norms, RoPE and the k/v cache write
+as one launch per layer, instead of several PyTorch kernels each.
 """
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -42,8 +46,9 @@ from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin, swiglu_mlp
 DECODE_ATTENTIONS = ("torch", "triton", "triton_grouped", "triton_split")
 # prefill_attention choices: per-sequence PyTorch, one padded SDPA call (M8), the M9 kernel.
 PREFILL_ATTENTIONS = ("per_seq", "batched", "triton")
-# (layer index, q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]) -> attention output [T, Hq, D]
-AttentionFn = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+# (layer index, q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]) -> attention output [T, Hq, D].
+# k and v are None when the fused kernel (M9) already wrote them into the cache.
+AttentionFn = Callable[[int, torch.Tensor, torch.Tensor | None, torch.Tensor | None], torch.Tensor]
 # paged_decode_attention's signature (triton_attention.py); kept here so the model does
 # not import Triton unless asked to.
 DecodeFn = Callable[
@@ -59,6 +64,7 @@ class Qwen3:
         weights: dict[str, torch.Tensor],
         decode_attention: Literal["torch", "triton", "triton_grouped", "triton_split"] = "torch",
         prefill_attention: Literal["per_seq", "batched", "triton"] = "per_seq",
+        fused_kernels: bool = False,
     ) -> None:
         """``decode_attention`` picks how ``forward_batch`` attends for one-token sequences:
         "torch" runs ``paged_gqa_attention`` per sequence, "triton" runs the M4 kernel once
@@ -67,7 +73,9 @@ class Qwen3:
         Triton is imported only when chosen (it has no Windows wheels).
         ``prefill_attention`` picks how the other sequences attend: "per_seq" runs
         ``paged_gqa_attention`` for each, "batched" (M8) runs ``batched_prefill_attention``
-        once for all of them, "triton" (M9) the varlen prefill kernel once for all."""
+        once for all of them, "triton" (M9) the varlen prefill kernel once for all.
+        ``fused_kernels`` (M9) turns on the fused norm / RoPE / cache-write kernels for
+        ``forward_batch`` and ``forward_decode``."""
         self.cfg = cfg
         self.w = weights
         self.decode_kernel: DecodeFn | None = None
@@ -101,31 +109,57 @@ class Qwen3:
             from tinyserve.triton_prefill import paged_prefill_attention
 
             self.prefill_kernel = paged_prefill_attention
+        self.fused: Any = None  # the triton_fused module, imported only when asked for
+        if fused_kernels:
+            from tinyserve import triton_fused
+
+            self.fused = triton_fused
         # Tied embeddings: the output projection reuses the input embedding matrix.
         key = "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm_head.weight"
         self.lm_head = weights[key]
 
+    def _norm(self, x: torch.Tensor, weight: torch.Tensor, fused: bool) -> torch.Tensor:
+        if fused:
+            return self.fused.rms_norm_rows(x, weight, self.cfg.rms_norm_eps)  # type: ignore[no-any-return]
+        return rms_norm(x, weight, self.cfg.rms_norm_eps)
+
     def _layer(
-        self, i: int, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attend: AttentionFn
+        self,
+        i: int,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attend: AttentionFn,
+        store: tuple[KVCache, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """One decoder layer. With ``store`` = (cache, slots) and the fused kernels on,
+        the new k/v go into the cache here, and ``attend`` gets k = v = None."""
         cfg, p = self.cfg, f"model.layers.{i}."
         w = self.w
         t = x.shape[0]
+        fused = store is not None and self.fused is not None
 
         # Attention block: pre-norm, then a residual add.
-        h = rms_norm(x, w[p + "input_layernorm.weight"], cfg.rms_norm_eps)
+        h = self._norm(x, w[p + "input_layernorm.weight"], fused)
         q = F.linear(h, w[p + "self_attn.q_proj.weight"]).view(t, cfg.num_heads, cfg.head_dim)
         k = F.linear(h, w[p + "self_attn.k_proj.weight"]).view(t, cfg.num_kv_heads, cfg.head_dim)
         v = F.linear(h, w[p + "self_attn.v_proj.weight"]).view(t, cfg.num_kv_heads, cfg.head_dim)
-        # Qwen3-specific: normalise each head of q and k BEFORE applying RoPE.
-        q = rms_norm(q, w[p + "self_attn.q_norm.weight"], cfg.rms_norm_eps)
-        k = rms_norm(k, w[p + "self_attn.k_norm.weight"], cfg.rms_norm_eps)
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        attn = attend(i, q, k, v)
+        qn, kn = w[p + "self_attn.q_norm.weight"], w[p + "self_attn.k_norm.weight"]
+        if fused and store is not None:  # M9: norms, RoPE and the cache write in one launch
+            cache, slots = store
+            q = self.fused.qk_norm_rope_store(
+                q, k, v, qn, kn, cos, sin, slots, cache.k[i], cache.v[i], cfg.rms_norm_eps
+            )
+            attn = attend(i, q, None, None)
+        else:
+            # Qwen3-specific: normalise each head of q and k BEFORE applying RoPE.
+            q, k = rms_norm(q, qn, cfg.rms_norm_eps), rms_norm(k, kn, cfg.rms_norm_eps)
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            attn = attend(i, q, k, v)
         x = x + F.linear(attn.reshape(t, cfg.q_size), w[p + "self_attn.o_proj.weight"])
 
         # MLP block: pre-norm, then a residual add.
-        h = rms_norm(x, w[p + "post_attention_layernorm.weight"], cfg.rms_norm_eps)
+        h = self._norm(x, w[p + "post_attention_layernorm.weight"], fused)
         mlp = swiglu_mlp(
             h,
             w[p + "mlp.gate_proj.weight"],
@@ -140,17 +174,19 @@ class Qwen3:
         positions: torch.Tensor,
         attend: AttentionFn,
         rows: torch.Tensor | None = None,
+        store: tuple[KVCache, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Logits for every token, or only for ``rows`` if given."""
+        """Logits for every token, or only for ``rows`` if given. ``store`` = (cache, the
+        new tokens' slots) lets the fused kernels write k/v (see ``_layer``)."""
         cos, sin = rope_cos_sin(self.cfg.head_dim, self.cfg.rope_theta, positions)
         x = self.w["model.embed_tokens.weight"][token_ids]  # embedding = row lookup
         for i in range(self.cfg.num_layers):
-            x = self._layer(i, x, cos, sin, attend)
+            x = self._layer(i, x, cos, sin, attend, store)
         if rows is not None:
             # The output head is [vocab, hidden] = 151,936 x 1,024 for Qwen3-0.6B: the
             # largest matmul in the model. Skip it for rows nobody samples from.
             x = x[rows]
-        x = rms_norm(x, self.w["model.norm.weight"], self.cfg.rms_norm_eps)
+        x = self._norm(x, self.w["model.norm.weight"], store is not None and bool(self.fused))
         return F.linear(x, self.lm_head).float()
 
     @torch.inference_mode()
@@ -158,9 +194,14 @@ class Qwen3:
         """``[T]`` token ids of one sequence -> ``[T, vocab]`` float32 logits. No cache."""
         positions = torch.arange(token_ids.shape[0], device=token_ids.device)
         scale = self.cfg.head_dim**-0.5
-        return self._run(
-            token_ids, positions, lambda i, q, k, v: causal_gqa_attention(q, k, v, scale)
-        )
+
+        def attend(
+            i: int, q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None
+        ) -> torch.Tensor:
+            assert k is not None and v is not None  # no cache, so never fused
+            return causal_gqa_attention(q, k, v, scale)
+
+        return self._run(token_ids, positions, attend)
 
     @torch.inference_mode()
     def forward_paged(
@@ -187,7 +228,10 @@ class Qwen3:
         positions = torch.arange(total - n, total, device=token_ids.device)
         scale = self.cfg.head_dim**-0.5
 
-        def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        def attend(
+            i: int, q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None
+        ) -> torch.Tensor:
+            assert k is not None and v is not None  # the M2 path is never fused
             cache.write(i, new_slots, k, v)
             return paged_gqa_attention(q, cache.k[i], cache.v[i], all_slots, scale)
 
@@ -236,8 +280,11 @@ class Qwen3:
             p_tables, p_lens = batch.block_tables[sel], batch.context_lens[sel]
             max_q = max(batch.query_lens[b] for b in rest)
 
-        def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            cache.write(i, batch.new_slots, k, v)
+        def attend(
+            i: int, q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None
+        ) -> torch.Tensor:
+            if k is not None and v is not None:  # else the fused kernel wrote them
+                cache.write(i, batch.new_slots, k, v)
             ki, vi, bs = cache.k[i], cache.v[i], cache.block_size
             if kernel and not rest:  # all decode: q's rows are the B sequences, in order
                 return kernel(q, ki, vi, tables, lens, scale, bs)
@@ -255,7 +302,13 @@ class Qwen3:
                 out[s:e] = paged_gqa_attention(q[s:e], ki, vi, batch.seq_slots[b], scale)
             return out
 
-        return self._run(batch.token_ids, batch.positions, attend, rows=batch.last_rows)
+        return self._run(
+            batch.token_ids,
+            batch.positions,
+            attend,
+            rows=batch.last_rows,
+            store=(cache, batch.new_slots),
+        )
 
     @torch.inference_mode()
     def forward_decode(self, inputs: DecodeInputs, cache: KVCache) -> torch.Tensor:
@@ -274,12 +327,15 @@ class Qwen3:
             raise ValueError('forward_decode needs a Triton decode kernel ("triton..." attention)')
         scale = self.cfg.head_dim**-0.5
 
-        def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            cache.write(i, inputs.slots, k, v)
+        def attend(
+            i: int, q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None
+        ) -> torch.Tensor:
+            if k is not None and v is not None:  # else the fused kernel wrote them
+                cache.write(i, inputs.slots, k, v)
             ki, vi, bs = cache.k[i], cache.v[i], cache.block_size
             return launch(q, ki, vi, inputs.block_tables, inputs.context_lens, scale, bs)
 
-        return self._run(inputs.token_ids, inputs.positions, attend)
+        return self._run(inputs.token_ids, inputs.positions, attend, store=(cache, inputs.slots))
 
 
 def greedy_generate(

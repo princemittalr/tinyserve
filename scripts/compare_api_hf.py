@@ -88,9 +88,13 @@ def main() -> None:
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--fused-kernels", action="store_true")
+    parser.add_argument("--chunked-prefill", action="store_true")
+    parser.add_argument("--max-batch-tokens", type=int, default=2048)
     args = parser.parse_args()
     dev = args.device.split(":")[0]
     milestone = "m8" if args.cuda_graphs else "m6"
+    milestone = "m9" if args.chunked_prefill or args.fused_kernels else milestone
     out = args.out or Path(f"results/{milestone}_api_hf_compare_{args.dtype}_{dev}.json")
 
     template_diffs = check_chat_template(args.model_dir)
@@ -103,8 +107,11 @@ def main() -> None:
         "--model-dir", str(args.model_dir), "--device", args.device, "--dtype", args.dtype,
         "--attention", args.attention, "--kv-gib", "2", "--max-num-seqs", "64",
         "--prefill-attention", args.prefill_attention,
+        "--max-batch-tokens", str(args.max_batch_tokens),
     ] + (["--prefix-cache"] if args.prefix_cache else []) + (
-        ["--cuda-graphs"] if args.cuda_graphs else [])  # fmt: skip
+        ["--cuda-graphs"] if args.cuda_graphs else []) + (
+        ["--fused-kernels"] if args.fused_kernels else []) + (
+        ["--chunked-prefill"] if args.chunked_prefill else [])  # fmt: skip
     with running_server(serve_args, args.port) as url:
         api = asyncio.run(ask_all(url, prompts, args.max_new_tokens))
 
@@ -133,6 +140,9 @@ def main() -> None:
         "dtype": args.dtype,
         "attention": args.attention,
         "prefill_attention": args.prefill_attention,
+        "fused_kernels": args.fused_kernels,
+        "chunked_prefill": args.chunked_prefill,
+        "max_batch_tokens": args.max_batch_tokens,
         "cuda_graphs": args.cuda_graphs,
         "prefix_cache": args.prefix_cache,
         "transport": "HTTP /v1/completions, token-id prompts, half SSE half plain, all at once",

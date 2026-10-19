@@ -95,7 +95,7 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
 
     def engine(c: int, trace: bool = False) -> Engine:
         return Engine(model, cache, c, args.max_batch_tokens, trace_steps=trace,
-                      decode_graphs=graphs)  # fmt: skip
+                      decode_graphs=graphs, chunked_prefill=args.chunked_prefill)  # fmt: skip
 
     run_closed_loop(engine(2), prompts[:2], 4, concurrency=2)  # warm-up, not reported
     print(f"{'C':>3} | {'tok/s':>7} | decode step ms: {'sched':>5} {'build':>5} "
@@ -210,7 +210,7 @@ def run_prefix(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: to
 
     def engine(on: bool, trace: bool = False) -> Engine:
         return Engine(model, cache, c, args.max_batch_tokens, prefix_cache=on,
-                      trace_steps=trace)  # fmt: skip
+                      trace_steps=trace, chunked_prefill=args.chunked_prefill)  # fmt: skip
 
     run_closed_loop(engine(True), prompts[:2], 4, concurrency=2)  # warm-up
     runs: dict[str, Any] = {}
@@ -287,6 +287,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trace", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--chunked-prefill", action="store_true",
+                        help="split prompts into chunks of the step budget (M9)")  # fmt: skip
+    parser.add_argument("--fused-kernels", action="store_true",
+                        help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
     args = parser.parse_args()
     args.concurrency = args.concurrency or ("1,8,32,64" if args.workload == "m3" else "32")
     if args.output_len is None:
@@ -300,7 +304,8 @@ def main() -> None:
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, dev),
                   decode_attention=args.attention,
-                  prefill_attention=args.prefill_attention)  # fmt: skip
+                  prefill_attention=args.prefill_attention,
+                  fused_kernels=args.fused_kernels)  # fmt: skip
     print(f"{hardware(dev)}, {dtype}, {args.attention} decode attention, workload "
           f"{args.workload}")  # fmt: skip
     with torch.inference_mode():
@@ -314,6 +319,9 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
         "prefill_attention": args.prefill_attention,
+        "fused_kernels": args.fused_kernels,
+        "chunked_prefill": args.chunked_prefill,
+        "max_batch_tokens": args.max_batch_tokens,
         "cuda_graphs": args.cuda_graphs,
         "args": {k: str(v) for k, v in vars(args).items()},
         **data,

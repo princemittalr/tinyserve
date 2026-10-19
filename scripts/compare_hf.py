@@ -91,6 +91,8 @@ def main() -> None:
                         help="batched engine splits prompts into chunks (M9)")  # fmt: skip
     parser.add_argument("--max-batch-tokens", type=int, default=2048, help="batched engine only")
     parser.add_argument("--out", type=Path, default=None, help="default: results/<m2|m1>_...")
+    parser.add_argument("--fused-kernels", action="store_true",
+                        help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
     args = parser.parse_args()
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype or ("float32" if device.type == "cpu" else "float16"))
@@ -99,7 +101,7 @@ def main() -> None:
         milestone = "m4" if args.attention != "torch" else milestone
         milestone = "m5" if args.prefix_cache else milestone
         milestone = "m8" if args.cuda_graphs else milestone
-        milestone = "m9" if args.chunked_prefill else milestone
+        milestone = "m9" if args.chunked_prefill or args.fused_kernels else milestone
         suffix = "" if device.type == "cpu" else f"_{device.type}"
         args.out = Path(f"results/{milestone}_hf_compare{suffix}.json")
 
@@ -107,7 +109,8 @@ def main() -> None:
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     weights = load_weights(args.model_dir, cfg, dtype=dtype, device=device)
     ours = Qwen3(cfg, weights, decode_attention=args.attention,
-                 prefill_attention=args.prefill_attention)  # fmt: skip
+                 prefill_attention=args.prefill_attention,
+                  fused_kernels=args.fused_kernels)  # fmt: skip
     hf: Any = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=dtype)
     hf.to(device).eval()
     tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
@@ -196,6 +199,8 @@ def main() -> None:
         "engine": args.engine,
         "attention": args.attention,
         "prefill_attention": args.prefill_attention,
+        "fused_kernels": args.fused_kernels,
+        "chunked_prefill": args.chunked_prefill,
         "cuda_graphs": args.cuda_graphs,
         "prompts": len(rows),
         "max_new_tokens": args.max_new_tokens,

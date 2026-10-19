@@ -63,18 +63,21 @@ def main() -> None:
                         help="split prompts into chunks of the step budget (M9)")  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--fused-kernels", action="store_true",
+                        help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
     args = parser.parse_args()
     dtype = getattr(torch, args.dtype or ("float16" if args.device != "cpu" else "float32"))
     levels = [int(c) for c in args.concurrency.split(",")]
     milestone = "m4" if args.attention != "torch" else "m3"
     milestone = "m8" if args.cuda_graphs else milestone
-    milestone = "m9" if args.chunked_prefill else milestone
+    milestone = "m9" if args.chunked_prefill or args.fused_kernels else milestone
     out = args.out or Path(f"results/{milestone}_bench_{args.device.split(':')[0]}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     weights = load_weights(args.model_dir, cfg, dtype, args.device)
     model = Qwen3(cfg, weights, decode_attention=args.attention,
-                  prefill_attention=args.prefill_attention)  # fmt: skip
+                  prefill_attention=args.prefill_attention,
+                  fused_kernels=args.fused_kernels)  # fmt: skip
     most = max(num_requests_for(c, args.num_requests) for c in levels)
     prompts = synthetic_prompts(most, args.input_len, cfg.vocab_size, args.seed)
 
@@ -118,6 +121,7 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
         "prefill_attention": args.prefill_attention,
+        "fused_kernels": args.fused_kernels,
         "chunked_prefill": args.chunked_prefill,
         "max_batch_tokens": args.max_batch_tokens,
         "cuda_graphs": None
