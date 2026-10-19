@@ -26,13 +26,21 @@ from hypothesis import strategies as st
 pytest.importorskip("triton", reason="Triton is not installed (no Windows wheels)")
 
 from tinyserve.attention import paged_decode_attention_ref, paged_gqa_attention
-from tinyserve.triton_attention import paged_decode_attention, paged_decode_attention_grouped
+from tinyserve.triton_attention import (
+    MAX_SPLITS,
+    launch_paged_decode_split,
+    num_splits_for,
+    paged_decode_attention,
+    paged_decode_attention_grouped,
+    paged_decode_attention_split,
+)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TOL = {torch.float32: 1e-5, torch.float16: 1e-3}
-# The M4 kernel (one program per query head) and the M8 grouped one (one per kv head):
-# every check below runs both against the same reference.
-KERNELS = [paged_decode_attention, paged_decode_attention_grouped]
+# The M4 kernel (one program per query head), the M8 grouped one (one per kv head) and
+# the M9 split-K one (grouped, each sequence's blocks split into ranges at small batches):
+# every check below runs all three against the same reference.
+KERNELS = [paged_decode_attention, paged_decode_attention_grouped, paged_decode_attention_split]
 
 
 @dataclass
@@ -219,6 +227,36 @@ def test_grouped_kernel_rejects_a_group_that_is_not_a_power_of_2() -> None:
     paged_decode_attention(*c.args(), c.scale, c.block_size)  # the per-head kernel is fine
     with pytest.raises(ValueError, match="power-of-2 head group"):
         paged_decode_attention_grouped(*c.args(), c.scale, c.block_size)
+    with pytest.raises(ValueError, match="power-of-2 head group"):
+        paged_decode_attention_split(*c.args(), c.scale, c.block_size)
+
+
+# --- split-K (M9) ---------------------------------------------------------------------------
+
+
+def test_number_of_splits_fills_the_gpu_at_small_batches_only() -> None:
+    # Qwen3-0.6B has 8 kv heads: batch 1 gets 10 ranges (80 programs), batch 8 two,
+    # batch 10 and up none; never more ranges than blocks in a table, or MAX_SPLITS.
+    assert [num_splits_for(b, 8, 64) for b in (1, 2, 4, 8, 10, 32)] == [10, 5, 3, 2, 1, 1]
+    assert num_splits_for(1, 8, 4) == 4
+    assert num_splits_for(1, 1, 64) == MAX_SPLITS
+
+
+@pytest.mark.parametrize("splits", [1, 2, 3, 5, 16])
+@pytest.mark.parametrize("lens", [[1], [17, 300, 33], [64, 2]])
+def test_any_number_of_splits_gives_the_same_result(splits: int, lens: list[int]) -> None:
+    # More ranges than a sequence has blocks leaves some empty: they must not count.
+    c = make_case(lens, 4, 2, head_dim=32, block_size=4, seed=splits)
+    ref = paged_decode_attention_ref(*c.args(), c.scale, c.block_size)
+    out = launch_paged_decode_split(*c.args(), c.scale, c.block_size, num_splits=splits)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.gpu
+def test_one_long_sequence_on_gpu() -> None:
+    # Split-K's case: batch 1 with a long context (2,048 tokens), fp16, Qwen3 shapes.
+    check(make_case([2048], dtype=torch.float16, seed=2))
 
 
 @pytest.mark.gpu

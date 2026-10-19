@@ -47,7 +47,7 @@ def tables(alloc: BlockAllocator, cached: list[int], new: list[int]) -> list[Blo
         ([0, 0], [3, 5]),  # all prefill: the kernel is never called
     ],
 )
-@pytest.mark.parametrize("kernel", ["triton", "triton_grouped"])
+@pytest.mark.parametrize("kernel", ["triton", "triton_grouped", "triton_split"])
 def test_forward_batch_matches_torch_path(cached: list[int], new: list[int], kernel: str) -> None:
     torch_model, triton_model = models(kernel)
     cache = KVCache(CFG, 64, 4, dtype=torch.float32, device=DEVICE)
@@ -67,7 +67,7 @@ def test_forward_batch_matches_torch_path(cached: list[int], new: list[int], ker
     ("num_blocks", "max_num_seqs"),
     [(64, 8), (64, 1), (7, 8)],  # roomy; one at a time; tight cache (preemptions)
 )
-@pytest.mark.parametrize("kernel", ["triton", "triton_grouped"])
+@pytest.mark.parametrize("kernel", ["triton", "triton_grouped", "triton_split"])
 def test_engine_with_kernel_matches_m1_greedy(
     num_blocks: int, max_num_seqs: int, kernel: str
 ) -> None:
@@ -94,5 +94,5 @@ def test_engine_with_kernel_and_prefix_cache_matches_m1_greedy(num_blocks: int) 
 
 
 def test_unknown_decode_attention_is_rejected() -> None:
-    with pytest.raises(ValueError, match="'torch', 'triton' or 'triton_grouped'"):
+    with pytest.raises(ValueError, match="decode_attention must be one of"):
         Qwen3(CFG, tiny_model().w, decode_attention="flash")  # type: ignore[arg-type]

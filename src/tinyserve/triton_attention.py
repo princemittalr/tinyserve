@@ -24,6 +24,14 @@ which equals softmax(scores) @ v exactly (up to rounding).
 M8 adds ``paged_decode_attention_grouped``: the same math with one program per
 (sequence, kv head), so the query heads of a GQA group share each k/v load. M7 measured
 the per-head kernel loading every k/v twice for Qwen3-0.6B (16 query heads, 8 kv heads).
+
+M9 adds split-K (``paged_decode_attention_split``, "flash-decoding"): at batch 1 the
+grouped kernel has only 8 programs for the T4's 40 SMs. Splitting each sequence's blocks
+into S contiguous ranges gives B * Hkv * S programs. Each range runs the same online
+softmax and writes its partial (m, sum_exp, acc) per query head; a second small kernel
+merges them. Two partials with maxima m1, m2 merge exactly like one block into another:
+
+    m = max(m1, m2),  sum_exp = e^(m1-m) sum_exp1 + e^(m2-m) sum_exp2,  same for acc.
 """
 
 import torch
@@ -160,6 +168,103 @@ def _paged_decode_grouped_kernel(
     out = acc / sum_exp[:, None]
     o_off = seq * stride_ob + heads[:, None] * stride_oh + d[None, :]
     tl.store(out_ptr + o_off, out.to(out_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _paged_decode_split_kernel(
+    q_ptr,  # [B, Hq, D]
+    k_ptr,  # [num_slots, Hkv, D]
+    v_ptr,
+    m_ptr,  # [B, Hq, S] float32: each split's running max
+    l_ptr,  # [B, Hq, S] float32: each split's sum of exp(score - max)
+    acc_ptr,  # [B, Hq, S, D] float32: each split's unnormalised output
+    block_tables_ptr,  # [B, max_blocks] int32
+    context_lens_ptr,  # [B] int32
+    scale,
+    stride_qb,
+    stride_qh,
+    stride_ks,
+    stride_kh,
+    stride_bt,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """M9: the grouped kernel's loop over one of NUM_SPLITS contiguous ranges of the
+    sequence's blocks; the partial results go to m / l / acc, not to the output."""
+    seq = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+    ctx_len = tl.load(context_lens_ptr + seq)
+
+    g = tl.arange(0, GROUP)
+    heads = kv_head * GROUP + g
+    d = tl.arange(0, HEAD_DIM)
+    t = tl.arange(0, BLOCK_SIZE)
+    q_off = seq * stride_qb + heads[:, None] * stride_qh + d[None, :]
+    q = tl.load(q_ptr + q_off).to(tl.float32)
+
+    m = tl.full([GROUP], float("-inf"), tl.float32)
+    sum_exp = tl.zeros([GROUP], tl.float32)
+    acc = tl.zeros([GROUP, HEAD_DIM], tl.float32)
+
+    num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
+    per_split = tl.cdiv(num_blocks, NUM_SPLITS)
+    first = split * per_split
+    last = tl.minimum(first + per_split, num_blocks)  # a range past the end is empty
+    for j in range(first, last):
+        block = tl.load(block_tables_ptr + seq * stride_bt + j)
+        valid = j * BLOCK_SIZE + t < ctx_len
+        slot = block * BLOCK_SIZE + t
+        off = slot[:, None] * stride_ks + kv_head * stride_kh + d[None, :]
+        k = tl.load(k_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
+        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
+        s = tl.where(valid[None, :], s, float("-inf"))
+        m_new = tl.maximum(m, tl.max(s, axis=1))
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(s - m_new[:, None])
+        sum_exp = sum_exp * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+        m = m_new
+
+    part = (seq * NUM_Q_HEADS + heads) * NUM_SPLITS + split  # [GROUP]
+    tl.store(m_ptr + part, m)
+    tl.store(l_ptr + part, sum_exp)
+    tl.store(acc_ptr + part[:, None] * HEAD_DIM + d[None, :], acc)
+
+
+@triton.jit
+def _merge_splits_kernel(
+    m_ptr,  # [B, Hq, S]
+    l_ptr,
+    acc_ptr,  # [B, Hq, S, D]
+    out_ptr,  # [B, Hq, D]
+    stride_ob,
+    stride_oh,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    SPLITS_PAD: tl.constexpr,  # NUM_SPLITS rounded up to a power of 2
+    HEAD_DIM: tl.constexpr,
+):
+    """M9: merge one query head's NUM_SPLITS partials (see the module docstring).
+
+    An empty range has m = -inf and sum_exp = acc = 0, so its weight exp(m - m_max) is 0.
+    The first range always holds the first block, so m_max is finite."""
+    seq = tl.program_id(0)
+    head = tl.program_id(1)
+    sp = tl.arange(0, SPLITS_PAD)
+    ok = sp < NUM_SPLITS
+    d = tl.arange(0, HEAD_DIM)
+    part = (seq * NUM_Q_HEADS + head) * NUM_SPLITS + sp
+    m = tl.load(m_ptr + part, mask=ok, other=float("-inf"))
+    l = tl.load(l_ptr + part, mask=ok, other=0.0)  # noqa: E741
+    acc = tl.load(acc_ptr + part[:, None] * HEAD_DIM + d[None, :], mask=ok[:, None], other=0.0)
+    w = tl.exp(m - tl.max(m, axis=0))  # [SPLITS_PAD]
+    out = tl.sum(w[:, None] * acc, axis=0) / tl.sum(w * l, axis=0)
+    tl.store(out_ptr + seq * stride_ob + head * stride_oh + d, out.to(out_ptr.dtype.element_ty))
 
 
 def paged_decode_attention(
@@ -301,6 +406,92 @@ def launch_paged_decode_grouped(
         block_tables.stride(0),
         GROUP=num_q_heads // num_kv_heads,
         BLOCK_SIZE=block_size,
+        HEAD_DIM=head_dim,
+    )  # fmt: skip
+    return out
+
+
+# M9 split-K: aim for this many programs per decode launch (about 2 per T4 SM), and never
+# split a sequence's blocks into more than MAX_SPLITS ranges.
+TARGET_PROGRAMS = 80
+MAX_SPLITS = 16
+
+
+def num_splits_for(batch: int, num_kv_heads: int, max_blocks: int) -> int:
+    """How many ranges to split each sequence's blocks into: enough that the grouped
+    launch has about ``TARGET_PROGRAMS`` programs, at most ``MAX_SPLITS`` and at most the
+    block-table width. 1 (no split) once the batch alone fills the GPU.
+
+    Depends only on shapes, never on lengths, so a CUDA graph captured for a batch
+    size always launches the same grid."""
+    want = -(-TARGET_PROGRAMS // (batch * num_kv_heads))
+    return max(1, min(want, MAX_SPLITS, max_blocks))
+
+
+def paged_decode_attention_split(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """``paged_decode_attention_grouped`` with split-K for small batches (M9): same
+    arguments, same result. Splits as ``num_splits_for`` says; 1 split is the grouped
+    kernel itself."""
+    check_decode_args(q, k_cache, v_cache, block_tables, context_lens, block_size)
+    group = q.shape[1] // k_cache.shape[1]
+    if group & (group - 1):
+        raise ValueError(f"the grouped kernel needs a power-of-2 head group, got {group}")
+    return launch_paged_decode_split(
+        q, k_cache, v_cache, block_tables, context_lens, scale, block_size
+    )
+
+
+def launch_paged_decode_split(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+    num_splits: int | None = None,
+) -> torch.Tensor:
+    """The split-K launches alone: no checks, no host sync (CUDA-graph safe).
+
+    ``num_splits`` defaults to ``num_splits_for(B, Hkv, max_blocks)``."""
+    b, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    splits = num_splits or num_splits_for(b, num_kv_heads, block_tables.shape[1])
+    if splits == 1:
+        return launch_paged_decode_grouped(
+            q, k_cache, v_cache, block_tables, context_lens, scale, block_size
+        )
+    dev = q.device
+    m = torch.empty((b, num_q_heads, splits), dtype=torch.float32, device=dev)
+    l = torch.empty_like(m)  # noqa: E741
+    acc = torch.empty((b, num_q_heads, splits, head_dim), dtype=torch.float32, device=dev)
+    _paged_decode_split_kernel[(b, num_kv_heads, splits)](
+        q, k_cache, v_cache, m, l, acc, block_tables, context_lens,
+        scale,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1),
+        block_tables.stride(0),
+        NUM_Q_HEADS=num_q_heads,
+        NUM_SPLITS=splits,
+        GROUP=num_q_heads // num_kv_heads,
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=head_dim,
+    )  # fmt: skip
+    out = torch.empty_like(q)
+    _merge_splits_kernel[(b, num_q_heads)](
+        m, l, acc, out,
+        out.stride(0), out.stride(1),
+        NUM_Q_HEADS=num_q_heads,
+        NUM_SPLITS=splits,
+        SPLITS_PAD=triton.next_power_of_2(splits),
         HEAD_DIM=head_dim,
     )  # fmt: skip
     return out

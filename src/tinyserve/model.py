@@ -37,8 +37,9 @@ from tinyserve.config import ModelConfig
 from tinyserve.kv_cache import KVCache
 from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin, swiglu_mlp
 
-# decode_attention choices: per-sequence PyTorch, the M4 kernel, the M8 grouped kernel.
-DECODE_ATTENTIONS = ("torch", "triton", "triton_grouped")
+# decode_attention choices: per-sequence PyTorch, the M4 kernel, the M8 grouped kernel,
+# the grouped kernel with split-K for small batches (M9).
+DECODE_ATTENTIONS = ("torch", "triton", "triton_grouped", "triton_split")
 # prefill_attention choices: per-sequence PyTorch, one padded SDPA call (M8), the M9 kernel.
 PREFILL_ATTENTIONS = ("per_seq", "batched", "triton")
 # (layer index, q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]) -> attention output [T, Hq, D]
@@ -56,13 +57,14 @@ class Qwen3:
         self,
         cfg: ModelConfig,
         weights: dict[str, torch.Tensor],
-        decode_attention: Literal["torch", "triton", "triton_grouped"] = "torch",
+        decode_attention: Literal["torch", "triton", "triton_grouped", "triton_split"] = "torch",
         prefill_attention: Literal["per_seq", "batched", "triton"] = "per_seq",
     ) -> None:
         """``decode_attention`` picks how ``forward_batch`` attends for one-token sequences:
         "torch" runs ``paged_gqa_attention`` per sequence, "triton" runs the M4 kernel once
         for all of them, "triton_grouped" the M8 kernel that shares k/v loads across a
-        head group. Triton is imported only when chosen (it has no Windows wheels).
+        head group, "triton_split" (M9) that kernel with split-K when the batch is small.
+        Triton is imported only when chosen (it has no Windows wheels).
         ``prefill_attention`` picks how the other sequences attend: "per_seq" runs
         ``paged_gqa_attention`` for each, "batched" (M8) runs ``batched_prefill_attention``
         once for all of them, "triton" (M9) the varlen prefill kernel once for all."""
@@ -80,10 +82,14 @@ class Qwen3:
 
             self.decode_kernel = ta.paged_decode_attention_grouped
             self.decode_launch = ta.launch_paged_decode_grouped
+        elif decode_attention == "triton_split":  # M9: grouped, split-K at small batches
+            from tinyserve import triton_attention as ta
+
+            self.decode_kernel = ta.paged_decode_attention_split
+            self.decode_launch = ta.launch_paged_decode_split
         elif decode_attention != "torch":
             raise ValueError(
-                "decode_attention must be 'torch', 'triton' or 'triton_grouped': "
-                f"{decode_attention!r}"
+                f"decode_attention must be one of {DECODE_ATTENTIONS}: {decode_attention!r}"
             )
         if prefill_attention not in PREFILL_ATTENTIONS:
             raise ValueError(

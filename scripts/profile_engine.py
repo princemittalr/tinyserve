@@ -156,7 +156,8 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
     per_step = {key: s[key] / k for key in ("aten_calls", "kernel_launches", "graph_launches",
                                              "gpu_kernel_ms", "wall_ms")}  # fmt: skip
     gemm_ms = gpu_time_ms(prof, lambda name: "gemm" in name.lower()) / k
-    attn_ms = gpu_time_ms(prof, lambda name: "paged_decode" in name) / k
+    # Split-K (M9) adds a merge kernel per layer; it is part of decode attention.
+    attn_ms = gpu_time_ms(prof, lambda name: "paged_decode" in name or "merge_splits" in name) / k
     w_bytes = weight_bytes(cfg, elem)
     kv_min = context / k * kv_bytes_per_token(cfg, elem)
     # The M4 kernel loads each k/v once per query head; the M8 grouped one once per kv head.

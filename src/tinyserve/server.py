@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> None:
                              "thread (default 5 ms)")  # fmt: skip
     args = parser.parse_args(argv)
     if args.cuda_graphs and args.attention == "torch":
-        parser.error("--cuda-graphs needs --attention triton or triton_grouped")
+        parser.error("--cuda-graphs needs a Triton --attention (triton, triton_grouped, ...)")
 
     if not is_loopback(args.host) and not args.allow_remote:
         sys.exit(f"refusing to bind to {args.host}: the API has no authentication. "

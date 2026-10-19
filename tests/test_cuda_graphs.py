@@ -185,9 +185,13 @@ def test_engine_with_captured_graphs_matches_m1_greedy(num_blocks: int, max_num_
 
 
 @pytest.mark.parametrize("num_blocks", [64, 7])
-def test_engine_with_graphs_of_the_grouped_kernel_matches_m1_greedy(num_blocks: int) -> None:
-    # M8 step 5: the grouped kernel in the graphs (captured on a GPU, eager on CPU).
-    _, model = models("triton_grouped")
+@pytest.mark.parametrize("kernel", ["triton_grouped", "triton_split"])
+def test_engine_with_graphs_of_the_grouped_kernel_matches_m1_greedy(
+    num_blocks: int, kernel: str
+) -> None:
+    # M8 step 5: the grouped kernel in the graphs (captured on a GPU, eager on CPU); M9:
+    # with split-K too, whose number of ranges is fixed per captured batch size.
+    _, model = models(kernel)
     cache = KVCache(CFG, num_blocks, 4, dtype=torch.float32, device=DEVICE)
     e = Engine(model, cache, max_num_seqs=8, decode_graphs=DecodeGraphs(model, cache, 8))
     assert e.generate(PROMPTS, 10) == [expected(p, 10) for p in PROMPTS]
