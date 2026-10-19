@@ -169,7 +169,9 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   126.8, 534.2 / 730.9, 1,258.9 / 1,465.6 and 1,621.5 / 1,824.8 tok/s at C = 1 / 8 / 32 / 64.
   fp32 greedy with every M9 option (64-token chunks): 0 mismatches / 1,920 tokens vs HF; fp16: 6
   near-tie divergences (HF top-2 margin <= 0.0625). Greedy text through the API with every option
-  and the prefix cache (fp32): identical to HF. Numbers transcribed from the printed output.
+  and the prefix cache (fp32): identical to HF. The default setup F on its own (another
+  session): fp32 0 mismatches / 1,920 tokens, fp16 4 near-ties (margin <= 0.0156), and over
+  HTTP identical to HF. Numbers transcribed from the printed output.
 
 - Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
   `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms

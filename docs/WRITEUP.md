@@ -238,7 +238,9 @@ API gained `stop` strings, `n` choices and logprobs. CI runs Python 3.13 too.
 Correctness held: fp32 greedy with every M9 option at once (and 64-token chunks) 0 mismatches
 / 1,920 tokens vs HF; fp16 6 near-tie divergences at HF top-2 margins <= 0.0625 (M8:
 <= 0.0156; 0.0625 is one fp16 step at a logit of 64-128). Greedy text through the API with
-every option and the prefix cache is identical to HF in fp32.
+every option and the prefix cache is identical to HF in fp32. The default setup F, checked
+on its own in a later session: fp32 0 mismatches, fp16 4 near-ties at margins <= 0.0156, and
+identical text over HTTP.
 
 What is left, measured: decode at C=32 is ~15 ms per step against a roofline floor of ~6 ms
 (GEMMs at ~160 GB/s of the T4's 320); vLLM is still faster at C=1 (142.4 vs 129.0 tok/s); and
