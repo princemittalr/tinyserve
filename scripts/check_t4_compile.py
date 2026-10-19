@@ -15,10 +15,16 @@ sm_75 (``tl.dot`` becomes FMA loops), and the prefill kernel's first tiles spill
 about 10 KB per thread, which is why it ran ~6x slower than batched SDPA. A small spill
 can be the right trade: the fastest prefill tile on the T4 spills 936 bytes (step 9).
 
+``--arch 80`` (M10) compiles for another GPU instead, here an A100 (sm_80), to see what
+Triton would emit where it has tensor cores; the spill limit applies to the T4 only.
+Compiling is all it shows: nothing here ran on such a GPU.
+
 Usage:
     python scripts/check_t4_compile.py          # exit code 1 if any kernel fails
+    python scripts/check_t4_compile.py --arch 80
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -37,7 +43,6 @@ from tinyserve import triton_attention as ta
 from tinyserve import triton_fused as tf
 from tinyserve import triton_prefill as tp
 
-T4 = GPUTarget("cuda", 75, 32)
 PTXAS = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin", "ptxas")
 HQ, HKV, D, BS = 16, 8, 128, 16  # Qwen3-0.6B; the engine's default block size
 MAX_SPILL = 1024  # bytes per thread
@@ -73,24 +78,27 @@ def specs(dt: str) -> list[tuple[str, Any, dict[str, str], dict[str, Any], int]]
     ]  # fmt: skip
 
 
-def check(kernel: Any, types: dict[str, str], constexprs: dict[str, Any], warps: int) -> str:
-    """Compile for sm_75; returns ptxas's report. Raises on a compile error or a spill."""
+def check(kernel: Any, types: dict[str, str], constexprs: dict[str, Any], warps: int,
+          arch: int = 75) -> str:  # fmt: skip
+    """Compile for sm_<arch>; returns ptxas's report. Raises on a compile error, or on the
+    T4 (sm_75) on a spill over ``MAX_SPILL``."""
     sig = {a: "constexpr" if a in constexprs else types.get(a, "i32") for a in kernel.arg_names}
-    k = triton.compile(ASTSource(kernel, sig, constexprs=constexprs), target=T4,
+    target = GPUTarget("cuda", arch, 32)
+    k = triton.compile(ASTSource(kernel, sig, constexprs=constexprs), target=target,
                        options={"num_warps": warps})  # fmt: skip
     ptx = k.asm["ptx"]
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "k.ptx")
         with open(path, "w") as f:
             f.write(ptx)
-        cmd = [PTXAS, "-v", "--gpu-name", "sm_75", path, "-o", path + ".o"]
+        cmd = [PTXAS, "-v", "--gpu-name", f"sm_{arch}", path, "-o", path + ".o"]
         report = subprocess.run(cmd, capture_output=True, text=True, check=True).stderr
     regs = re.search(r"Used (\d+) registers", report)
     spills = re.search(r"(\d+) bytes spill stores", report)
     if regs is None or spills is None:
         raise RuntimeError(f"unexpected ptxas output: {report}")
     line = f"{regs[1]:>3} registers, {spills[1]:>5} bytes spilled, {ptx.count('mma.sync')} mma"
-    if int(spills[1]) > MAX_SPILL:
+    if arch == 75 and int(spills[1]) > MAX_SPILL:
         raise RuntimeError(line)
     return line
 
@@ -108,6 +116,9 @@ def specialized_per_step(kernel: Any) -> list[str]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--arch", type=int, default=75, help="compute capability, e.g. 80")
+    arch = parser.parse_args().arch
     failed = 0
     for name, kernel, *_ in specs("fp16"):
         bad = specialized_per_step(kernel)
@@ -116,7 +127,8 @@ def main() -> None:
     for dt in ("fp16", "fp32"):
         for name, kernel, types, constexprs, warps in specs(dt):
             try:
-                print(f"{dt} {name:<24} ok: {check(kernel, types, constexprs, warps)}")
+                line = check(kernel, types, constexprs, warps, arch)
+                print(f"{dt} {name:<24} ok: {line}")
             except Exception as e:  # report every kernel, then fail
                 failed += 1
                 print(f"{dt} {name:<24} FAILED: {str(e).splitlines()[-1]}")

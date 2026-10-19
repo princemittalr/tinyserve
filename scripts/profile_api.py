@@ -18,6 +18,11 @@ after the T4 run showed a few requests whose first chunk came only at the very e
 contention were the cause, the loop-side segments would shrink (step 2 on the T4: they
 did not).
 
+M10: ``--prefill-attention``, ``--cuda-graphs`` and ``--fused-kernels`` profile another
+setup than M7's (still the default), such as the M9 GPU default:
+    python scripts/profile_api.py --device cuda --attention triton_split \
+        --prefill-attention batched --cuda-graphs --fused-kernels --concurrency 32
+
 Usage: python scripts/profile_api.py --device cuda --attention triton
 """
 
@@ -35,7 +40,7 @@ from tinyserve.bench import num_requests_for, percentile, synthetic_prompts
 from tinyserve.client import closed_loop, running_server
 from tinyserve.config import ModelConfig
 from tinyserve.engine import StepRecord
-from tinyserve.model import DECODE_ATTENTIONS
+from tinyserve.model import DECODE_ATTENTIONS, PREFILL_ATTENTIONS
 from tinyserve.profiling import TTFT_SEGMENTS, summarize_steps, ttft_segments
 
 
@@ -108,6 +113,9 @@ def main() -> None:
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
+    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default="per_seq")
+    parser.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--fused-kernels", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--concurrency", default="32,64")
     parser.add_argument("--switch-intervals", default="5",
                         help="GIL switch intervals to run, ms (Python's default is 5)")  # fmt: skip
@@ -120,7 +128,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     levels = [int(c) for c in args.concurrency.split(",")]
-    out = args.out or Path(f"results/m7_api_profile_{args.device.split(':')[0]}.json")
+    m7 = args.prefill_attention == "per_seq" and not (args.cuda_graphs or args.fused_kernels)
+    name = "m7_api_profile" if m7 else "m10_api_profile"
+    out = args.out or Path(f"results/{name}_{args.device.split(':')[0]}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     most = max(num_requests_for(c, args.num_requests) for c in levels)
@@ -133,8 +143,10 @@ def main() -> None:
             "--attention", args.attention, "--kv-gib", str(args.kv_gib),
             "--max-num-seqs", str(max(levels)), "--ignore-eos", "--trace-requests",
             "--switch-interval-ms", interval,
-            # M7's setup whatever the server's defaults (M9 changed them on cuda).
-            "--prefill-attention", "per_seq", "--no-cuda-graphs", "--no-fused-kernels",
+            # Explicit both ways: the server's own defaults differ by device (M9).
+            "--prefill-attention", args.prefill_attention,
+            "--cuda-graphs" if args.cuda_graphs else "--no-cuda-graphs",
+            "--fused-kernels" if args.fused_kernels else "--no-fused-kernels",
         ]  # fmt: skip
         with running_server(serve_args, args.port) as url:
             asyncio.run(closed_loop(url, prompts[:2], 4, 2))  # warm-up, not reported
@@ -152,6 +164,9 @@ def main() -> None:
         "hardware": torch.cuda.get_device_name() if args.device != "cpu" else "CPU",
         "torch": torch.__version__,
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
+        "cuda_graphs": args.cuda_graphs,
+        "fused_kernels": args.fused_kernels,
         "transport": "HTTP /v1/completions, SSE stream, token-id prompts, EOS ignored",
         "args": {k: str(v) for k, v in vars(args).items()},
         "runs": runs,
