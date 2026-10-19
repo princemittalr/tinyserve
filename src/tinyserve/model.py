@@ -20,6 +20,11 @@ Two paths share the same layers and differ only in attention:
 With ``fused_kernels=True`` (M9, triton_fused.py) the paged paths run the hidden-state
 RMSNorms as one Triton launch each, and the q/k head norms, RoPE and the k/v cache write
 as one launch per layer, instead of several PyTorch kernels each.
+
+Since M10 every path multiplies by q/k/v as one matrix and by gate/up as one
+(``weights.merge_projections``), and the output head always gets at least
+``HEAD_MIN_ROWS`` rows: with fewer, cuBLAS runs a matrix-vector kernel that read the
+head's 311 MB at 138 GB/s on the T4, against 239 GB/s for 8 rows (M10 run 1).
 """
 
 from collections.abc import Callable
@@ -39,7 +44,8 @@ from tinyserve.block_allocator import BlockAllocator
 from tinyserve.block_table import BlockTable
 from tinyserve.config import ModelConfig
 from tinyserve.kv_cache import KVCache
-from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin, swiglu_mlp
+from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin
+from tinyserve.weights import GATE_UP, QKV, merge_projections
 
 # decode_attention choices: per-sequence PyTorch, the M4 kernel, the M8 grouped kernel,
 # the grouped kernel with split-K for small batches (M9).
@@ -55,6 +61,8 @@ DecodeFn = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, int],
     torch.Tensor,
 ]
+# The output head runs on at least this many rows (zero rows are added, then dropped).
+HEAD_MIN_ROWS = 8
 
 
 class Qwen3:
@@ -75,8 +83,11 @@ class Qwen3:
         ``paged_gqa_attention`` for each, "batched" (M8) runs ``batched_prefill_attention``
         once for all of them, "triton" (M9) the varlen prefill kernel once for all.
         ``fused_kernels`` (M9) turns on the fused norm / RoPE / cache-write kernels for
-        ``forward_batch`` and ``forward_decode``."""
+        ``forward_batch`` and ``forward_decode``.
+        ``weights`` gets the merged q/k/v and gate/up matrices added (M10,
+        ``merge_projections``); its other entries keep their values."""
         self.cfg = cfg
+        merge_projections(weights, cfg)
         self.w = weights
         self.decode_kernel: DecodeFn | None = None
         self.decode_launch: DecodeFn | None = None  # the same kernel without its checks
@@ -141,9 +152,12 @@ class Qwen3:
 
         # Attention block: pre-norm, then a residual add.
         h = self._norm(x, w[p + "input_layernorm.weight"], fused)
-        q = F.linear(h, w[p + "self_attn.q_proj.weight"]).view(t, cfg.num_heads, cfg.head_dim)
-        k = F.linear(h, w[p + "self_attn.k_proj.weight"]).view(t, cfg.num_kv_heads, cfg.head_dim)
-        v = F.linear(h, w[p + "self_attn.v_proj.weight"]).view(t, cfg.num_kv_heads, cfg.head_dim)
+        # One GEMM for q, k and v (M10); the three are column ranges of its output.
+        qkv = F.linear(h, w[p + QKV])
+        q, k, v = torch.split(qkv, [cfg.q_size, cfg.kv_size, cfg.kv_size], dim=1)
+        q = q.view(t, cfg.num_heads, cfg.head_dim)
+        k = k.view(t, cfg.num_kv_heads, cfg.head_dim)
+        v = v.view(t, cfg.num_kv_heads, cfg.head_dim)
         qn, kn = w[p + "self_attn.q_norm.weight"], w[p + "self_attn.k_norm.weight"]
         if fused and store is not None:  # M9: norms, RoPE and the cache write in one launch
             cache, slots = store
@@ -160,13 +174,9 @@ class Qwen3:
 
         # MLP block: pre-norm, then a residual add.
         h = self._norm(x, w[p + "post_attention_layernorm.weight"], fused)
-        mlp = swiglu_mlp(
-            h,
-            w[p + "mlp.gate_proj.weight"],
-            w[p + "mlp.up_proj.weight"],
-            w[p + "mlp.down_proj.weight"],
-        )
-        return x + mlp
+        # swiglu_mlp (layers.py) with gate and up from one GEMM (M10).
+        gate, up = F.linear(h, w[p + GATE_UP]).chunk(2, dim=1)
+        return x + F.linear(F.silu(gate) * up, w[p + "mlp.down_proj.weight"])
 
     def _run(
         self,
@@ -187,7 +197,15 @@ class Qwen3:
             # largest matmul in the model. Skip it for rows nobody samples from.
             x = x[rows]
         x = self._norm(x, self.w["model.norm.weight"], store is not None and bool(self.fused))
-        return F.linear(x, self.lm_head).float()
+        return self.head(x)
+
+    def head(self, x: torch.Tensor) -> torch.Tensor:
+        """``[N, hidden]`` -> ``[N, vocab]`` float32 logits, padded to ``HEAD_MIN_ROWS``
+        rows for the matrix multiply (M10)."""
+        n = x.shape[0]
+        if n < HEAD_MIN_ROWS:
+            x = F.pad(x, (0, 0, 0, HEAD_MIN_ROWS - n))
+        return F.linear(x, self.lm_head)[:n].float()
 
     @torch.inference_mode()
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:

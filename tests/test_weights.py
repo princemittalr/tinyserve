@@ -6,7 +6,15 @@ from safetensors.torch import save_file
 
 from tests.test_config import TINY
 from tinyserve.config import ModelConfig
-from tinyserve.weights import WeightLoadError, expected_shapes, load_weights
+from tinyserve.weights import (
+    GATE_UP,
+    MERGED,
+    QKV,
+    WeightLoadError,
+    expected_shapes,
+    load_weights,
+    merge_projections,
+)
 
 CFG = ModelConfig.from_dict(TINY)
 
@@ -91,3 +99,37 @@ def test_fp16_overflow_is_caught(tmp_path: Path) -> None:
 def test_empty_dir(tmp_path: Path) -> None:
     with pytest.raises(WeightLoadError, match=r"no \*\.safetensors"):
         load_weights(tmp_path, CFG)
+
+
+# --- merged projections (M10) ---------------------------------------------------------------
+
+
+def test_merge_projections_stacks_rows_and_keeps_one_copy() -> None:
+    w = {n: t.float() for n, t in fake_checkpoint(CFG).items()}
+    before = {n: t.clone() for n, t in w.items()}
+    merge_projections(w, CFG)
+    for i in range(CFG.num_layers):
+        p = f"model.layers.{i}."
+        for merged, parts in MERGED.items():
+            whole = w[p + merged]
+            assert torch.equal(whole, torch.cat([before[p + n] for n in parts]))
+            start = 0
+            for n in parts:
+                part = w[p + n]
+                assert torch.equal(part, before[p + n])  # same values, same shape
+                # a row view of the merged matrix, not a copy: memory stays 1x
+                assert part.untyped_storage().data_ptr() == whole.untyped_storage().data_ptr()
+                assert part.storage_offset() == start * CFG.hidden_size
+                start += part.shape[0]
+    assert w[f"model.layers.0.{QKV}"].shape == (CFG.q_size + 2 * CFG.kv_size, CFG.hidden_size)
+    assert w[f"model.layers.0.{GATE_UP}"].shape == (2 * CFG.intermediate_size, CFG.hidden_size)
+    assert set(w) == set(before) | {f"model.layers.{i}.{m}" for i in range(CFG.num_layers)
+                                    for m in MERGED}  # fmt: skip
+
+
+def test_merge_projections_twice_changes_nothing() -> None:
+    w = {n: t.float() for n, t in fake_checkpoint(CFG).items()}
+    merge_projections(w, CFG)
+    first = dict(w)
+    merge_projections(w, CFG)  # e.g. a second model built on the same weights
+    assert all(w[n] is t for n, t in first.items())

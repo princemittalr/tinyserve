@@ -426,20 +426,28 @@ def launch_paged_decode_grouped(
     return out
 
 
-# M9 split-K: aim for this many programs per decode launch (about 2 per T4 SM), and never
-# split a sequence's blocks into more than MAX_SPLITS ranges.
-TARGET_PROGRAMS = 80
+# Split-K: aim for this many programs per decode launch, and never split a sequence's
+# blocks into more than MAX_SPLITS ranges. A batch that alone gives NO_SPLIT_PROGRAMS
+# programs (B x Hkv) is not split. Tuned on the T4 in M10 run 1 (bench_decode_kernel.py,
+# Qwen3-0.6B shapes): M9's target of 80 programs (2 per SM) split batch 8 in 2 and left
+# batch 16 whole, ~30% slower than 8-16 splits; at batch 32 the split count changed the
+# time by under 3% either way, and at batch 64 any split was slower.
+TARGET_PROGRAMS = 1024
+NO_SPLIT_PROGRAMS = 256
 MAX_SPLITS = 16
 
 
 def num_splits_for(batch: int, num_kv_heads: int, max_blocks: int) -> int:
     """How many ranges to split each sequence's blocks into: enough that the grouped
     launch has about ``TARGET_PROGRAMS`` programs, at most ``MAX_SPLITS`` and at most the
-    block-table width. 1 (no split) once the batch alone fills the GPU.
+    block-table width. 1 (no split) once the batch alone gives ``NO_SPLIT_PROGRAMS``.
 
     Depends only on shapes, never on lengths, so a CUDA graph captured for a batch
     size always launches the same grid."""
-    want = -(-TARGET_PROGRAMS // (batch * num_kv_heads))
+    programs = batch * num_kv_heads
+    if programs >= NO_SPLIT_PROGRAMS:
+        return 1
+    want = -(-TARGET_PROGRAMS // programs)
     return max(1, min(want, MAX_SPLITS, max_blocks))
 
 

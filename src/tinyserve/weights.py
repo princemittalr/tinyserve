@@ -3,6 +3,9 @@
 The loader is strict: every expected tensor must be present with the exact
 shape, and unknown tensors are an error. A silent mismatch here would only show
 up much later as wrong tokens, which is far harder to debug.
+
+``merge_projections`` (M10) lays each layer's q/k/v and gate/up matrices out as one matrix
+each, so a decode step runs 4 matrix multiplies per layer instead of 7.
 """
 
 from pathlib import Path
@@ -95,3 +98,32 @@ def load_weights(
             raise WeightLoadError(f"{name} has inf/nan after casting to {dtype}")
         out[name] = cast
     return out
+
+
+# Per layer, the merged matrices ``merge_projections`` adds and the ones each is made of.
+QKV = "self_attn.qkv_proj.weight"
+GATE_UP = "mlp.gate_up_proj.weight"
+MERGED = {
+    QKV: ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"),
+    GATE_UP: ("mlp.gate_proj.weight", "mlp.up_proj.weight"),
+}
+
+
+def merge_projections(weights: dict[str, torch.Tensor], cfg: ModelConfig) -> None:
+    """In place: add each layer's ``self_attn.qkv_proj.weight`` (q, k, v stacked by rows:
+    ``[q_size + 2 * kv_size, hidden]``) and ``mlp.gate_up_proj.weight`` (gate then up:
+    ``[2 * intermediate, hidden]``), and make the q/k/v/gate/up entries row views of them,
+    so the weights still take memory once. A decode step reads every weight once and is
+    memory-bound; on the T4 one GEMM over the merged matrix took 6-14% less time than
+    the separate ones (M10 run 1). Does nothing for a layer that is already merged."""
+    for i in range(cfg.num_layers):
+        p = f"model.layers.{i}."
+        for merged, parts in MERGED.items():
+            if p + merged in weights:
+                continue
+            names = [p + part for part in parts]
+            whole = torch.cat([weights[n] for n in names])
+            rows = [weights[n].shape[0] for n in names]
+            for name, view in zip(names, torch.split(whole, rows), strict=True):
+                weights[name] = view
+            weights[p + merged] = whole

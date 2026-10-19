@@ -235,11 +235,15 @@ def test_grouped_kernel_rejects_a_group_that_is_not_a_power_of_2() -> None:
 
 
 def test_number_of_splits_fills_the_gpu_at_small_batches_only() -> None:
-    # Qwen3-0.6B has 8 kv heads: batch 1 gets 10 ranges (80 programs), batch 8 two,
-    # batch 10 and up none; never more ranges than blocks in a table, or MAX_SPLITS.
-    assert [num_splits_for(b, 8, 64) for b in (1, 2, 4, 8, 10, 32)] == [10, 5, 3, 2, 1, 1]
+    # Qwen3-0.6B has 8 kv heads. M10 tuning on the T4: about 1,024 programs while the
+    # batch alone gives fewer than 256 (batch 32), so batch 8 gets 16 ranges, 16 gets 8,
+    # 24 gets 6 and 31 gets 5; batch 32 and up none. Never more ranges than blocks in a
+    # table, or MAX_SPLITS.
+    batches = (1, 2, 4, 8, 10, 16, 24, 31, 32, 64)
+    assert [num_splits_for(b, 8, 64) for b in batches] == [16, 16, 16, 16, 13, 8, 6, 5, 1, 1]
     assert num_splits_for(1, 8, 4) == 4
     assert num_splits_for(1, 1, 64) == MAX_SPLITS
+    assert num_splits_for(256, 1, 64) == 1
 
 
 @pytest.mark.parametrize("splits", [1, 2, 3, 5, 16])

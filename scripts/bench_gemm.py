@@ -63,7 +63,7 @@ def time_gemms(ws: list[torch.Tensor], inputs: dict[int, torch.Tensor], iters: i
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
-    parser.add_argument("--batches", default="1,8,32,64")
+    parser.add_argument("--batches", default="1,2,4,8,32,64")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--out", type=Path, default=Path("results/m10_gemm_cuda.json"))
     args = parser.parse_args()

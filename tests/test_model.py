@@ -1,10 +1,11 @@
 """Forward-pass tests on a tiny random Qwen3. The real-model check is in step 7."""
 
 import torch
+import torch.nn.functional as F
 
 from tests.test_config import TINY
 from tinyserve.config import ModelConfig
-from tinyserve.model import Qwen3, greedy_generate
+from tinyserve.model import HEAD_MIN_ROWS, Qwen3, greedy_generate
 from tinyserve.weights import expected_shapes
 
 CFG = ModelConfig.from_dict(TINY)
@@ -41,6 +42,17 @@ def test_order_matters() -> None:
 def test_tied_embeddings_reuse_embedding_matrix() -> None:
     m = tiny_model()
     assert m.lm_head is m.w["model.embed_tokens.weight"]
+
+
+def test_output_head_pads_small_batches_and_returns_only_their_rows() -> None:
+    # M10: fewer than HEAD_MIN_ROWS rows are padded for the matrix multiply; the logits
+    # are those of the rows given, in order, and nothing else.
+    m = tiny_model()
+    x = torch.randn(HEAD_MIN_ROWS + 3, CFG.hidden_size, generator=torch.Generator().manual_seed(1))
+    for n in (0, 1, 2, HEAD_MIN_ROWS - 1, HEAD_MIN_ROWS, HEAD_MIN_ROWS + 3):
+        out = m.head(x[:n])
+        assert out.shape == (n, CFG.vocab_size) and out.dtype == torch.float32
+        torch.testing.assert_close(out, F.linear(x[:n], m.lm_head), atol=1e-5, rtol=1e-5)
 
 
 def test_greedy_matches_argmax_step_by_step() -> None:
