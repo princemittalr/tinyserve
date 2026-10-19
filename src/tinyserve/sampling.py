@@ -14,6 +14,11 @@ the smallest of independent exponentials is i with probability p_i / sum(p), so 
 samples exactly from p, needs no renormalisation after top-p (dropped tokens have
 p_i = 0 and never win), and is one elementwise op and one argmax for the whole batch.
 
+Logprobs (M9): a request with ``logprobs=k`` also gets, for every token it samples, that
+token's log-probability and the k most likely tokens with theirs (``token_logprobs``).
+They come from the model's own distribution, log_softmax of the raw logits, before
+temperature and top-p, which is what vLLM reports by default.
+
 Randomness: a request with a ``seed`` draws its noise from its own generator, so its
 output depends only on its prompt, its parameters and its seed, not on which other
 requests happen to share its batches. Requests without a seed share the engine's
@@ -25,18 +30,23 @@ from dataclasses import dataclass
 
 import torch
 
+MAX_LOGPROBS = 20  # OpenAI's limit for top_logprobs
+
 
 @dataclass(frozen=True)
 class SamplingParams:
     temperature: float = 0.0  # 0 = greedy, the default, so nothing changes unless asked
     top_p: float = 1.0
     seed: int | None = None
+    logprobs: int | None = None  # None: none; k: the sampled token's and the top k (M9)
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.temperature) and self.temperature >= 0):
             raise ValueError(f"temperature must be finite and >= 0, got {self.temperature}")
         if not (0 < self.top_p <= 1):
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
+        if self.logprobs is not None and not 0 <= self.logprobs <= MAX_LOGPROBS:
+            raise ValueError(f"logprobs must be in [0, {MAX_LOGPROBS}], got {self.logprobs}")
 
     @property
     def greedy(self) -> bool:
@@ -90,3 +100,29 @@ def sample(
     noise.clamp_(min=torch.finfo(noise.dtype).tiny)
     sampled = (probs / noise).argmax(dim=-1)
     return torch.where(greedy, greedy_tokens, sampled)
+
+
+@dataclass(frozen=True)
+class TokenLogprobs:
+    """One sampled token's log-probability and the most likely alternatives (M9)."""
+
+    logprob: float
+    top: list[tuple[int, float]]  # (token id, log-probability), most likely first
+
+
+def token_logprobs(
+    logits: torch.Tensor, tokens: torch.Tensor, ks: list[int]
+) -> list[TokenLogprobs]:
+    """For each row: ``log_softmax(logits)`` at ``tokens[b]``, and the top ``ks[b]``.
+
+    ``logits`` is ``[B, V]`` (the raw logits the tokens were sampled from), ``tokens``
+    ``[B]``. One log_softmax and one topk for the whole batch, then one copy to the host.
+    """
+    lp = torch.log_softmax(logits.float(), dim=-1)
+    chosen = lp.gather(-1, tokens[:, None])[:, 0].tolist()
+    top_v, top_i = lp.topk(max(ks, default=0), dim=-1)
+    vals, ids = top_v.tolist(), top_i.tolist()
+    return [
+        TokenLogprobs(chosen[b], list(zip(ids[b][:k], vals[b][:k], strict=True)))
+        for b, k in enumerate(ks)
+    ]

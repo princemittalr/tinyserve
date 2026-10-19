@@ -36,7 +36,7 @@ from typing import Any
 import torch
 
 from tinyserve.engine import Engine
-from tinyserve.sampling import SamplingParams
+from tinyserve.sampling import SamplingParams, TokenLogprobs
 from tinyserve.sequence import SeqStatus
 
 
@@ -54,6 +54,7 @@ class StreamOutput:
     finish_reason: str | None  # None while running, then "stop" (EOS) or "length"
     num_prompt_tokens: int
     num_output_tokens: int  # generated so far, including token_ids
+    logprobs: list[TokenLogprobs] | None = None  # one per token_ids, if the request asked
 
 
 @dataclass
@@ -272,6 +273,8 @@ class AsyncEngine:
             finished = seq.status is SeqStatus.FINISHED
             if not new and not finished:
                 continue  # waiting, or preempted this step
+            lps = self.engine.logprobs.get(seq_id)
+            lps = None if lps is None else lps[req.sent :]
             req.sent = len(seq.output)
             reason = None
             if finished:
@@ -282,7 +285,7 @@ class AsyncEngine:
             if req.trace is not None and req.trace.first_token is None:
                 req.trace.first_token = time.perf_counter()
                 req.trace.first_token_step = self.engine.num_steps
-            self._send(req, StreamOutput(new, reason, len(seq.prompt), len(seq.output)))
+            self._send(req, StreamOutput(new, reason, len(seq.prompt), len(seq.output), lps))
 
     @staticmethod
     def _send(req: _Request, item: StreamOutput | BaseException) -> None:

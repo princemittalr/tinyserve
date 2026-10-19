@@ -537,3 +537,84 @@ def test_disconnect_aborts_every_choice(stream: bool) -> None:
     ae.shutdown()
     assert not e.seqs and e.num_steps < 500
     assert e.scheduler.allocator.num_free == 256
+
+
+# --- logprobs (M9) ----------------------------------------------------------------------
+
+
+def model_logprobs(prompt: str, text: str) -> list[torch.Tensor]:
+    """log_softmax of the M1 model's logits before each token of ``text``."""
+    ids, out = TOK.encode(prompt), TOK.encode(text)
+    logits = tiny_model().forward(torch.tensor(ids + out))[len(ids) - 1 : -1]
+    return list(torch.log_softmax(logits, dim=-1))
+
+
+def test_completion_logprobs(client: TestClient) -> None:
+    body = {"prompt": "hello", "max_tokens": 8, "temperature": 0, "logprobs": 2}
+    choice = client.post("/v1/completions", json=body).json()["choices"][0]
+    lp, text = choice["logprobs"], choice["text"]
+    assert lp["tokens"] == list(text)  # one character per token
+    assert lp["text_offset"] == list(range(8))
+    for t, v, top, ref in zip(lp["tokens"], lp["token_logprobs"], lp["top_logprobs"],
+                              model_logprobs("hello", text), strict=True):  # fmt: skip
+        assert v == pytest.approx(ref[TOK.encode(t)[0]].item(), abs=1e-4)
+        best = ref.argsort(descending=True)[:2].tolist()
+        assert list(top) == [ALPHABET[i] for i in best]  # most likely first
+        assert top[t] == pytest.approx(v)  # greedy: the token is the top one
+    chunks = post_stream(client, "/v1/completions", body)
+    streamed = [ch["choices"][0]["logprobs"] for ch in chunks]
+    for key in ("tokens", "token_logprobs", "top_logprobs", "text_offset"):
+        assert [x for s in streamed for x in s[key]] == lp[key]
+    without = client.post("/v1/completions", json={**body, "logprobs": None}).json()
+    assert without["choices"][0]["logprobs"] is None
+
+
+def test_chat_logprobs(client: TestClient) -> None:
+    msgs = [{"role": "user", "content": "hi"}]
+    body = {"messages": msgs, "max_tokens": 6, "temperature": 0.8, "seed": 2, "logprobs": True,
+            "top_logprobs": 3}  # fmt: skip
+    choice = client.post("/v1/chat/completions", json=body).json()["choices"][0]
+    content, text = choice["logprobs"]["content"], choice["message"]["content"]
+    prompt = qwen3_chat_prompt([ChatMessage.model_validate(m) for m in msgs])
+    assert "".join(c["token"] for c in content) == text
+    for c, ref in zip(content, model_logprobs(prompt, text), strict=True):
+        assert c["bytes"] == list(c["token"].encode())
+        assert c["logprob"] == pytest.approx(ref[TOK.encode(c["token"])[0]].item(), abs=1e-4)
+        assert len(c["top_logprobs"]) == 3
+        assert set(c["top_logprobs"][0]) == {"token", "logprob", "bytes"}
+    chunks = post_stream(client, "/v1/chat/completions", body)
+    assert chunks[0]["choices"][0]["logprobs"] is None  # the role chunk
+    streamed = [c for ch in chunks[1:] for c in ch["choices"][0]["logprobs"]["content"]]
+    assert streamed == content
+    plain = client.post("/v1/chat/completions", json={**body, "top_logprobs": None}).json()
+    assert all(c["top_logprobs"] == [] for c in plain["choices"][0]["logprobs"]["content"])
+    off = client.post("/v1/chat/completions", json={"messages": msgs, "max_tokens": 2}).json()
+    assert off["choices"][0]["logprobs"] is None
+
+
+def test_logprobs_with_n_and_stop(client: TestClient) -> None:
+    full = greedy_text("abc", 12)
+    body = {"prompt": "abc", "max_tokens": 12, "temperature": 0, "logprobs": 0, "n": 2,
+            "stop": full[6]}  # fmt: skip
+    for choice in client.post("/v1/completions", json=body).json()["choices"]:
+        lp = choice["logprobs"]
+        # Every token generated, up to the one that completed the stop string.
+        assert "".join(lp["tokens"]) == full[: full.index(full[6]) + 1]
+        assert lp["top_logprobs"] == [{}] * len(lp["tokens"])
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "message"),
+    [
+        ("/v1/completions", {"prompt": "x", "logprobs": 6}, "logprobs"),
+        ("/v1/completions", {"prompt": "x", "logprobs": -1}, "logprobs"),
+        ("/v1/chat/completions", {"top_logprobs": 2}, "top_logprobs needs logprobs"),
+        ("/v1/chat/completions", {"logprobs": True, "top_logprobs": 21}, "top_logprobs"),
+    ],
+)
+def test_bad_logprobs_requests(
+    client: TestClient, path: str, body: dict[str, Any], message: str
+) -> None:
+    if "chat" in path:
+        body = {"messages": [{"role": "user", "content": "x"}], **body}
+    assert message in error_of(client.post(path, json=body), 400)

@@ -34,7 +34,7 @@ from tinyserve.block_allocator import BlockAllocator
 from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
-from tinyserve.sampling import SamplingParams, sample
+from tinyserve.sampling import SamplingParams, TokenLogprobs, sample, token_logprobs
 from tinyserve.scheduler import Scheduler
 from tinyserve.sequence import SeqStatus, Sequence
 
@@ -120,6 +120,8 @@ class Engine:
         self._next_id = 0
         dev = cache.k.device
         self.sampling: dict[int, SamplingParams] = {}
+        # Requests asking for logprobs: one entry per output token, in order (M9).
+        self.logprobs: dict[int, list[TokenLogprobs]] = {}
         # Seeded requests get their own generator; the rest share this one (sampling.py).
         self.generators: dict[int, torch.Generator] = {}
         self.shared_generator = torch.Generator(device=dev).manual_seed(seed)
@@ -138,6 +140,8 @@ class Engine:
         self.times[seq_id] = RequestTimes(arrival=self.clock())
         params = sampling or SamplingParams()
         self.sampling[seq_id] = params
+        if params.logprobs is not None:
+            self.logprobs[seq_id] = []
         if params.seed is not None:
             g = torch.Generator(device=self.cache.k.device)
             self.generators[seq_id] = g.manual_seed(params.seed)
@@ -157,6 +161,7 @@ class Engine:
         if self.seqs[seq_id].status is not SeqStatus.FINISHED:
             raise ValueError(f"request {seq_id} has not finished; abort it first")
         del self.seqs[seq_id], self.times[seq_id], self.sampling[seq_id]
+        self.logprobs.pop(seq_id, None)
         self.generators.pop(seq_id, None)
 
     def step(self) -> list[Sequence]:
@@ -204,7 +209,14 @@ class Engine:
                 logits = logits[torch.tensor(ready, device=logits.device)]
             params = [self.sampling[q.seq_id] for q in sampled]
             gens = [self.generators.get(q.seq_id) for q in sampled]
-            next_tokens = sample(logits, params, gens, self.shared_generator).tolist()
+            tokens = sample(logits, params, gens, self.shared_generator)
+            want = [j for j, p in enumerate(params) if p.logprobs is not None]
+            if want:  # from the raw logits, before temperature and top-p
+                rows = torch.tensor(want, device=logits.device)
+                ks = [params[j].logprobs or 0 for j in want]
+                for j, lp in zip(want, token_logprobs(logits[rows], tokens[rows], ks), strict=True):
+                    self.logprobs[sampled[j].seq_id].append(lp)
+            next_tokens = tokens.tolist()
         self._mark(marks)
         now = self.clock()
         for q in sampled:

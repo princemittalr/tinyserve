@@ -13,7 +13,7 @@ from tests.test_model import CFG, tiny_model
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import greedy_generate
-from tinyserve.sampling import SamplingParams, sample, top_p_filter
+from tinyserve.sampling import SamplingParams, sample, token_logprobs, top_p_filter
 
 N = 100_000  # rows per statistical test
 
@@ -189,3 +189,74 @@ def test_different_seeds_give_different_outputs() -> None:
         for s in range(5)
     }
     assert len(outs) > 1
+
+
+# --- logprobs (M9) ----------------------------------------------------------------------
+
+
+def test_logprobs_must_be_0_to_20() -> None:
+    assert SamplingParams(logprobs=0).logprobs == 0 and SamplingParams(logprobs=20).logprobs == 20
+    for k in (-1, 21):
+        with pytest.raises(ValueError):
+            SamplingParams(logprobs=k)
+
+
+def test_token_logprobs_are_log_softmax_at_the_token_and_the_top_k() -> None:
+    torch.manual_seed(0)
+    logits = torch.randn(3, 10) * 4
+    tokens = torch.tensor([7, 0, 3])
+    got = token_logprobs(logits, tokens, [2, 0, 10])
+    want = torch.log_softmax(logits, dim=-1)
+    for b, lp in enumerate(got):
+        assert lp.logprob == pytest.approx(want[b, tokens[b]].item(), abs=1e-6)
+        order = want[b].argsort(descending=True).tolist()
+        assert [i for i, _ in lp.top] == order[: [2, 0, 10][b]]
+        for i, v in lp.top:
+            assert v == pytest.approx(want[b, i].item(), abs=1e-6)
+
+
+def reference_logprobs(prompt: list[int], output: list[int]) -> list[torch.Tensor]:
+    """log_softmax of the M1 model's logits before each output token."""
+    m = tiny_model()
+    logits = m.forward(torch.tensor(prompt + output))[len(prompt) - 1 : -1]
+    return list(torch.log_softmax(logits.float(), dim=-1))
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "chunked"),
+    [(64, False), (64, True), (7, False)],  # 7: preemptions
+)
+def test_engine_logprobs_match_the_model(num_blocks: int, chunked: bool) -> None:
+    e = Engine(tiny_model(), KVCache(CFG, num_blocks, 4, dtype=torch.float32),
+               max_num_seqs=4, max_batch_tokens=8 if chunked else 2048,
+               chunked_prefill=chunked)  # fmt: skip
+    prompts = [[1, 2, 3, 4, 5, 6, 7, 8, 9], [9, 8, 7], [5, 5, 5, 5], [2, 4, 6, 8, 1]]
+    hot = SamplingParams(1.5, 0.9, seed=3, logprobs=3)  # logprobs ignore temperature, top-p
+    ids = [e.add_request(p, 8, sampling=hot if k % 2 else SamplingParams(logprobs=2))
+           for k, p in enumerate(prompts)]  # fmt: skip
+    plain = e.add_request([3, 1, 4], 8)  # no logprobs asked: none kept
+    while e.has_work():
+        e.step()
+    if num_blocks == 7:
+        assert e.scheduler.num_preemptions > 0
+    assert plain not in e.logprobs
+    for k, (i, p) in enumerate(zip(ids, prompts, strict=True)):
+        out, lps = e.seqs[i].output, e.logprobs[i]
+        assert len(lps) == len(out) == 8  # one per token, none twice after a preemption
+        for t, lp, ref in zip(out, lps, reference_logprobs(p, out), strict=True):
+            assert lp.logprob == pytest.approx(ref[t].item(), abs=1e-4)
+            assert [j for j, _ in lp.top] == ref.argsort(descending=True)[
+                : 3 if k % 2 else 2
+            ].tolist()
+            if k % 2 == 0:  # greedy: the token is the most likely one
+                assert lp.top[0][0] == t and lp.top[0][1] == pytest.approx(lp.logprob)
+    e.release(ids[0])
+    assert ids[0] not in e.logprobs
+
+
+def test_asking_for_logprobs_does_not_change_the_tokens() -> None:
+    def run(params: SamplingParams) -> list[int]:
+        e = Engine(tiny_model(), KVCache(CFG, 64, 4, dtype=torch.float32))
+        return e.generate([[4, 2, 4, 2]], 10, sampling=params)[0]
+
+    assert run(SamplingParams(1.2, 0.8, 7)) == run(SamplingParams(1.2, 0.8, 7, logprobs=5))

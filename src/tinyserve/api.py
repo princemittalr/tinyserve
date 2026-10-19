@@ -14,7 +14,7 @@ Limits, each with the error a client gets back (OpenAI's error shape):
     prompt over ``max_prompt_tokens``               400
     max_tokens over ``max_tokens_cap``              400
     n over ``max_n``, more than 4 stop strings     400
-    a field out of range, or a feature not built   400 (logprobs, echo, penalties)
+    a field out of range, or a feature not built   400 (echo, penalties)
     ``max_requests`` already in flight              429 (AsyncEngine)
     engine thread dead                              503
 
@@ -23,6 +23,13 @@ is not returned (``StopMatcher``), with finish_reason "stop", and the engine req
 aborted there. ``n`` (M9): n engine requests for the same prompt, one per choice, run
 side by side; with a ``seed``, choice i samples with seed + i. Usage counts the prompt
 once and every choice's tokens.
+
+``logprobs`` (M9): for completions ``logprobs: k`` (0-5), for chat ``logprobs: true`` with
+``top_logprobs: k`` (0-20), in OpenAI's two formats. Each generated token comes with its
+log-probability under the model (before temperature and top-p) and the k most likely
+tokens. A token's text is ``decode([id])`` alone, so a token holding part of a UTF-8
+character shows as U+FFFD. With a stop string, the tokens are every token generated, up
+to and including the one that completed the stop string.
 
 A client that disconnects is aborted: for a stream, Starlette cancels the response
 task; for a plain request, the handler checks for a disconnect after every step. Either
@@ -34,6 +41,8 @@ There is no authentication, which is why ``scripts/serve.py`` binds to 127.0.0.1
 """
 
 import asyncio
+import dataclasses
+import itertools
 import json
 import time
 import uuid
@@ -46,7 +55,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tinyserve.detokenize import IncrementalDetokenizer, StopMatcher
-from tinyserve.sampling import SamplingParams
+from tinyserve.sampling import SamplingParams, TokenLogprobs
 from tinyserve.serving import (
     AsyncEngine,
     EngineDeadError,
@@ -92,7 +101,6 @@ class _Common(BaseModel):
     n: int = Field(1, ge=1)
     stop: str | list[str] | None = None
     # Not implemented: accepted only at their "off" values.
-    logprobs: Literal[False, None] = None
     echo: Literal[False] = False
     presence_penalty: Literal[0] = 0
     frequency_penalty: Literal[0] = 0
@@ -100,6 +108,7 @@ class _Common(BaseModel):
 
 class CompletionRequest(_Common):
     prompt: str | list[int] = Field(min_length=1)
+    logprobs: int | None = Field(None, ge=0, le=5)  # the legacy API's limit
 
 
 class ChatMessage(BaseModel):
@@ -109,6 +118,8 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(_Common):
     messages: list[ChatMessage] = Field(min_length=1)
+    logprobs: bool = False
+    top_logprobs: int | None = Field(None, ge=0, le=20)
 
 
 def qwen3_chat_prompt(messages: list[ChatMessage]) -> str:
@@ -184,6 +195,14 @@ def create_app(
             raise APIError(400, "stop: at most 4 strings, none of them empty")
         return out
 
+    def num_logprobs(req: _Common) -> int | None:
+        """How many alternatives per token, or None for no logprobs at all."""
+        if isinstance(req, ChatRequest):
+            if req.top_logprobs is not None and not req.logprobs:
+                raise APIError(400, "top_logprobs needs logprobs: true")
+            return (req.top_logprobs or 0) if req.logprobs else None
+        return req.logprobs if isinstance(req, CompletionRequest) else None
+
     def prepare(req: _Common, prompt_ids: list[int]) -> tuple[int, SamplingParams]:
         n = len(prompt_ids)
         if n > limits.max_prompt_tokens:
@@ -196,7 +215,7 @@ def create_app(
             raise APIError(400, f"max_tokens is {max_tokens}, the limit is {limits.max_tokens_cap}")
         if req.n > limits.max_n:
             raise APIError(400, f"n is {req.n}, the limit is {limits.max_n}")
-        return max_tokens, SamplingParams(req.temperature, req.top_p, req.seed)
+        return max_tokens, SamplingParams(req.temperature, req.top_p, req.seed, num_logprobs(req))
 
     async def start(
         prompt_ids: list[int], max_tokens: int, params: SamplingParams, trace: RequestTrace
@@ -286,6 +305,32 @@ def create_app(
             for g in gens:
                 await g.aclose()
 
+    def entries(out: StreamOutput) -> list[tuple[str, float, list[tuple[str, float]]]]:
+        """An output's tokens as (text, logprob, [(text, logprob) of the top k])."""
+        lps: list[TokenLogprobs] = out.logprobs or []
+        piece = tokenizer.decode
+        return [
+            (piece([t]), lp.logprob, [(piece([i]), v) for i, v in lp.top])
+            for t, lp in zip(out.token_ids, lps, strict=True)
+        ]
+
+    def completion_logprobs(es: list[Any], offset: int) -> dict[str, Any]:
+        """The legacy format; ``offset`` is where the first token starts in the answer."""
+        starts = itertools.accumulate((len(t) for t, _, _ in es), initial=offset)
+        return {
+            "tokens": [t for t, _, _ in es],
+            "token_logprobs": [v for _, v, _ in es],
+            "top_logprobs": [dict(top) for _, _, top in es],
+            "text_offset": list(starts)[:-1],
+        }
+
+    def chat_logprobs(es: list[Any]) -> dict[str, Any]:
+        def one(t: str, v: float) -> dict[str, Any]:
+            return {"token": t, "logprob": v, "bytes": list(t.encode())}
+
+        return {"content": [{**one(t, v), "top_logprobs": [one(*x) for x in top]}
+                            for t, v, top in es]}  # fmt: skip
+
     def usage(lasts: dict[int, StreamOutput]) -> dict[str, int]:
         prompt = next(iter(lasts.values())).num_prompt_tokens  # counted once, as OpenAI does
         completion = sum(out.num_output_tokens for out in lasts.values())
@@ -309,7 +354,7 @@ def create_app(
         try:
             for i in range(req.n):  # one engine request per choice
                 seed = None if params.seed is None else params.seed + i
-                p = SamplingParams(params.temperature, params.top_p, seed)
+                p = dataclasses.replace(params, seed=seed)
                 tag = rid if req.n == 1 else f"{rid}-{i}"
                 outs = await start(prompt_ids, max_tokens, p, RequestTrace(tag, received))
                 gens.append(texts(i, outs, stop))
@@ -325,15 +370,22 @@ def create_app(
             "model": model_name,
         }
 
+        want_lps = params.logprobs is not None
+        offsets = dict.fromkeys(range(req.n), 0)  # completions: text so far, per choice
+
         def choice(
-            i: int, text: str | None, reason: str | None, first: bool = False
+            i: int, text: str | None, reason: str | None, es: list[Any], first: bool = False
         ) -> dict[str, Any]:
+            lps = None
+            if want_lps and not first:
+                lps = chat_logprobs(es) if chat else completion_logprobs(es, offsets[i])
+                offsets[i] += sum(len(t) for t, _, _ in es)
             if not chat:
-                return {"index": i, "text": text or "", "logprobs": None, "finish_reason": reason}
+                return {"index": i, "text": text or "", "logprobs": lps, "finish_reason": reason}
             delta: dict[str, str] = {"role": "assistant"} if first else {}
             if text is not None:
                 delta["content"] = text
-            return {"index": i, "delta": delta, "logprobs": None, "finish_reason": reason}
+            return {"index": i, "delta": delta, "logprobs": lps, "finish_reason": reason}
 
         if req.stream:
             include_usage = req.stream_options is not None and req.stream_options.include_usage
@@ -346,11 +398,13 @@ def create_app(
                 try:
                     if chat:  # OpenAI opens a chat stream with the role, per choice
                         for i in range(req.n):
-                            yield sse({**head, "choices": [choice(i, "", None, first=True)]})
+                            c = choice(i, "", None, [], first=True)
+                            yield sse({**head, "choices": [c]})
                     async for i, text, reason, out in choices:
                         lasts[i] = out
-                        if text or reason is not None:
-                            c = choice(i, text or None, reason)  # chat's last delta: {}
+                        es = entries(out) if want_lps else []
+                        if text or reason is not None or es:
+                            c = choice(i, text or None, reason, es)  # chat's last delta: {}
                             yield sse({**head, "choices": [c]})
                 except EngineDeadError as e:  # mid-stream: the status code is already sent
                     yield sse({"error": {"message": str(e), "type": "server_error"}})
@@ -364,12 +418,15 @@ def create_app(
             return StreamingResponse(events(), media_type="text/event-stream")
 
         pieces: dict[int, list[str]] = {i: [] for i in range(req.n)}
+        es_all: dict[int, list[Any]] = {i: [] for i in range(req.n)}
         reasons: dict[int, str] = {}
         outs_last: dict[int, StreamOutput] = {}
         try:
             async for i, text, reason, out in choices:
                 pieces[i].append(text)
                 outs_last[i] = out
+                if want_lps:
+                    es_all[i] += entries(out)
                 if reason is not None:
                     reasons[i] = reason
                 if await request.is_disconnected():
@@ -385,14 +442,14 @@ def create_app(
                 {
                     "index": i,
                     "message": {"role": "assistant", "content": "".join(pieces[i])},
-                    "logprobs": None,
+                    "logprobs": chat_logprobs(es_all[i]) if want_lps else None,
                     "finish_reason": reasons[i],
                 }
                 for i in range(req.n)
             ]
             body = {**head, "object": "chat.completion", "choices": chs}
         else:
-            chs = [choice(i, "".join(pieces[i]), reasons[i]) for i in range(req.n)]
+            chs = [choice(i, "".join(pieces[i]), reasons[i], es_all[i]) for i in range(req.n)]
             body = {**head, "choices": chs}
         return JSONResponse({**body, "usage": usage(outs_last)})
 
