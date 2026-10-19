@@ -48,9 +48,19 @@ def check_invariants(s: Scheduler) -> None:
 
 
 def sched(
-    num_blocks: int = 64, block_size: int = 4, prefix_cache: bool = False, **kw: int
+    num_blocks: int = 64,
+    block_size: int = 4,
+    prefix_cache: bool = False,
+    max_num_seqs: int = 64,
+    max_batch_tokens: int = 2048,
 ) -> Scheduler:
-    return Scheduler(BlockAllocator(num_blocks), block_size, prefix_cache=prefix_cache, **kw)
+    return Scheduler(
+        BlockAllocator(num_blocks),
+        block_size,
+        max_num_seqs,
+        max_batch_tokens,
+        prefix_cache=prefix_cache,
+    )
 
 
 # --- add ----------------------------------------------------------------------------------

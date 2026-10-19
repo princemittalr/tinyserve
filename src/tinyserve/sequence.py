@@ -10,6 +10,8 @@ go into the next forward pass:
                             (recompute: the k/v are rebuilt by one prefill)
     prefix cache hit (M5):  the table starts with cached blocks, so pending = only
                             the tokens after the cached prefix
+    chunked prefill (M9):   a long prompt is appended a chunk per step, so pending =
+                            the rest of the prompt until its last chunk has run
 """
 
 from dataclasses import dataclass, field
@@ -59,6 +61,12 @@ class Sequence:
     def pending(self) -> list[int]:
         """Tokens whose k/v are not in the cache yet: the next step's input."""
         return self.tokens[self.table.num_tokens :]
+
+    def in_prefill(self) -> bool:
+        """After ``schedule()``: True if prompt tokens are left for later steps (chunked
+        prefill, M9). Such a sequence's logits this step predict nothing, so it does not
+        sample; every other scheduled sequence ran its last pending token and does."""
+        return bool(self.pending())
 
     def is_done(self) -> bool:
         if len(self.output) >= self.max_new_tokens:

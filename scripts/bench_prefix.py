@@ -27,6 +27,7 @@ import torch
 
 from tinyserve.bench import num_requests_for, run_closed_loop, shared_prefix_prompts
 from tinyserve.config import ModelConfig
+from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import DECODE_ATTENTIONS, Qwen3
@@ -59,6 +60,10 @@ def main() -> None:
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
     parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
                         help="per sequence, or one call per layer (M8)")  # fmt: skip
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="replay CUDA graphs for decode steps (M8; needs triton)")  # fmt: skip
+    parser.add_argument("--chunked-prefill", action="store_true",
+                        help="split prompts into chunks of the step budget (M9)")  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -84,9 +89,12 @@ def main() -> None:
           f"{args.prefix_len}-token prefix + {args.suffix_len}-token suffix, "
           f"{args.output_len} output tokens")  # fmt: skip
 
+    graphs = DecodeGraphs(model, cache, max_batch=max(levels)) if args.cuda_graphs else None
+
     def engine(max_num_seqs: int, prefix_cache: bool) -> Engine:
         return Engine(model, cache, max_num_seqs, args.max_batch_tokens,
-                      prefix_cache=prefix_cache)  # fmt: skip
+                      prefix_cache=prefix_cache, decode_graphs=graphs,
+                      chunked_prefill=args.chunked_prefill)  # fmt: skip
 
     run_closed_loop(engine(2, True), prompts[:2], 4, concurrency=2)  # warm-up, not reported
     results = []
@@ -101,6 +109,7 @@ def main() -> None:
             row["cache_on" if on else "cache_off"] = r.as_dict()
             print(f"C={c:>3} cache {'on ' if on else 'off'}: {r.output_tok_per_s:7.1f} tok/s | "
                   f"TTFT p50/p99 {r.ttft_p50_ms:6.0f} / {r.ttft_p99_ms:6.0f} ms | "
+                  f"ITL p99/max {r.itl_p99_ms or 0:4.0f} / {r.itl_max_ms or 0:4.0f} ms | "
                   f"prefix hit {r.prefix_hit_rate:.0%} | steps {r.steps} | "
                   f"preemptions {r.preemptions}")  # fmt: skip
         same = sum(a == b for a, b in zip(outputs[False], outputs[True], strict=True))
@@ -115,6 +124,9 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
         "prefill_attention": args.prefill_attention,
+        "cuda_graphs": args.cuda_graphs,
+        "chunked_prefill": args.chunked_prefill,
+        "max_batch_tokens": args.max_batch_tokens,
         "args": {k: str(v) for k, v in vars(args).items()},
         "num_blocks": num_blocks,
         "results": results,

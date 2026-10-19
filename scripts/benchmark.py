@@ -59,6 +59,8 @@ def main() -> None:
                         help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="replay CUDA graphs for decode steps (M8; needs triton)")  # fmt: skip
+    parser.add_argument("--chunked-prefill", action="store_true",
+                        help="split prompts into chunks of the step budget (M9)")  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -66,6 +68,7 @@ def main() -> None:
     levels = [int(c) for c in args.concurrency.split(",")]
     milestone = "m4" if args.attention != "torch" else "m3"
     milestone = "m8" if args.cuda_graphs else milestone
+    milestone = "m9" if args.chunked_prefill else milestone
     out = args.out or Path(f"results/{milestone}_bench_{args.device.split(':')[0]}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
@@ -90,7 +93,8 @@ def main() -> None:
               f"{graphs.capture_seconds:.1f} s, {mib:.0f} MiB")  # fmt: skip
 
     def engine(max_num_seqs: int) -> Engine:
-        return Engine(model, cache, max_num_seqs, args.max_batch_tokens, decode_graphs=graphs)
+        return Engine(model, cache, max_num_seqs, args.max_batch_tokens, decode_graphs=graphs,
+                      chunked_prefill=args.chunked_prefill)  # fmt: skip
 
     run_closed_loop(engine(2), prompts[:2], 4, concurrency=2)  # warm-up, not reported
     results = []
@@ -103,7 +107,8 @@ def main() -> None:
             tpot = f"{r.tpot_p50_ms:.1f} / {r.tpot_p99_ms:.1f}"
         print(f"concurrency {c:>3}: {r.output_tok_per_s:8.1f} tok/s | "
               f"TTFT p50/p99 {r.ttft_p50_ms:.0f} / {r.ttft_p99_ms:.0f} ms | "
-              f"TPOT p50/p99 {tpot} ms | KV util mean {r.kv_util_mean:.0%} "
+              f"TPOT p50/p99 {tpot} ms | ITL p99/max {r.itl_p99_ms or 0:.0f} / "
+              f"{r.itl_max_ms or 0:.0f} ms | KV util mean {r.kv_util_mean:.0%} "
               f"max {r.kv_util_max:.0%} | preemptions {r.preemptions}")  # fmt: skip
 
     report = {
@@ -113,6 +118,8 @@ def main() -> None:
         "dtype": str(dtype).removeprefix("torch."),
         "attention": args.attention,
         "prefill_attention": args.prefill_attention,
+        "chunked_prefill": args.chunked_prefill,
+        "max_batch_tokens": args.max_batch_tokens,
         "cuda_graphs": None
         if graphs is None
         else {

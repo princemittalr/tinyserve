@@ -16,6 +16,10 @@ measuring throughput.
 With ``decode_graphs`` (M8, cuda_graphs.py), every step in which all sequences decode one
 token replays a captured CUDA graph instead of running ``forward_batch``; prefill and
 mixed steps run eagerly as before.
+
+With ``chunked_prefill=True`` (M9, scheduler.py) no step runs more than
+``max_batch_tokens`` tokens: a long prompt is spread over several steps, and only the
+step that runs its last chunk samples its first token.
 """
 
 import itertools
@@ -91,6 +95,7 @@ class Engine:
         seed: int = 0,
         trace_steps: bool = False,
         decode_graphs: DecodeGraphs | None = None,
+        chunked_prefill: bool = False,
     ) -> None:
         if decode_graphs is not None and (
             decode_graphs.model is not model or decode_graphs.cache is not cache
@@ -105,6 +110,7 @@ class Engine:
             max_num_seqs,
             max_batch_tokens,
             prefix_cache=prefix_cache,
+            chunked_prefill=chunked_prefill,
         )
         self.clock = clock
         self.seqs: dict[int, Sequence] = {}
@@ -164,8 +170,12 @@ class Engine:
             raise RuntimeError("scheduler made no progress with requests still queued")
         self.kv_utilization.append(s.kv_utilization)
         # Each sequence's input is what schedule() just appended to its table: a whole
-        # prompt, the part after a cached prefix (M5), or one decode token.
-        items = [(q.tokens[-q.num_scheduled :], q.table) for q in seqs]
+        # prompt, the part after a cached prefix (M5), one decode token, or one chunk of a
+        # prompt (M9), which need not be the end of the prompt.
+        items = [
+            (q.tokens[q.table.num_tokens - q.num_scheduled : q.table.num_tokens], q.table)
+            for q in seqs
+        ]
         # Read before update(), which releases the tables of finished sequences.
         context = sum(table.num_tokens for _, table in items)
         self._mark(marks)
@@ -184,15 +194,23 @@ class Engine:
             self._mark(marks)
             logits = self.model.forward_batch(batch, self.cache)
         self._mark(marks)
-        params = [self.sampling[q.seq_id] for q in seqs]
-        gens = [self.generators.get(q.seq_id) for q in seqs]
-        next_tokens = sample(logits, params, gens, self.shared_generator).tolist()
+        # A sequence still mid-prompt (chunked prefill) has nothing to sample yet; its
+        # generator must not draw, so a seeded request gives the same tokens either way.
+        ready = [b for b, q in enumerate(seqs) if not q.in_prefill()]
+        sampled = [seqs[b] for b in ready]
+        next_tokens: list[int] = []
+        if sampled:
+            if len(ready) < len(seqs):
+                logits = logits[torch.tensor(ready, device=logits.device)]
+            params = [self.sampling[q.seq_id] for q in sampled]
+            gens = [self.generators.get(q.seq_id) for q in sampled]
+            next_tokens = sample(logits, params, gens, self.shared_generator).tolist()
         self._mark(marks)
         now = self.clock()
-        for q in seqs:
+        for q in sampled:
             self.times[q.seq_id].tokens.append(now)
         self.num_steps += 1
-        finished = s.update(seqs, next_tokens)
+        finished = s.update(sampled, next_tokens)
         for q in finished:
             self.generators.pop(q.seq_id, None)  # a finished request draws no more noise
         if self.step_records is not None:

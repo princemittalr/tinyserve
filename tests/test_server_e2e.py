@@ -107,6 +107,26 @@ def test_server_with_the_m8_configuration(model_dir: Path) -> None:
     assert any(s["graph"] for s in trace["steps"]), "no decode step took the graph path"
 
 
+def test_server_with_chunked_prefill(model_dir: Path) -> None:
+    # Prompts longer than the 2-token step budget: same greedy text, no step over budget.
+    prompts = [byte_level_bpe().encode(t).ids for t in ("the capital of", "one two three")]
+    assert min(len(p) for p in prompts) > 2
+    args = ["--model-dir", str(model_dir), "--device", "cpu", "--kv-gib", "0.01",
+            "--chunked-prefill", "--max-batch-tokens", "2", "--max-num-seqs", "2",
+            "--trace-requests"]  # fmt: skip
+    with running_server(args, free_port(), timeout=120) as url:
+
+        async def both() -> list[StreamResult]:
+            async with httpx.AsyncClient(timeout=120) as client:
+                bodies = [{"prompt": p, "max_tokens": 8, "temperature": 0} for p in prompts]
+                return await asyncio.gather(*(stream_completion(client, url, b) for b in bodies))
+
+        got = asyncio.run(both())
+        trace = httpx.get(f"{url}/debug/trace").json()
+    assert [r.text for r in got] == [offline_text(model_dir, p, 8) for p in prompts]
+    assert max(s["num_tokens"] for s in trace["steps"]) <= 2
+
+
 def test_server_refuses_cuda_graphs_without_a_kernel(model_dir: Path) -> None:
     cmd = [sys.executable, "-m", "tinyserve.server", "--model-dir", str(model_dir),
            "--cuda-graphs"]  # fmt: skip

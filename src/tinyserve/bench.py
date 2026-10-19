@@ -8,10 +8,13 @@ Reported per run:
     output tok/s   output tokens / wall time, over the whole run
     TTFT p50/p99   time to first token: arrival -> first output token (queueing + prefill)
     TPOT p50/p99   time per output token after the first, averaged per request
+    ITL p99/max    inter-token latency: every gap between two tokens of one request (M9);
+                   a decode that waits for a long prefill step shows here, not in TPOT
     KV utilization fraction of KV-cache blocks in use, sampled every step (mean, max)
     prefix hit     fraction of admitted prompt tokens served by the prefix cache (M5)
 """
 
+import itertools
 import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -85,6 +88,8 @@ class BenchResult:
     ttft_p99_ms: float
     tpot_p50_ms: float | None  # None when every request produced a single token
     tpot_p99_ms: float | None
+    itl_p99_ms: float | None  # None when every request produced a single token
+    itl_max_ms: float | None
     kv_util_mean: float
     kv_util_max: float
     prefix_hit_rate: float  # cached prompt tokens / admitted prompt tokens; 0 if cache off
@@ -115,6 +120,7 @@ def run_closed_loop(
     out_tokens = sum(len(engine.seqs[i].output) for i in ids)
     ttft = [t.ttft * 1e3 for t in times]
     tpot = [x * 1e3 for t in times if (x := t.tpot) is not None]
+    itl = [(b - a) * 1e3 for t in times for a, b in itertools.pairwise(t.tokens)]
     util = engine.kv_utilization
     s = engine.scheduler
     return BenchResult(
@@ -129,6 +135,8 @@ def run_closed_loop(
         ttft_p99_ms=percentile(ttft, 99),
         tpot_p50_ms=percentile(tpot, 50) if tpot else None,
         tpot_p99_ms=percentile(tpot, 99) if tpot else None,
+        itl_p99_ms=percentile(itl, 99) if itl else None,
+        itl_max_ms=max(itl) if itl else None,
         kv_util_mean=sum(util) / len(util),
         kv_util_max=max(util),
         prefix_hit_rate=s.num_cached_tokens / s.num_admitted_tokens,

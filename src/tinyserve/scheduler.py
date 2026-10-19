@@ -51,11 +51,19 @@ class Scheduler:
         max_batch_tokens: int = 2048,
         *,
         prefix_cache: bool = False,
+        chunked_prefill: bool = False,
     ) -> None:
+        if chunked_prefill and max_batch_tokens < max_num_seqs:
+            # Every running sequence's decode token must fit in one step.
+            raise ValueError(
+                f"chunked prefill needs max_batch_tokens ({max_batch_tokens}) >= "
+                f"max_num_seqs ({max_num_seqs})"
+            )
         self.allocator = allocator
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
         self.max_batch_tokens = max_batch_tokens
+        self.chunked_prefill = chunked_prefill
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []  # in admission order: oldest first
         self.num_preemptions = 0
@@ -76,10 +84,10 @@ class Scheduler:
         seq = Sequence(
             seq_id, prompt, max_new_tokens, BlockTable(self.allocator, self.block_size), eos_ids
         )
-        # After a preemption the whole sequence is recomputed in one step, so its longest
-        # possible length must fit in one batch and in the whole cache, or it would wait
-        # (or preempt everyone else) forever.
-        if seq.max_cached_tokens > self.max_batch_tokens:
+        # After a preemption the whole sequence is recomputed in one step (unless it is
+        # chunked), so its longest possible length must fit in one batch and in the whole
+        # cache, or it would wait (or preempt everyone else) forever.
+        if not self.chunked_prefill and seq.max_cached_tokens > self.max_batch_tokens:
             raise ValueError(
                 f"request needs up to {seq.max_cached_tokens} tokens in one step, "
                 f"max_batch_tokens is {self.max_batch_tokens}"
@@ -120,24 +128,34 @@ class Scheduler:
         """Pick this step's sequences and append their pending tokens to their tables.
 
         Returns the running sequences, oldest first. Each one's input for the forward pass
-        is ``seq.tokens[-n:]`` with n the tokens just appended, i.e. what ``pending()``
-        returned before this call.
+        is the ``n = seq.num_scheduled`` tokens just appended to its table: what
+        ``pending()`` returned before this call, or its first n tokens (chunked prefill).
         """
         self._reserve_running()
         self._admit_waiting()
         return list(self.running)
 
     def _reserve_running(self) -> None:
-        """Phase 1: one more token for each running sequence, preempting if needed."""
+        """Phase 1: one more token for each running sequence, preempting if needed.
+
+        With chunked prefill, a sequence still in its prompt gets the next chunk of it
+        from what the budget has left after one token for every decoding sequence. That
+        is at least 1 token: only the last sequence admitted can be left mid-prompt, and
+        ``max_batch_tokens >= max_num_seqs``.
+        """
         queue = deque(self.running)  # oldest on the left, newest on the right
         self.running = []
+        budget = self.max_batch_tokens - sum(len(s.pending()) == 1 for s in queue)
         while queue:
             seq = queue.popleft()
+            n = len(seq.pending())  # 1 for a decode; more only mid-prompt (chunked)
+            if n > 1:
+                n = min(n, max(budget, 0))
             fits = True
             # TODO(you) 1: loop while this sequence's pending tokens need more NEW blocks
             # than are free. (BlockTable.blocks_needed, allocator.num_free)
-            while seq.table.blocks_needed(len(seq.pending())) > self.allocator.num_free:
-                short = seq.table.blocks_needed(len(seq.pending())) - self.allocator.num_free
+            while seq.table.blocks_needed(n) > self.allocator.num_free:
+                short = seq.table.blocks_needed(n) - self.allocator.num_free
                 if self._evict(short):
                     continue  # unused cached blocks go before any running sequence
                 if queue:
@@ -148,13 +166,15 @@ class Scheduler:
                     fits = False
                     break
             if fits:
-                seq.num_scheduled = len(seq.pending())
-                seq.table.append(seq.num_scheduled)
+                seq.num_scheduled = n
+                seq.table.append(n)
                 self.running.append(seq)
+                if n > 1:
+                    budget -= n
 
     def _admit_waiting(self) -> None:
         """Phase 2: FCFS admission while the next waiting sequence fits."""
-        budget = self.max_batch_tokens - len(self.running)  # each running seq brings 1 token
+        budget = self.max_batch_tokens - sum(s.num_scheduled for s in self.running)
         while self.waiting:
             seq = self.waiting[0]
             # TODO(you) 3: stop if the batch already has the maximum number of sequences.
@@ -162,6 +182,8 @@ class Scheduler:
                 break
             hit = self._adopt_cached_prefix(seq)
             n = len(seq.pending())
+            if self.chunked_prefill and budget > 0:
+                n = min(n, budget)  # the rest of the prompt comes in later steps
             # TODO(you) 4: stop if this sequence's n tokens don't fit in the token budget.
             if n > budget:
                 seq.table.release()  # give back the adopted blocks; they stay cached
@@ -227,9 +249,15 @@ class Scheduler:
         seq.status = SeqStatus.FINISHED
 
     def update(self, seqs: list[Sequence], next_tokens: list[int]) -> list[Sequence]:
-        """Record each sequence's new token; retire and return the ones that finished."""
+        """Record each sequence's new token; retire and return the ones that finished.
+
+        ``seqs`` are the step's sequences that sampled: not those still in their prompt
+        (chunked prefill), which have no new token yet and stay running as they are.
+        """
         finished = []
         for seq, tok in zip(seqs, next_tokens, strict=True):
+            if seq.in_prefill():
+                raise ValueError(f"sequence {seq.seq_id} is mid-prompt and samples nothing")
             seq.output.append(tok)
             if seq.num_scheduled > 1 or seq.is_done():
                 # Cache right after a prefill, not only at the end: requests that arrive

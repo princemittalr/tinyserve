@@ -81,6 +81,9 @@ def main() -> None:
                         help="batched engine with the M5 radix prefix cache")  # fmt: skip
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="batched engine replays CUDA graphs for decode (M8)")  # fmt: skip
+    parser.add_argument("--chunked-prefill", action="store_true",
+                        help="batched engine splits prompts into chunks (M9)")  # fmt: skip
+    parser.add_argument("--max-batch-tokens", type=int, default=2048, help="batched engine only")
     parser.add_argument("--out", type=Path, default=None, help="default: results/<m2|m1>_...")
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -90,6 +93,7 @@ def main() -> None:
         milestone = "m4" if args.attention != "torch" else milestone
         milestone = "m5" if args.prefix_cache else milestone
         milestone = "m8" if args.cuda_graphs else milestone
+        milestone = "m9" if args.chunked_prefill else milestone
         suffix = "" if device.type == "cpu" else f"_{device.type}"
         args.out = Path(f"results/{milestone}_hf_compare{suffix}.json")
 
@@ -121,8 +125,10 @@ def main() -> None:
             ours,
             big,
             max_num_seqs=args.max_num_seqs,
+            max_batch_tokens=args.max_batch_tokens,
             prefix_cache=args.prefix_cache,
             decode_graphs=graphs,
+            chunked_prefill=args.chunked_prefill,
         )
         t0 = time.perf_counter()
         ours_out = engine.generate(

@@ -76,6 +76,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--max-batch-tokens", type=int, default=2048)
+    parser.add_argument("--chunked-prefill", action="store_true",
+                        help="prompts in chunks of --max-batch-tokens per step (M9)")  # fmt: skip
     parser.add_argument("--max-requests", type=int, default=256, help="in flight; then 429")
     parser.add_argument("--max-prompt-tokens", type=int, default=Limits.max_prompt_tokens)
     parser.add_argument("--max-tokens-cap", type=int, default=Limits.max_tokens_cap)
@@ -109,7 +111,8 @@ def main(argv: list[str] | None = None) -> None:
     graphs = DecodeGraphs(model, cache, args.max_num_seqs) if args.cuda_graphs else None
     engine = Engine(model, cache, args.max_num_seqs, args.max_batch_tokens,
                     prefix_cache=args.prefix_cache, seed=args.seed,
-                    trace_steps=args.trace_requests, decode_graphs=graphs)  # fmt: skip
+                    trace_steps=args.trace_requests, decode_graphs=graphs,
+                    chunked_prefill=args.chunked_prefill)  # fmt: skip
     limits = Limits(max_prompt_tokens=args.max_prompt_tokens, max_tokens_cap=args.max_tokens_cap)
     tok = QwenTokenizer(args.model_dir / "tokenizer.json")
     ae = AsyncEngine(engine, max_requests=args.max_requests, trace=args.trace_requests)
@@ -123,7 +126,9 @@ def main(argv: list[str] | None = None) -> None:
             else "eager (no CUDA)"
         )
     print(f"{args.device} {dtype}, {args.attention} decode attention, "
-          f"{args.prefill_attention} prefill attention, CUDA graphs {graph_note}, prefix cache "
+          f"{args.prefill_attention} prefill attention, CUDA graphs {graph_note}, chunked "
+          f"prefill {'on' if args.chunked_prefill else 'off'} ({args.max_batch_tokens} tokens "
+          f"per step), prefix cache "
           f"{'on' if args.prefix_cache else 'off'}, KV cache {num_blocks} blocks x "
           f"{args.block_size} tokens ({cache.memory_bytes / 2**30:.2f} GiB)"
           f"{', EOS ignored' if args.ignore_eos else ''}"

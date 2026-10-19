@@ -89,6 +89,16 @@ def test_tight_cache_shows_up_as_preemptions_and_full_utilization() -> None:
 def test_single_token_requests_have_no_tpot() -> None:
     r = run_closed_loop(make_engine(), PROMPTS, max_new_tokens=1, concurrency=2)
     assert r.tpot_p50_ms is None and r.tpot_p99_ms is None
+    assert r.itl_p99_ms is None and r.itl_max_ms is None
+
+
+def test_itl_is_every_gap_between_two_tokens_of_a_request() -> None:
+    e = make_engine()
+    r = run_closed_loop(e, PROMPTS, max_new_tokens=5, concurrency=3)
+    gaps = [b - a for t in e.times.values() for a, b in itertools.pairwise(t.tokens)]
+    assert len(gaps) == 4 * len(PROMPTS)
+    assert r.itl_max_ms == pytest.approx(max(gaps) * 1e3)
+    assert r.itl_p99_ms == pytest.approx(percentile([g * 1e3 for g in gaps], 99))
 
 
 def test_concurrency_must_be_positive() -> None:
