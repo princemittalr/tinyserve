@@ -27,7 +27,7 @@ from tinyserve.config import ModelConfig
 from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
-from tinyserve.model import DECODE_ATTENTIONS, Qwen3
+from tinyserve.model import DECODE_ATTENTIONS, PREFILL_ATTENTIONS, Qwen3
 from tinyserve.serving import AsyncEngine
 from tinyserve.weights import load_weights
 
@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
-    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
+    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default="per_seq",
                         help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="replay CUDA graphs for decode steps (M8; needs a triton "

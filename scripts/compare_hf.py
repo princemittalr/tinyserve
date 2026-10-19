@@ -36,7 +36,13 @@ from tinyserve.config import ModelConfig
 from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
-from tinyserve.model import DECODE_ATTENTIONS, Qwen3, greedy_generate, greedy_generate_paged
+from tinyserve.model import (
+    DECODE_ATTENTIONS,
+    PREFILL_ATTENTIONS,
+    Qwen3,
+    greedy_generate,
+    greedy_generate_paged,
+)
 from tinyserve.weights import load_weights
 
 
@@ -75,8 +81,8 @@ def main() -> None:
                         help="default: float32 on cpu, float16 on cuda")  # fmt: skip
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch",
                         help="batched engine's decode attention (M4 kernel: triton)")  # fmt: skip
-    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
-                        help="per sequence, or one call per layer (M8)")  # fmt: skip
+    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default="per_seq",
+                        help="per sequence, one SDPA call (M8) or the M9 kernel")  # fmt: skip
     parser.add_argument("--prefix-cache", action="store_true",
                         help="batched engine with the M5 radix prefix cache")  # fmt: skip
     parser.add_argument("--cuda-graphs", action="store_true",

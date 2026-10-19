@@ -142,7 +142,7 @@ def test_engine_with_batched_prefill_and_prefix_cache_matches_m1_greedy() -> Non
 
 
 def test_unknown_prefill_attention_is_rejected() -> None:
-    with pytest.raises(ValueError, match="per_seq' or 'batched"):
+    with pytest.raises(ValueError, match="must be one of"):
         Qwen3(CFG, tiny_model().w, prefill_attention="flash")  # type: ignore[arg-type]
 
 

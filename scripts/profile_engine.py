@@ -53,7 +53,7 @@ from tinyserve.config import ModelConfig
 from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine, StepRecord
 from tinyserve.kv_cache import KVCache
-from tinyserve.model import DECODE_ATTENTIONS, Qwen3
+from tinyserve.model import DECODE_ATTENTIONS, PREFILL_ATTENTIONS, Qwen3
 from tinyserve.profiling import (
     attention_replaced,
     fill_to_decode,
@@ -264,8 +264,8 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
-    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
-                        help="per sequence, or one call per layer (M8)")  # fmt: skip
+    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default="per_seq",
+                        help="per sequence, one SDPA call (M8) or the M9 kernel")  # fmt: skip
     parser.add_argument("--workload", choices=["m3", "prefix"], default="m3")
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="m3 workload: decode steps replay CUDA graphs (M8)")  # fmt: skip

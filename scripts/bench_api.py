@@ -27,7 +27,7 @@ import torch
 from tinyserve.bench import num_requests_for, percentile, synthetic_prompts
 from tinyserve.client import StreamResult, closed_loop, running_server
 from tinyserve.config import ModelConfig
-from tinyserve.model import DECODE_ATTENTIONS
+from tinyserve.model import DECODE_ATTENTIONS, PREFILL_ATTENTIONS
 
 
 def summarise(results: list[StreamResult], seconds: float, concurrency: int) -> dict[str, Any]:
@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
-    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq")
+    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default="per_seq")
     parser.add_argument("--cuda-graphs", action="store_true")
     parser.add_argument("--chunked-prefill", action="store_true")
     parser.add_argument("--max-batch-tokens", type=int, default=2048)

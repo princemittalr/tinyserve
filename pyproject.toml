@@ -69,8 +69,8 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # Triton reads a kernel's parameter annotations itself (tl.constexpr), so kernel
-# parameters carry no ordinary type hints. Only this module relaxes those rules.
-module = ["tinyserve.triton_attention"]
+# parameters carry no ordinary type hints. Only these modules relax those rules.
+module = ["tinyserve.triton_attention", "tinyserve.triton_prefill"]
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 disallow_untyped_decorators = false

@@ -10,7 +10,9 @@ Two paths share the same layers and differ only in attention:
         With ``decode_attention="triton"`` (M4), every sequence that brings one token is
         handled by one Triton kernel launch per layer instead of one PyTorch call each.
         With ``prefill_attention="batched"`` (M8), the other sequences attend in one
-        padded call per layer (``batched_prefill_attention``) instead of one call each.
+        padded call per layer (``batched_prefill_attention``) instead of one call each;
+        with ``"triton"`` (M9), in one launch of the varlen kernel in triton_prefill.py,
+        which reads their keys and values straight from the cache blocks.
     ``forward_decode`` (M8): a decode step with fixed shapes and no host syncs, from
         buffers filled in advance (``DecodeInputs``), so a CUDA graph can capture it
         (cuda_graphs.py). Same layers, same kernel; only how the inputs arrive differs.
@@ -37,6 +39,8 @@ from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin, swiglu_mlp
 
 # decode_attention choices: per-sequence PyTorch, the M4 kernel, the M8 grouped kernel.
 DECODE_ATTENTIONS = ("torch", "triton", "triton_grouped")
+# prefill_attention choices: per-sequence PyTorch, one padded SDPA call (M8), the M9 kernel.
+PREFILL_ATTENTIONS = ("per_seq", "batched", "triton")
 # (layer index, q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]) -> attention output [T, Hq, D]
 AttentionFn = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 # paged_decode_attention's signature (triton_attention.py); kept here so the model does
@@ -53,7 +57,7 @@ class Qwen3:
         cfg: ModelConfig,
         weights: dict[str, torch.Tensor],
         decode_attention: Literal["torch", "triton", "triton_grouped"] = "torch",
-        prefill_attention: Literal["per_seq", "batched"] = "per_seq",
+        prefill_attention: Literal["per_seq", "batched", "triton"] = "per_seq",
     ) -> None:
         """``decode_attention`` picks how ``forward_batch`` attends for one-token sequences:
         "torch" runs ``paged_gqa_attention`` per sequence, "triton" runs the M4 kernel once
@@ -61,7 +65,7 @@ class Qwen3:
         head group. Triton is imported only when chosen (it has no Windows wheels).
         ``prefill_attention`` picks how the other sequences attend: "per_seq" runs
         ``paged_gqa_attention`` for each, "batched" (M8) runs ``batched_prefill_attention``
-        once for all of them."""
+        once for all of them, "triton" (M9) the varlen prefill kernel once for all."""
         self.cfg = cfg
         self.w = weights
         self.decode_kernel: DecodeFn | None = None
@@ -81,11 +85,16 @@ class Qwen3:
                 "decode_attention must be 'torch', 'triton' or 'triton_grouped': "
                 f"{decode_attention!r}"
             )
-        if prefill_attention not in ("per_seq", "batched"):
+        if prefill_attention not in PREFILL_ATTENTIONS:
             raise ValueError(
-                f"prefill_attention must be 'per_seq' or 'batched': {prefill_attention!r}"
+                f"prefill_attention must be one of {PREFILL_ATTENTIONS}: {prefill_attention!r}"
             )
         self.batched_prefill = prefill_attention == "batched"
+        self.prefill_kernel: Callable[..., torch.Tensor] | None = None
+        if prefill_attention == "triton":
+            from tinyserve.triton_prefill import paged_prefill_attention
+
+            self.prefill_kernel = paged_prefill_attention
         # Tied embeddings: the output projection reuses the input embedding matrix.
         key = "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm_head.weight"
         self.lm_head = weights[key]
@@ -206,6 +215,20 @@ class Qwen3:
                 [batch.query_lens[b] for b in rest],
                 [batch.seq_slots[b] for b in rest],
             )
+        prefill = self.prefill_kernel if rest else None
+        if prefill is not None:  # the varlen kernel's per-sequence inputs, once per step
+            dev = batch.token_ids.device
+            sel = torch.tensor(rest, device=dev)
+
+            def ints(xs: list[int]) -> torch.Tensor:
+                return torch.tensor(xs, dtype=torch.int32, device=dev)
+
+            starts, qlens = (
+                ints([bounds[b] for b in rest]),
+                ints([batch.query_lens[b] for b in rest]),
+            )
+            p_tables, p_lens = batch.block_tables[sel], batch.context_lens[sel]
+            max_q = max(batch.query_lens[b] for b in rest)
 
         def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             cache.write(i, batch.new_slots, k, v)
@@ -215,6 +238,8 @@ class Qwen3:
             out = torch.empty_like(q)
             if kernel and one:
                 out[rows] = kernel(q[rows], ki, vi, tables, lens, scale, bs)
+            if prefill is not None:  # writes the rest's rows of out in place
+                return prefill(q, ki, vi, p_tables, starts, qlens, p_lens, scale, bs, max_q, out)
             if plan is not None:
                 res = batched_prefill_attention(q, ki, vi, plan, scale)
                 out[plan.rows[plan.real]] = res[plan.real]
