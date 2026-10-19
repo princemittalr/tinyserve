@@ -32,14 +32,29 @@ softmax and writes its partial (m, sum_exp, acc) per query head; a second small 
 merges them. Two partials with maxima m1, m2 merge exactly like one block into another:
 
     m = max(m1, m2),  sum_exp = e^(m1-m) sum_exp1 + e^(m2-m) sum_exp2,  same for acc.
+
+M10: Triton compiles a kernel once per "specialization": each value of a constexpr, and
+for an int argument whether it equals 1 or is a multiple of 16, gets a variant of its
+own. Two inputs used to change from step to step: ``stride_bt``, the block-table width
+(the longest sequence's block count in the batch), and the split count, a constexpr
+picked from the number of decodes, which in a step that also prefills can be anything.
+CUDA graphs compile their variants at capture, but a mixed step could need one that no
+graph used, and that step then waited for the compiler. Replaying M9 run 2's scheduler
+on CPU, chunked prefill at C=8 is the one run that needed variants no earlier process
+in that session had compiled; it is also the run with the unexplained ~450 ms stall.
+Now ``stride_bt`` and ``num_splits`` are plain ints (``NO_SPECIALIZE``) and the merge
+kernel always pads to ``MAX_SPLITS``, so each kernel compiles once per dtype.
 """
 
 import torch
 import triton
 import triton.language as tl
 
+# Integer arguments whose value changes between steps: never specialize on them (above).
+NO_SPECIALIZE = ["stride_bt", "num_splits"]
 
-@triton.jit
+
+@triton.jit(do_not_specialize=NO_SPECIALIZE)
 def _paged_decode_kernel(
     q_ptr,  # [B, Hq, D]
     k_ptr,  # [num_slots, Hkv, D], one layer of the cache
@@ -106,7 +121,7 @@ def _paged_decode_kernel(
     tl.store(out_ptr + seq * stride_ob + head * stride_oh + d, out.to(out_ptr.dtype.element_ty))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=NO_SPECIALIZE)
 def _paged_decode_grouped_kernel(
     q_ptr,  # [B, Hq, D]
     k_ptr,  # [num_slots, Hkv, D], one layer of the cache
@@ -170,7 +185,7 @@ def _paged_decode_grouped_kernel(
     tl.store(out_ptr + o_off, out.to(out_ptr.dtype.element_ty))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=NO_SPECIALIZE)
 def _paged_decode_split_kernel(
     q_ptr,  # [B, Hq, D]
     k_ptr,  # [num_slots, Hkv, D]
@@ -186,13 +201,13 @@ def _paged_decode_split_kernel(
     stride_ks,
     stride_kh,
     stride_bt,
+    num_splits,  # a plain int since M10 (see the module docstring)
     NUM_Q_HEADS: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
     GROUP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """M9: the grouped kernel's loop over one of NUM_SPLITS contiguous ranges of the
+    """M9: the grouped kernel's loop over one of num_splits contiguous ranges of the
     sequence's blocks; the partial results go to m / l / acc, not to the output."""
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -211,7 +226,7 @@ def _paged_decode_split_kernel(
     acc = tl.zeros([GROUP, HEAD_DIM], tl.float32)
 
     num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
-    per_split = tl.cdiv(num_blocks, NUM_SPLITS)
+    per_split = tl.cdiv(num_blocks, num_splits)
     first = split * per_split
     last = tl.minimum(first + per_split, num_blocks)  # a range past the end is empty
     for j in range(first, last):
@@ -230,13 +245,13 @@ def _paged_decode_split_kernel(
         acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
         m = m_new
 
-    part = (seq * NUM_Q_HEADS + heads) * NUM_SPLITS + split  # [GROUP]
+    part = (seq * NUM_Q_HEADS + heads) * num_splits + split  # [GROUP]
     tl.store(m_ptr + part, m)
     tl.store(l_ptr + part, sum_exp)
     tl.store(acc_ptr + part[:, None] * HEAD_DIM + d[None, :], acc)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=NO_SPECIALIZE)
 def _merge_splits_kernel(
     m_ptr,  # [B, Hq, S]
     l_ptr,
@@ -244,21 +259,21 @@ def _merge_splits_kernel(
     out_ptr,  # [B, Hq, D]
     stride_ob,
     stride_oh,
+    num_splits,
     NUM_Q_HEADS: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
-    SPLITS_PAD: tl.constexpr,  # NUM_SPLITS rounded up to a power of 2
+    SPLITS_PAD: tl.constexpr,  # a power of 2 >= num_splits: MAX_SPLITS since M10
     HEAD_DIM: tl.constexpr,
 ):
-    """M9: merge one query head's NUM_SPLITS partials (see the module docstring).
+    """M9: merge one query head's num_splits partials (see the module docstring).
 
     An empty range has m = -inf and sum_exp = acc = 0, so its weight exp(m - m_max) is 0.
     The first range always holds the first block, so m_max is finite."""
     seq = tl.program_id(0)
     head = tl.program_id(1)
     sp = tl.arange(0, SPLITS_PAD)
-    ok = sp < NUM_SPLITS
+    ok = sp < num_splits
     d = tl.arange(0, HEAD_DIM)
-    part = (seq * NUM_Q_HEADS + head) * NUM_SPLITS + sp
+    part = (seq * NUM_Q_HEADS + head) * num_splits + sp
     m = tl.load(m_ptr + part, mask=ok, other=float("-inf"))
     l = tl.load(l_ptr + part, mask=ok, other=0.0)  # noqa: E741
     acc = tl.load(acc_ptr + part[:, None] * HEAD_DIM + d[None, :], mask=ok[:, None], other=0.0)
@@ -465,6 +480,8 @@ def launch_paged_decode_split(
     b, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     splits = num_splits or num_splits_for(b, num_kv_heads, block_tables.shape[1])
+    if not 1 <= splits <= MAX_SPLITS:
+        raise ValueError(f"num_splits must be 1..{MAX_SPLITS}, got {splits}")
     if splits == 1:
         return launch_paged_decode_grouped(
             q, k_cache, v_cache, block_tables, context_lens, scale, block_size
@@ -479,8 +496,8 @@ def launch_paged_decode_split(
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1),
         block_tables.stride(0),
+        splits,
         NUM_Q_HEADS=num_q_heads,
-        NUM_SPLITS=splits,
         GROUP=num_q_heads // num_kv_heads,
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
@@ -489,9 +506,9 @@ def launch_paged_decode_split(
     _merge_splits_kernel[(b, num_q_heads)](
         m, l, acc, out,
         out.stride(0), out.stride(1),
+        splits,
         NUM_Q_HEADS=num_q_heads,
-        NUM_SPLITS=splits,
-        SPLITS_PAD=triton.next_power_of_2(splits),
+        SPLITS_PAD=MAX_SPLITS,
         HEAD_DIM=head_dim,
     )  # fmt: skip
     return out

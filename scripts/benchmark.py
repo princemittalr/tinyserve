@@ -13,12 +13,20 @@ Usage:
     python scripts/benchmark.py --concurrency 1,4 --num-requests 8 --input-len 32 \\
         --output-len 16                                                # laptop smoke run
 Laptop CPU numbers only show that the harness works; they are not benchmark results.
+
+M10: after each level it prints which Triton kernels compiled a new variant during that
+run (a compile mid-run stalls one step), and ``--trace-steps`` prints the run's slowest
+step (the 3 slowest go to the JSON). A level may repeat (``--concurrency 1,8,8``): the
+second run shows whether a slow first one was a one-off. Both work against an older
+checkout too (PYTHONPATH=<old checkout>/src), which is how M10 compared the kernels
+before and after its change.
 """
 
 import argparse
 import datetime as dt
 import json
 import platform
+import sys
 from pathlib import Path
 
 import torch
@@ -36,6 +44,19 @@ def hardware(device: str) -> str:
     if device.startswith("cuda"):
         return f"{torch.cuda.get_device_name()}, CUDA {torch.version.cuda}"
     return f"{platform.system()} {platform.machine()} CPU"
+
+
+def triton_variants() -> dict[str, int]:
+    """Compiled variants this process holds for each TinyServe Triton kernel (M10).
+    Empty without Triton, and in its interpreter, which compiles nothing."""
+    counts = {}
+    for name in ("triton_attention", "triton_prefill", "triton_fused"):
+        module = sys.modules.get(f"tinyserve.{name}")
+        for attr, kernel in vars(module).items() if module else ():
+            caches = getattr(kernel, "device_caches", None)
+            if caches is not None:
+                counts[attr] = sum(len(c[0]) for c in caches.values())
+    return counts
 
 
 def main() -> None:
@@ -65,6 +86,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--fused-kernels", action="store_true",
                         help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
+    parser.add_argument("--trace-steps", action="store_true",
+                        help="time every step and print each run's slowest (M10)")  # fmt: skip
     args = parser.parse_args()
     dtype = getattr(torch, args.dtype or ("float16" if args.device != "cpu" else "float32"))
     levels = [int(c) for c in args.concurrency.split(",")]
@@ -84,6 +107,7 @@ def main() -> None:
     per_seq = -(-(args.input_len + args.output_len) // args.block_size)
     num_blocks = args.num_blocks or per_seq * max(levels)
     cache = KVCache(cfg, num_blocks, args.block_size, dtype, args.device)  # reused by every run
+    print(f"tinyserve from {Path(sys.modules['tinyserve'].__file__ or '').parent}")
     print(f"{hardware(args.device)}, {dtype}, {args.attention} decode attention, "
           f"KV cache {num_blocks} blocks x "
           f"{args.block_size} tokens = {cache.memory_bytes / 2**30:.2f} GiB")  # fmt: skip
@@ -97,14 +121,25 @@ def main() -> None:
 
     def engine(max_num_seqs: int) -> Engine:
         return Engine(model, cache, max_num_seqs, args.max_batch_tokens, decode_graphs=graphs,
-                      chunked_prefill=args.chunked_prefill)  # fmt: skip
+                      chunked_prefill=args.chunked_prefill,
+                      trace_steps=args.trace_steps)  # fmt: skip
 
     run_closed_loop(engine(2), prompts[:2], 4, concurrency=2)  # warm-up, not reported
     results = []
     for c in levels:
         n = num_requests_for(c, args.num_requests)
-        r = run_closed_loop(engine(c), prompts[:n], args.output_len, concurrency=c)
-        results.append(r.as_dict())
+        before = triton_variants()
+        e = engine(c)
+        r = run_closed_loop(e, prompts[:n], args.output_len, concurrency=c)
+        new = {k: v - before.get(k, 0) for k, v in triton_variants().items()}
+        new = {k: v for k, v in new.items() if v}
+        slowest = sorted(e.step_records or [], key=lambda x: x.total_ms, reverse=True)[:3]
+        results.append(r.as_dict() | {
+            "triton_variants_compiled": new,
+            "slowest_steps": [{"num_seqs": x.num_seqs, "num_prefill_seqs": x.num_prefill_seqs,
+                               "num_tokens": x.num_tokens, "forward_ms": x.forward_ms,
+                               "total_ms": x.total_ms, "graph": x.graph} for x in slowest],
+        })  # fmt: skip
         tpot = "-"
         if r.tpot_p50_ms is not None and r.tpot_p99_ms is not None:
             tpot = f"{r.tpot_p50_ms:.1f} / {r.tpot_p99_ms:.1f}"
@@ -113,6 +148,13 @@ def main() -> None:
               f"TPOT p50/p99 {tpot} ms | ITL p99/max {r.itl_p99_ms or 0:.0f} / "
               f"{r.itl_max_ms or 0:.0f} ms | KV util mean {r.kv_util_mean:.0%} "
               f"max {r.kv_util_max:.0%} | preemptions {r.preemptions}")  # fmt: skip
+        if before:  # Triton kernels in use and compiled (not the interpreter)
+            print("    compiled during this run: "
+                  + (", ".join(f"{k} +{v}" for k, v in new.items()) or "nothing"))  # fmt: skip
+        for x in slowest[:1]:  # all 3 are in the JSON
+            print(f"    slowest step: {x.total_ms:.0f} ms ({x.forward_ms:.0f} forward), "
+                  f"{x.num_seqs} seqs, {x.num_prefill_seqs} prefilling, {x.num_tokens} "
+                  f"tokens{', graph' if x.graph else ''}")  # fmt: skip
 
     report = {
         "date": dt.date.today().isoformat(),

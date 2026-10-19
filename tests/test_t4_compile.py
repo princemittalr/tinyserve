@@ -21,3 +21,4 @@ def test_every_kernel_compiles_for_the_t4_without_large_spills() -> None:
     r = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stdout + r.stderr
     assert r.stdout.count(" ok: ") == 14
+    assert r.stdout.count(" one variant") == 7  # nothing specializes on a per-step value

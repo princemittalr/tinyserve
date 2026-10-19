@@ -8,7 +8,8 @@ to PTX, and the ptxas Triton ships with reports each kernel's registers and spil
 For each kernel, at Qwen3-0.6B's shapes and the launch options its wrapper uses, in
 float16 and float32, this prints registers, bytes spilled to local memory and the
 number of tensor-core (mma) instructions, and fails on a compile error or a spill of
-more than ``MAX_SPILL`` bytes.
+more than ``MAX_SPILL`` bytes. It also fails if a kernel specializes on an argument that
+changes from step to step (``PER_STEP``, M10).
 What it found on the T4 (M9 step 8): Triton emits no tensor-core instructions for
 sm_75 (``tl.dot`` becomes FMA loops), and the prefill kernel's first tiles spilled
 about 10 KB per thread, which is why it ran ~6x slower than batched SDPA. A small spill
@@ -55,10 +56,10 @@ def specs(dt: str) -> list[tuple[str, Any, dict[str, str], dict[str, Any], int]]
         ("decode (M4)", ta._paged_decode_kernel, decode, group, 4),
         ("decode grouped (M8)", ta._paged_decode_grouped_kernel, decode, group, 4),
         ("decode split (M9)", ta._paged_decode_split_kernel, split,
-         {"NUM_Q_HEADS": HQ, "NUM_SPLITS": 8, **group}, 4),
+         {"NUM_Q_HEADS": HQ, **group}, 4),
         ("merge splits (M9)", ta._merge_splits_kernel,
          {"m_ptr": "*fp32", "l_ptr": "*fp32", "acc_ptr": "*fp32", "out_ptr": p},
-         {"NUM_Q_HEADS": HQ, "NUM_SPLITS": 8, "SPLITS_PAD": 8, "HEAD_DIM": D}, 4),
+         {"NUM_Q_HEADS": HQ, "SPLITS_PAD": ta.MAX_SPLITS, "HEAD_DIM": D}, 4),
         ("prefill (M9)", tp._paged_prefill_kernel,
          {**decode, "q_starts_ptr": "*i32", "q_lens_ptr": "*i32"},
          {**group, "HEAD_DIM_PAD": D, "BLOCK_M": rows // (HQ // HKV), "BLOCK_N": block_n,
@@ -94,8 +95,24 @@ def check(kernel: Any, types: dict[str, str], constexprs: dict[str, Any], warps:
     return line
 
 
+# Kernel arguments whose value changes from step to step (M10): listed here, not taken
+# from the kernels' own NO_SPECIALIZE, so that dropping one there fails this check.
+PER_STEP = ("stride_bt", "num_splits")
+
+
+def specialized_per_step(kernel: Any) -> list[str]:
+    """Per-step arguments of ``kernel`` that Triton still specializes on (each new value
+    compiled a new variant mid-run). Empty when all is well."""
+    return [p.name for p in kernel.params
+            if p.name in PER_STEP and not p.do_not_specialize]  # fmt: skip
+
+
 def main() -> None:
     failed = 0
+    for name, kernel, *_ in specs("fp16"):
+        bad = specialized_per_step(kernel)
+        failed += bool(bad)
+        print(f"{name:<29} {'FAILED: specializes on ' + ', '.join(bad) if bad else 'one variant'}")
     for dt in ("fp16", "fp32"):
         for name, kernel, types, constexprs, warps in specs(dt):
             try:

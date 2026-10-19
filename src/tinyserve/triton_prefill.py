@@ -37,6 +37,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tinyserve.triton_attention import NO_SPECIALIZE
+
 # (rows_per_tile, block_n, num_warps). On the T4 Triton turns tl.dot into FMA loops (no
 # tensor cores before sm_80), and every value of a tile lives in registers: M9 step 3's
 # (64, 32, 4) spilled ~10 KB per thread to local memory and ran ~6x slower than batched
@@ -45,7 +47,7 @@ import triton.language as tl
 DEFAULT_TILE = (64, 32, 8)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=NO_SPECIALIZE)  # stride_bt: see triton_attention.py
 def _paged_prefill_kernel(
     q_ptr,  # [T, Hq, D]: the whole batch's queries
     k_ptr,  # [num_slots, Hkv, D], one layer of the cache
