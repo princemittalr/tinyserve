@@ -19,6 +19,14 @@ can be the right trade: the fastest prefill tile on the T4 spills 936 bytes (ste
 Triton would emit where it has tensor cores; the spill limit applies to the T4 only.
 Compiling is all it shows: nothing here ran on such a GPU.
 
+M11: a launch tells Triton which pointers and integer arguments are multiples of 16, and
+it vectorizes loads only where it knows that. Before M11 this compiled with no such
+hints, so its loads and registers were not those of the engine's launches (the 1x4
+decode tile: 128 registers here without hints, 94 with). Now every pointer and every
+``stride_*`` argument not in ``PER_STEP`` is marked divisible by 16, as it is at
+Qwen3-0.6B's shapes (torch allocations are 256-byte aligned; every stride is a multiple
+of 128 elements).
+
 Usage:
     python scripts/check_t4_compile.py          # exit code 1 if any kernel fails
     python scripts/check_t4_compile.py --arch 80
@@ -86,8 +94,11 @@ def check(kernel: Any, types: dict[str, str], constexprs: dict[str, Any], warps:
     T4 (sm_75) on a spill over ``MAX_SPILL``."""
     sig = {a: "constexpr" if a in constexprs else types.get(a, "i32") for a in kernel.arg_names}
     target = GPUTarget("cuda", arch, 32)
-    k = triton.compile(ASTSource(kernel, sig, constexprs=constexprs), target=target,
-                       options={"num_warps": warps})  # fmt: skip
+    hints = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(kernel.arg_names)
+             if a not in constexprs and a not in PER_STEP
+             and (a.endswith("_ptr") or a.startswith("stride_"))}  # fmt: skip
+    k = triton.compile(ASTSource(kernel, sig, constexprs=constexprs, attrs=hints),
+                       target=target, options={"num_warps": warps})  # fmt: skip
     ptx = k.asm["ptx"]
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "k.ptx")
@@ -99,10 +110,19 @@ def check(kernel: Any, types: dict[str, str], constexprs: dict[str, Any], warps:
     spills = re.search(r"(\d+) bytes spill stores", report)
     if regs is None or spills is None:
         raise RuntimeError(f"unexpected ptxas output: {report}")
-    line = f"{regs[1]:>3} registers, {spills[1]:>5} bytes spilled, {ptx.count('mma.sync')} mma"
+    fit = programs_per_sm(int(regs[1]), warps)
+    line = (f"{regs[1]:>3} registers, {spills[1]:>5} bytes spilled, "
+            f"{ptx.count('mma.sync')} mma, {fit:>2} programs/SM")  # fmt: skip
     if arch == 75 and int(spills[1]) > MAX_SPILL:
         raise RuntimeError(line)
     return line
+
+
+def programs_per_sm(registers: int, warps: int) -> int:
+    """Programs of ``warps`` warps that fit on one sm_75 SM by registers (M11): 64 K
+    registers, allocated per warp in units of 256; at most 32 warps and 16 programs."""
+    per_warp = -(-registers * 32 // 256) * 256
+    return min(16, 32 // warps, 65536 // per_warp // warps)
 
 
 # Kernel arguments whose value changes from step to step (M10): listed here, not taken
@@ -140,8 +160,8 @@ def main() -> None:
 
 
 # The tiles scripts/bench_decode_tile.py times (M11), and those it skips because they spill.
-TILES = ((1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (2, 8), (4, 2), (4, 4), (4, 8), (8, 2),
-         (8, 4), (8, 8))  # fmt: skip
+TILES = ((1, 1), (1, 2), (1, 4), (1, 8), (2, 1), (2, 2), (2, 4), (2, 8), (4, 1), (4, 2),
+         (4, 4), (4, 8), (8, 2), (8, 4), (8, 8))  # fmt: skip
 
 
 def print_tiles() -> None:

@@ -27,7 +27,9 @@ pytest.importorskip("triton", reason="Triton is not installed (no Windows wheels
 
 from tinyserve.attention import paged_decode_attention_ref, paged_gqa_attention
 from tinyserve.triton_attention import (
+    DECODE_TILE,
     MAX_SPLITS,
+    check_tile,
     launch_paged_decode_grouped,
     launch_paged_decode_split,
     num_splits_for,
@@ -277,6 +279,17 @@ def test_every_tile_gives_the_same_result(
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
     grouped = launch_paged_decode_grouped(*c.args(), c.scale, c.block_size, tile)
     torch.testing.assert_close(grouped, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_default_tile_matches_m10s_launch() -> None:
+    # DECODE_TILE changed from (1, 4) to (1, 2) in M11 step 2: one block per iteration
+    # either way, so the same sums in the same order; only the warps differ.
+    assert check_tile(DECODE_TILE) == DECODE_TILE
+    c = make_case([17, 300, 33], 4, 2, head_dim=32, block_size=4, seed=7)
+    for splits in (1, 3):
+        old = launch_paged_decode_split(*c.args(), c.scale, c.block_size, splits, (1, 4))
+        new = launch_paged_decode_split(*c.args(), c.scale, c.block_size, splits)
+        torch.testing.assert_close(new, old, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize("tile", [(3, 4), (2, 3), (0, 4)])

@@ -20,6 +20,10 @@ step (the 3 slowest go to the JSON). A level may repeat (``--concurrency 1,8,8``
 second run shows whether a slow first one was a one-off. Both work against an older
 checkout too (PYTHONPATH=<old checkout>/src), which is how M10 compared the kernels
 before and after its change.
+
+M11: ``--decode-tile 1x4`` runs the Triton decode kernels at another tile (cache blocks
+per loop iteration x warps) than ``triton_attention.DECODE_TILE``, so tiles can be
+compared end to end in one session with the same code.
 """
 
 import argparse
@@ -88,7 +92,14 @@ def main() -> None:
                         help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
     parser.add_argument("--trace-steps", action="store_true",
                         help="time every step and print each run's slowest (M10)")  # fmt: skip
+    parser.add_argument("--decode-tile", default=None,
+                        help="blocks x warps of the decode kernels, e.g. 1x4 (M11)")  # fmt: skip
     args = parser.parse_args()
+    if args.decode_tile:  # read by every launch, so set before any graph is captured
+        import tinyserve.triton_attention as ta
+
+        blocks, warps = (int(x) for x in args.decode_tile.split("x"))
+        ta.DECODE_TILE = ta.check_tile((blocks, warps))
     dtype = getattr(torch, args.dtype or ("float16" if args.device != "cpu" else "float32"))
     levels = [int(c) for c in args.concurrency.split(",")]
     milestone = "m4" if args.attention != "torch" else "m3"
@@ -108,7 +119,8 @@ def main() -> None:
     num_blocks = args.num_blocks or per_seq * max(levels)
     cache = KVCache(cfg, num_blocks, args.block_size, dtype, args.device)  # reused by every run
     print(f"tinyserve from {Path(sys.modules['tinyserve'].__file__ or '').parent}")
-    print(f"{hardware(args.device)}, {dtype}, {args.attention} decode attention, "
+    tile = f" (tile {args.decode_tile})" if args.decode_tile else ""
+    print(f"{hardware(args.device)}, {dtype}, {args.attention} decode attention{tile}, "
           f"KV cache {num_blocks} blocks x "
           f"{args.block_size} tokens = {cache.memory_bytes / 2**30:.2f} GiB")  # fmt: skip
 

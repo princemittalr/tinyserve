@@ -62,8 +62,11 @@ import triton.language as tl
 NO_SPECIALIZE = ["stride_bt", "num_splits"]
 
 # (cache blocks per loop iteration, warps per program) for the grouped and split kernels
-# (M11). (1, 4) is the loop and launch M8-M10 measured.
-DECODE_TILE = (1, 4)
+# (M11). M8-M10 ran (1, 4). M11 run 1 on the T4 (scripts/bench_decode_tile.py, one layer,
+# fp16, median of 3 rounds): (1, 2) was the fastest or within 1% of it at every batch from
+# 8 to 64, e.g. batch 32 with 160 tokens 0.119 vs 0.188 ms (1.58x) and batch 64 0.276 vs
+# 0.367 ms; more blocks per iteration was slower at every batch above 1.
+DECODE_TILE = (1, 2)
 
 
 @triton.jit(do_not_specialize=NO_SPECIALIZE)

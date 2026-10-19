@@ -13,7 +13,8 @@ Two things are measured here, in one process:
    point of M10's sweep varied by up to ~25% between sessions. Each tile's output is
    compared with 1x4's on the same inputs.
 
-The tiles skip those ptxas spills heavily on sm_75 (4x2, 8x2, 8x4: check_t4_compile.py).
+The tiles skip those ptxas spills heavily on sm_75 (4x1, 4x2, 8x2, 8x4: check_t4_compile.py).
+M11 step 2 added 1x1 and 2x1 after run 1 found 1x2 fastest.
 
 Usage (T4): python scripts/bench_decode_tile.py
 """
@@ -89,7 +90,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batches", default="1,8,16,32,64")
     parser.add_argument("--contexts", default="160,1024")
-    parser.add_argument("--tiles", default="1x4,1x2,1x8,2x2,2x4,2x8,4x4,4x8,8x8")
+    parser.add_argument("--tiles", default="1x4,1x1,1x2,1x8,2x1,2x2,2x4,2x8,4x4,4x8,8x8")
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--iters", type=int, default=100)
