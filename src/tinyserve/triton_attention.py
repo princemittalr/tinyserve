@@ -62,11 +62,15 @@ import triton.language as tl
 NO_SPECIALIZE = ["stride_bt", "num_splits"]
 
 # (cache blocks per loop iteration, warps per program) for the grouped and split kernels
-# (M11). M8-M10 ran (1, 4). M11 run 1 on the T4 (scripts/bench_decode_tile.py, one layer,
-# fp16, median of 3 rounds): (1, 2) was the fastest or within 1% of it at every batch from
-# 8 to 64, e.g. batch 32 with 160 tokens 0.119 vs 0.188 ms (1.58x) and batch 64 0.276 vs
-# 0.367 ms; more blocks per iteration was slower at every batch above 1.
-DECODE_TILE = (1, 2)
+# (M11). M8-M10 ran (1, 4). On the T4 more blocks per iteration was slower at every batch
+# above 1, and fewer warps faster (scripts/bench_decode_tile.py, one layer, fp16): run 1
+# found (1, 2) 1.33-1.58x faster than (1, 4) at batches 32-64; run 2 found (1, 1) faster
+# still, 2.0-2.45x faster than (1, 4) at batches 8-64 with 1,024 tokens and 32-64 with 160,
+# and the M3 benchmark at C=32 2,087.6 / 2,094.0 tok/s with (1, 1) against 1,901.7 /
+# 1,898.4 with (1, 2) and 1,631.0 / 1,646.8 with (1, 4). Inferred from registers (no
+# counters on Kaggle): one warp per program lets 15 programs share an SM (6 at (1, 4)), so
+# a decode launch of up to 600 programs runs in one wave on the T4's 40 SMs.
+DECODE_TILE = (1, 1)
 
 
 @triton.jit(do_not_specialize=NO_SPECIALIZE)

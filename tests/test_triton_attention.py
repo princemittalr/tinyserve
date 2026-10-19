@@ -282,8 +282,8 @@ def test_every_tile_gives_the_same_result(
 
 
 def test_default_tile_matches_m10s_launch() -> None:
-    # DECODE_TILE changed from (1, 4) to (1, 2) in M11 step 2: one block per iteration
-    # either way, so the same sums in the same order; only the warps differ.
+    # DECODE_TILE changed from (1, 4) to (1, 2) in M11 step 2 and to (1, 1) in step 3: one
+    # block per iteration each time, so the same math; only the warps differ.
     assert check_tile(DECODE_TILE) == DECODE_TILE
     c = make_case([17, 300, 33], 4, 2, head_dim=32, block_size=4, seed=7)
     for splits in (1, 3):
