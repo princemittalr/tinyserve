@@ -177,10 +177,10 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
         print(f"GEMMs: {gemm_ms:.1f} ms/step for {w_bytes / 1e9:.2f} GB of weights = "
               f"{w_bytes / gemm_ms / 1e6:.0f} GB/s (T4 spec {T4.mem_gbps:.0f})")  # fmt: skip
     if attn_ms:
+        how = "one program per query head" if group > 1 else "one program per kv head"
         print(f"decode kernel: {attn_ms:.1f} ms/step for {kv_min / 1e9:.3f} GB of k/v = "
               f"{kv_min / attn_ms / 1e6:.0f} GB/s counting each k/v once; it loads each "
-              f"{group}x (one program per query head), {group * kv_min / attn_ms / 1e6:.0f} "
-              f"GB/s as issued")  # fmt: skip
+              f"{group}x ({how}), {group * kv_min / attn_ms / 1e6:.0f} GB/s as issued")  # fmt: skip
     sort = "self_device_time_total" if dev.type == "cuda" else "self_cpu_time_total"
     table = prof.key_averages().table(sort_by=sort, row_limit=15)
     print(table)

@@ -1,6 +1,8 @@
 """Serve Qwen3-0.6B over an OpenAI-compatible HTTP API (M6).
 
 Usage: python scripts/serve.py [--device cuda --attention triton --prefix-cache]
+       python scripts/serve.py --device cuda --attention triton_grouped --cuda-graphs \\
+           --prefill-attention batched        (the fastest M8 configuration)
    or: python -m tinyserve.server [...]       (what tinyserve.client starts)
 
     curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \\
@@ -22,6 +24,7 @@ from tokenizers import Tokenizer
 
 from tinyserve.api import Limits, create_app, is_loopback
 from tinyserve.config import ModelConfig
+from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import DECODE_ATTENTIONS, Qwen3
@@ -63,6 +66,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
+                        help="per sequence, or one call per layer (M8)")  # fmt: skip
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="replay CUDA graphs for decode steps (M8; needs a triton "
+                             "attention)")  # fmt: skip
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--kv-gib", type=float, default=2.0, help="KV cache size")
     parser.add_argument("--block-size", type=int, default=16)
@@ -80,6 +88,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="profiling: how often Python offers the GIL to another "
                              "thread (default 5 ms)")  # fmt: skip
     args = parser.parse_args(argv)
+    if args.cuda_graphs and args.attention == "torch":
+        parser.error("--cuda-graphs needs --attention triton or triton_grouped")
 
     if not is_loopback(args.host) and not args.allow_remote:
         sys.exit(f"refusing to bind to {args.host}: the API has no authentication. "
@@ -89,20 +99,31 @@ def main(argv: list[str] | None = None) -> None:
         sys.setswitchinterval(args.switch_interval_ms / 1e3)
     dtype = getattr(torch, args.dtype or ("float32" if args.device == "cpu" else "float16"))
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
-    model = Qwen3(cfg, load_weights(args.model_dir, cfg, dtype, args.device), args.attention)
+    weights = load_weights(args.model_dir, cfg, dtype, args.device)
+    model = Qwen3(cfg, weights, args.attention, prefill_attention=args.prefill_attention)
     elem = torch.empty((), dtype=dtype).element_size()
     per_block = 2 * cfg.num_layers * args.block_size * cfg.num_kv_heads * cfg.head_dim * elem
     num_blocks = int(args.kv_gib * 2**30 // per_block)
     cache = KVCache(cfg, num_blocks, args.block_size, dtype, args.device)
+    # Captured before serving starts, for batches up to --max-num-seqs.
+    graphs = DecodeGraphs(model, cache, args.max_num_seqs) if args.cuda_graphs else None
     engine = Engine(model, cache, args.max_num_seqs, args.max_batch_tokens,
                     prefix_cache=args.prefix_cache, seed=args.seed,
-                    trace_steps=args.trace_requests)  # fmt: skip
+                    trace_steps=args.trace_requests, decode_graphs=graphs)  # fmt: skip
     limits = Limits(max_prompt_tokens=args.max_prompt_tokens, max_tokens_cap=args.max_tokens_cap)
     tok = QwenTokenizer(args.model_dir / "tokenizer.json")
     ae = AsyncEngine(engine, max_requests=args.max_requests, trace=args.trace_requests)
     eos = frozenset() if args.ignore_eos else eos_ids(args.model_dir)
     app = create_app(ae, tok, args.model_dir.name, cfg.vocab_size, eos, limits)
-    print(f"{args.device} {dtype}, {args.attention} decode attention, prefix cache "
+    graph_note = "off"
+    if graphs is not None:
+        graph_note = (
+            f"buckets up to {graphs.max_batch}, captured in {graphs.capture_seconds:.1f} s"
+            if graphs.graphs
+            else "eager (no CUDA)"
+        )
+    print(f"{args.device} {dtype}, {args.attention} decode attention, "
+          f"{args.prefill_attention} prefill attention, CUDA graphs {graph_note}, prefix cache "
           f"{'on' if args.prefix_cache else 'off'}, KV cache {num_blocks} blocks x "
           f"{args.block_size} tokens ({cache.memory_bytes / 2**30:.2f} GiB)"
           f"{', EOS ignored' if args.ignore_eos else ''}"

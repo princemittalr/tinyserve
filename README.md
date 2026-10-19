@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M7 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with a paged KV cache, continuous batching, a radix prefix cache and a Triton decode kernel. On a T4 it delivers 766 tok/s at 32 concurrent sequences (1.84x HF `generate()`, 69% of vLLM 0.32 on the same workload) and 1,206 tok/s at 64 (2.67x HF, 87% of vLLM). The 3x-HF target at 32 is not met; vLLM itself reaches 2.65x there. Profiling shows the decode step is launch-bound (the GPU is busy about half of each step). [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, and the comparison. See [PROGRESS.md](PROGRESS.md).
+> Status: **M8 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with a paged KV cache, continuous batching, a radix prefix cache, Triton decode kernels, CUDA graphs for decode steps and batched prefill attention. On a T4 the engine delivers 1,344 tok/s at 32 concurrent sequences (3.23x HF `generate()`; M7 was 766, 1.84x) and 1,754 tok/s at 64 (3.89x HF). vLLM 0.32, measured in another session, is still faster at 1 and 8 sequences. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8 changed, and the comparison. See [PROGRESS.md](PROGRESS.md).
 
 ## Features
 
@@ -11,8 +11,10 @@ Target model: Qwen3-0.6B. Written to be read and understood, not to compete with
 2. Paged KV cache with a block allocator
 3. Continuous-batching scheduler with preemption
 4. Radix-tree prefix cache with LRU eviction
-5. Custom Triton paged decode-attention kernel
-6. Batched sampling and an OpenAI-compatible streaming endpoint
+5. Custom Triton paged decode-attention kernels (one per query head, and one that shares each
+   k/v load across a GQA head group)
+6. CUDA graphs for decode steps (one per batch-size bucket) and batched prefill attention
+7. Batched sampling and an OpenAI-compatible streaming endpoint
 
 ## Quickstart (development)
 
@@ -26,12 +28,14 @@ ruff check . && ruff format --check . && mypy && pytest
 ## Serving (OpenAI-compatible)
 
 ```bash
-python scripts/serve.py --device cuda --attention triton --prefix-cache   # 127.0.0.1:8000
+python scripts/serve.py --device cuda --attention triton_grouped --cuda-graphs \
+  --prefill-attention batched --prefix-cache                               # 127.0.0.1:8000
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hi"}], "stream": true, "temperature": 0}'
 ```
 
-Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. Endpoints: `/v1/completions`,
+`--cuda-graphs` captures the decode graphs (a few seconds, ~220 MiB on a T4) before the server
+starts listening. Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. Endpoints: `/v1/completions`,
 `/v1/chat/completions` (both with `"stream": true`), `/v1/models`, `/health`. Requests are
 limited in body size, prompt length, `max_tokens` and requests in flight (413 / 400 / 429).
 
@@ -105,7 +109,30 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   Raw data: `results/m6_api_bench_cuda.json`, `results/m6_engine_bench_cuda.json`,
   `results/m6_api_hf_compare_float32_cuda.json`.
 
-- Where a decode step's time goes (2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
+- M8: CUDA graphs, batched prefill, grouped decode kernel (2026-10-18/19, Kaggle T4, fp16, the M3
+  workload above, `scripts/benchmark.py`). Each column adds one change, and each change was
+  measured against the configuration before it in one session (three sessions in all):
+
+  | Concurrency | M4 kernel, eager | + CUDA graphs | + batched prefill | + grouped kernel | HF `generate()` | final / HF |
+  |---|---|---|---|---|---|---|
+  | 1 | 30.4 | 87.4 | 87.5 | 84.3 | 25.2 | 3.35x |
+  | 8 | 231.2 | 545.8 | 548.8 | 571.0 | 193.3 | 2.95x |
+  | 32 | 763.0 | 1,142.3 | 1,206.5 | 1,343.8 | 415.6 | 3.23x |
+  | 64 | 1,213.9 | 1,419.8 | 1,493.8 | 1,753.7 | 451.3 | 3.89x |
+
+  The same-session pairs are 763.0 / 1,142.3 (graphs), 1,148.0 / 1,206.5 (batched prefill) and
+  1,213.8 / 1,343.8 (grouped kernel) at C=32. The same configuration differs by up to ~6% between
+  sessions, so read each gain from its pair, not from neighbouring columns. With all three at
+  C=32: TTFT p50 / p99 233 / 465 ms, TPOT 22.1 / 23.5 ms (M7: 39.5 ms). The grouped kernel is
+  2.7% slower at C=1 (inferred cause: 8 programs on 40 SMs at batch 1). fp32 greedy with all
+  three on: 0 mismatches / 1,920 tokens vs HF; fp16: 7 divergences, all near-ties (HF top-2
+  margin <= 0.0156). A graph replay equals the eager pass bit for bit (GPU test). Step trace at
+  C=32: a decode step takes 20.0 ms, the GPU is busy 89% of it, and the roofline floor is 31% of
+  the forward's time (M7: 17%). The JSON files of these runs stayed on Kaggle; the numbers in
+  PROGRESS.md are transcribed from the printed output, except
+  `results/m8_engine_profile_cuda.json` (step 3).
+
+- Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
   `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
   at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
   320 GB/s) is 3.8 / 4.3 / 5.9 / 8.1 ms. At C=32 the GPU runs kernels for 16.7 ms of a 34.2 ms
@@ -114,7 +141,7 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   spec), the decode kernel 89 GB/s (it loads each k/v twice). Raw data:
   `results/m7_engine_profile_cuda.json`, `results/m7_prefix_steps_cuda.json`.
 
-- Comparison with HF `generate()` and vLLM (2026-10-18, Kaggle T4, fp16, the M3 workload: the
+- Comparison with HF `generate()` and vLLM (M7, before M8; 2026-10-18, Kaggle T4, fp16, the M3 workload: the
   same seeded 128-token random prompts, 128 greedy output tokens, EOS ignored; closed loop at
   C, HF in static batches of C; output tok/s; `scripts/bench_vllm.py`):
 
@@ -131,6 +158,10 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   different Kaggle sessions, vLLM on torch 2.13.0+cu130 and the rest on 2.11.0+cu128. Raw data:
   `results/m7_vllm_bench_cuda.json`, `results/m3_bench_hf_cuda.json`,
   `results/m6_engine_bench_cuda.json`, `results/m6_api_bench_cuda.json`.
+  After M8 the engine reaches 59% / 84% / 122% / 127% of vLLM 0.32 at C = 1 / 8 / 32 / 64. The
+  runs were in different sessions on different torch versions, and vLLM ran with default
+  settings, so read this as "on par or ahead at 32 and 64 on this workload", not as a general
+  claim. [docs/WRITEUP.md](docs/WRITEUP.md#6-what-m8-changed) has the caveats.
 
 ## How it's tested
 
@@ -180,6 +211,18 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - The roofline model's byte counts are checked against the real checkpoint's 596,049,920
   parameters and against every tensor of the tiny test checkpoint; the engine's step trace must
   not change any output.
+- Both decode kernels run every kernel test against the same PyTorch reference, and a
+  non-power-of-2 head group is rejected.
+- CUDA graphs (M8): the padded fixed-shape decode step equals `forward_batch` and writes only the
+  new tokens' slots and the padding block; padding rows never change real rows; on the GPU a
+  graph replay equals the eager pass bit for bit, capture touches only the padding block, and the
+  step runs with `torch.cuda.set_sync_debug_mode("error")`. The engine takes the graph path
+  exactly on pure-decode steps, falls back past the largest bucket or block-table width, and
+  matches M1 greedy with preemptions and the prefix cache.
+- Batched prefill attention equals the per-sequence path for plain prompts, prefix-cache hits
+  and one-token sequences, and the engine with it matches M1 greedy.
+- The server is run end to end with the grouped kernel, graphs and batched prefill on the tiny
+  checkpoint: same greedy text as the offline engine, and its trace shows graph steps.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -194,12 +237,18 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   Chat content must be plain text; the chat template turns Qwen3's thinking off.
 - Sampling supports temperature and top-p only (no top-k, repetition penalties or logprobs).
   Requests without a seed are reproducible per run, not per request.
-- The Triton kernel covers decode only. Prefill attention still runs one sequence at a time in
-  PyTorch and copies that sequence's keys and values out of the cache first.
-- The kernel runs one program per (sequence, query head), so the two query heads of a GQA group
-  each load the same keys and values; no split-K over long contexts. Tuned only for the T4.
+- The Triton kernels cover decode only. Batched prefill attention is one PyTorch SDPA call per
+  layer over keys and values gathered out of the cache into a padded tensor, in fp32; it is
+  off by default (`--prefill-attention batched`).
+- The grouped decode kernel needs a power-of-2 head group and is slower than the M4 kernel at
+  batch 1 (fewer programs); neither kernel splits long contexts across programs (no split-K).
+  Tuned only for the T4.
 - Triton has no Windows wheels: on Windows the kernel tests skip and the PyTorch path is used.
-- The decode step is still launch-bound (Python launches every small kernel); no CUDA graphs yet.
+- CUDA graphs cover pure decode steps only, up to `--max-num-seqs` sequences and a fixed
+  block-table width; prefill and mixed steps run eagerly (a C=32 prefill step is ~175 ms).
+  Graphs are off by default and need a Triton kernel. The graphs replay but do not fuse the
+  small norm, RoPE and copy kernels (~5.7 ms of a 17 ms C=32 step on the GPU).
+- The HTTP benchmarks (M6, M7) predate M8 and have not been re-run with graphs.
 - Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
   one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
   decodes to empty text gets only at its end.

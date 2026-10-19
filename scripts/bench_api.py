@@ -11,6 +11,8 @@ The client runs on the same machine as the server and shares its CPU cores, so i
 parsing work is part of the measured cost.
 
 Usage: python scripts/bench_api.py --device cuda --attention triton
+       python scripts/bench_api.py --device cuda --attention triton_grouped --cuda-graphs \
+           --prefill-attention batched        (M8; results/m8_api_bench_<device>.json)
 """
 
 import argparse
@@ -51,6 +53,8 @@ def main() -> None:
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq")
+    parser.add_argument("--cuda-graphs", action="store_true")
     parser.add_argument("--concurrency", default="1,8,32,64")
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--input-len", type=int, default=128)
@@ -61,7 +65,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     levels = [int(c) for c in args.concurrency.split(",")]
-    out = args.out or Path(f"results/m6_api_bench_{args.device.split(':')[0]}.json")
+    milestone = "m8" if args.cuda_graphs else "m6"
+    out = args.out or Path(f"results/{milestone}_api_bench_{args.device.split(':')[0]}.json")
 
     cfg = ModelConfig.from_file(args.model_dir / "config.json")
     most = max(num_requests_for(c, args.num_requests) for c in levels)
@@ -70,7 +75,8 @@ def main() -> None:
         "--model-dir", str(args.model_dir), "--device", args.device,
         "--attention", args.attention, "--kv-gib", str(args.kv_gib),
         "--max-num-seqs", str(max(levels)), "--ignore-eos",
-    ]  # fmt: skip
+        "--prefill-attention", args.prefill_attention,
+    ] + (["--cuda-graphs"] if args.cuda_graphs else [])  # fmt: skip
 
     rows = []
     with running_server(serve_args, args.port) as url:
@@ -98,6 +104,8 @@ def main() -> None:
         "torch": torch.__version__,
         "dtype": "float16" if args.device != "cpu" else "float32",
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
+        "cuda_graphs": args.cuda_graphs,
         "transport": "HTTP /v1/completions, SSE stream, token-id prompts, EOS ignored",
         "args": {k: str(v) for k, v in vars(args).items()},
         "results": rows,

@@ -83,12 +83,15 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["float32", "float16"], default="float32")
     parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
+    parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq")
+    parser.add_argument("--cuda-graphs", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     dev = args.device.split(":")[0]
-    out = args.out or Path(f"results/m6_api_hf_compare_{args.dtype}_{dev}.json")
+    milestone = "m8" if args.cuda_graphs else "m6"
+    out = args.out or Path(f"results/{milestone}_api_hf_compare_{args.dtype}_{dev}.json")
 
     template_diffs = check_chat_template(args.model_dir)
 
@@ -99,7 +102,9 @@ def main() -> None:
     serve_args = [
         "--model-dir", str(args.model_dir), "--device", args.device, "--dtype", args.dtype,
         "--attention", args.attention, "--kv-gib", "2", "--max-num-seqs", "64",
-    ] + (["--prefix-cache"] if args.prefix_cache else [])  # fmt: skip
+        "--prefill-attention", args.prefill_attention,
+    ] + (["--prefix-cache"] if args.prefix_cache else []) + (
+        ["--cuda-graphs"] if args.cuda_graphs else [])  # fmt: skip
     with running_server(serve_args, args.port) as url:
         api = asyncio.run(ask_all(url, prompts, args.max_new_tokens))
 
@@ -127,6 +132,8 @@ def main() -> None:
         "torch": torch.__version__,
         "dtype": args.dtype,
         "attention": args.attention,
+        "prefill_attention": args.prefill_attention,
+        "cuda_graphs": args.cuda_graphs,
         "prefix_cache": args.prefix_cache,
         "transport": "HTTP /v1/completions, token-id prompts, half SSE half plain, all at once",
         "prompts": len(rows),

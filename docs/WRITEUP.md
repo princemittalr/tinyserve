@@ -1,7 +1,7 @@
-# TinyServe on a T4: where the time goes (M7)
+# TinyServe on a T4: where the time goes (M7, M8)
 
-Every number below comes from a logged run on a Kaggle Tesla T4 (2026-10-18), fp16,
-Qwen3-0.6B. Raw data is in `results/`; each table names its file. Anything not measured is
+Every number below comes from a logged run on a Kaggle Tesla T4 (2026-10-18 and 2026-10-19),
+fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed. Raw data is in `results/`; each table names its file. Anything not measured is
 marked *inferred* or *projected*.
 
 ## 1. The roofline: the fastest a decode step could run
@@ -106,7 +106,9 @@ What the comparison does and does not show:
 Sources: `results/m3_bench_hf_cuda.json`, `results/m6_engine_bench_cuda.json`,
 `results/m6_api_bench_cuda.json`, `results/m7_vllm_bench_cuda.json`.
 
-## 5. What would close the gap (projected, not measured)
+## 5. What would close the gap (projected in M7, not measured then)
+
+M8 built items 1, 3 and 4; section 6 has what they measured.
 
 1. **CUDA graphs for the decode step.** With the forward at its 16.7 ms of kernel time, a C=32
    step would be ~20 ms, about 1,600 tok/s. vLLM's own graphs-vs-eager gap (1.35x) is the
@@ -117,6 +119,69 @@ Sources: `results/m3_bench_hf_cuda.json`, `results/m6_engine_bench_cuda.json`,
    median TTFT, and it shortens the steps that requests wait behind.
 4. **GQA sharing in the decode kernel.** One k/v load per head group halves its traffic.
 
+## 6. What M8 changed
+
+M8 added three things, each measured against the configuration before it in one session
+(M3 workload, Kaggle T4, fp16; `scripts/benchmark.py`; output tok/s):
+
+| C | M4 kernel, eager | + CUDA graphs | + batched prefill | + grouped kernel | final / HF | final / vLLM 0.32 |
+|---|---|---|---|---|---|---|
+| 1 | 30.4 | 87.4 | 87.5 | 84.3 | 3.35x | 59% |
+| 8 | 231.2 | 545.8 | 548.8 | 571.0 | 2.95x | 84% |
+| 32 | 763.0 | 1,142.3 | 1,206.5 | 1,343.8 | 3.23x | 122% |
+| 64 | 1,213.9 | 1,419.8 | 1,493.8 | 1,753.7 | 3.89x | 127% |
+
+The columns come from three sessions. The same-session pairs at C=32 are 763.0 / 1,142.3
+(graphs, +50%), 1,148.0 / 1,206.5 (batched prefill, +5.1%) and 1,213.8 / 1,343.8 (grouped
+kernel, +10.7%). The M3 target, >= 3x HF at C=32 (>= 1,247 tok/s), is met at 3.23x.
+Correctness held at every step: fp32 greedy 0 mismatches / 1,920 tokens vs HF with all three
+on, fp16 only near-tie flips (HF top-2 margin <= 0.0156), and on the GPU a graph replay equals
+the eager decode pass bit for bit.
+
+**CUDA graphs** (`src/tinyserve/cuda_graphs.py`). The decode step was rewritten to have fixed
+shapes and no host syncs (`Qwen3.forward_decode` on padded `DecodeInputs`; padding rows write
+into a KV-cache block no sequence owns), then captured once per batch-size bucket (1, 2, 4, 8,
+then multiples of 8; 2.3-2.7 s and 222 MiB for 11 buckets). A C=32 decode step went from
+34.2 ms of forward with 1,851 kernel launches to one graph replay; the GPU is busy 91% of the
+step (M7: about half). The section 5 projection was ~1,600 tok/s at C=32; the measurement was
+1,142. The projection ignored prefill: steps carrying a prefill (eager, ~225 ms each at C=32)
+took 20% of the run's step time once decode steps were short.
+
+**Batched prefill attention** (`src/tinyserve/attention.py`). One PyTorch SDPA call per layer
+over every prefilling sequence's keys and values gathered from the cache, padded and masked,
+in fp32 like the other paths, instead of ~17 small kernels per sequence per layer. A C=32
+prefill step fell from 224.5 to 177.5 ms, not to the ~60 ms I projected; *inferred:* most of
+what is left is the GEMMs over ~1,400 prompt tokens. On the prefix-cache workload it cut the
+C=32 cache-on median TTFT from 644 to 505 ms.
+
+**A grouped decode kernel** (`_paged_decode_grouped_kernel` in
+`src/tinyserve/triton_attention.py`). One program per (sequence, kv head) loads each k/v block
+once and runs the online softmax for both query heads of the GQA pair. In the C=32 profile it
+takes 4.2 ms per step at 118 GB/s counting each k/v once (the M4 kernel: 6.2 ms in another
+session, each k/v loaded twice). It is 2.7% slower at C=1; *inferred:* at batch 1 it runs 8
+programs on the T4's 40 SMs, against 16 for the M4 kernel.
+
+Where a C=32 decode step goes now (step trace and torch.profiler, grouped kernel): 20.0 ms in
+all, 19.2 ms of it the forward; the roofline floor is 31% of that (M7: 17%). Of the 17.0 ms of
+GPU time per profiled step, GEMMs take 7.1 ms (169 GB/s), the decode kernel 4.2 ms, and ~5.7 ms
+is small norm, RoPE and copy kernels that the graph replays but does not fuse. Steps carrying
+a prefill are 17% of the run's step time at C=32 and 23% at C=64.
+
+On the comparison with vLLM: TinyServe is now ahead at C=32 and C=64 on this workload and
+behind at C=1 and C=8. The caveats of section 4 apply in full: vLLM ran in another session,
+on torch 2.13.0+cu130 against 2.11.0+cu128, with default settings and its own scheduler, and
+TinyServe's own C=32 result has varied ~6% between sessions with unchanged code. The fair
+reading is that a small engine with graphs, a GQA-aware decode kernel and batched prefill can
+match a general-purpose engine's defaults on one model, GPU and synthetic workload; it says
+nothing about other workloads (real prompts, EOS, long contexts), and vLLM's much lower C=1
+time (7.0 vs 11.9 ms per token, the latter from 84.3 tok/s) shows there is still more to take
+out of a small batch.
+
+What is still open, measured: the eager prefill steps (~175 ms at C=32; chunked prefill would
+cap them), the unfused small kernels (~5.7 ms of GPU time per C=32 step), the grouped kernel
+at batch 1 (split-K over the context would give it more programs), and the HTTP path, which
+has not been re-measured with graphs.
+
 ## How to reproduce
 
 Kaggle T4, after the repo's notebook cell 1 (clone, `pip install --no-deps -e .`, weights):
@@ -125,6 +190,15 @@ Kaggle T4, after the repo's notebook cell 1 (clone, `pip install --no-deps -e .`
 !python scripts/profile_engine.py --attention triton
 !python scripts/profile_engine.py --attention triton --workload prefix
 !python scripts/profile_api.py --attention triton
+```
+
+M8 (same session as the commands above):
+
+```
+!python scripts/benchmark.py --attention triton --cuda-graphs --prefill-attention batched
+!python scripts/benchmark.py --attention triton_grouped --cuda-graphs --prefill-attention batched
+!python scripts/compare_hf.py --engine batched --device cuda --dtype float32 --attention triton_grouped --cuda-graphs --prefill-attention batched
+!python scripts/profile_engine.py --device cuda --attention triton_grouped --cuda-graphs --prefill-attention batched
 ```
 
 vLLM replaces Kaggle's torch, so it runs last, in its own session. Kaggle's torchaudio is built

@@ -87,6 +87,34 @@ def test_server_over_http(model_dir: Path) -> None:
     assert trace["steps"] and trace["loop_lag_ms"]
 
 
+def test_server_with_the_m8_configuration(model_dir: Path) -> None:
+    # Grouped kernel, CUDA graphs (eager on CPU) and batched prefill: same greedy text.
+    pytest.importorskip("triton", reason="Triton is not installed (no Windows wheels)")
+    prompts = [byte_level_bpe().encode(t).ids for t in ("the capital of", "one two three")]
+    args = ["--model-dir", str(model_dir), "--device", "cpu", "--kv-gib", "0.01",
+            "--attention", "triton_grouped", "--cuda-graphs", "--prefill-attention", "batched",
+            "--max-num-seqs", "4", "--trace-requests"]  # fmt: skip
+    with running_server(args, free_port(), timeout=120) as url:
+
+        async def both() -> list[StreamResult]:
+            async with httpx.AsyncClient(timeout=120) as client:
+                bodies = [{"prompt": p, "max_tokens": 8, "temperature": 0} for p in prompts]
+                return await asyncio.gather(*(stream_completion(client, url, b) for b in bodies))
+
+        got = asyncio.run(both())
+        trace = httpx.get(f"{url}/debug/trace").json()
+    assert [r.text for r in got] == [offline_text(model_dir, p, 8) for p in prompts]
+    assert any(s["graph"] for s in trace["steps"]), "no decode step took the graph path"
+
+
+def test_server_refuses_cuda_graphs_without_a_kernel(model_dir: Path) -> None:
+    cmd = [sys.executable, "-m", "tinyserve.server", "--model-dir", str(model_dir),
+           "--cuda-graphs"]  # fmt: skip
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0
+    assert "--cuda-graphs needs" in r.stderr
+
+
 def test_server_refuses_a_public_host(model_dir: Path) -> None:
     cmd = [sys.executable, "-m", "tinyserve.server", "--model-dir", str(model_dir),
            "--host", "0.0.0.0"]  # fmt: skip
