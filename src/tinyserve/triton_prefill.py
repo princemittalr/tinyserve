@@ -27,7 +27,8 @@ cores in fp16. Each key's cache slot comes from the block table, position by pos
 span several cache blocks and the cache block size can be anything.
 
 Precision: q.k is computed from the cache dtype with float32 accumulation. In float32
-the dots are exact IEEE float32 (no TF32). In float16, p is rounded to float16 before
+the dots are exact IEEE float32 (no TF32); for 16-bit inputs the precision option is
+the default one, plain fp16 tensor-core dots. In float16, p is rounded to float16 before
 p @ v (as FlashAttention does), so fp16 results differ from the float32 reference by
 about one fp16 rounding (tested at 1e-3, the kernel tolerance since M4).
 """
@@ -35,6 +36,12 @@ about one fp16 rounding (tested at 1e-3, the kernel tolerance since M4).
 import torch
 import triton
 import triton.language as tl
+
+# (rows_per_tile, block_n, num_warps). On the T4 Triton turns tl.dot into FMA loops (no
+# tensor cores before sm_80), and every value of a tile lives in registers: M9 step 3's
+# (64, 32, 4) spilled ~10 KB per thread to local memory and ran ~6x slower than batched
+# SDPA. This one compiles with no spill in fp16 and fp32 (scripts/check_t4_compile.py).
+DEFAULT_TILE = (32, 32, 8)
 
 
 @triton.jit
@@ -61,6 +68,7 @@ def _paged_prefill_kernel(
     HEAD_DIM_PAD: tl.constexpr,  # HEAD_DIM rounded up to a power of 2, at least 16
     BLOCK_M: tl.constexpr,  # queries per tile; BLOCK_M * GROUP rows per program
     BLOCK_N: tl.constexpr,  # keys per inner step
+    PRECISION: tl.constexpr,  # tl.dot's input_precision: "ieee" for float32 inputs
 ):
     seq = tl.program_id(0)
     tile = tl.program_id(1)
@@ -94,7 +102,7 @@ def _paged_prefill_kernel(
         slot = block * BLOCK_SIZE + n % BLOCK_SIZE  # [N], as in BlockTable.slot
         kt_off = slot[None, :] * stride_ks + kv_head * stride_kh + d[:, None]  # [D, N]
         kt = tl.load(k_ptr + kt_off, mask=d_ok[:, None] & n_ok[None, :], other=0.0)
-        s = tl.dot(q, kt, input_precision="ieee") * scale  # [M, N] float32
+        s = tl.dot(q, kt, input_precision=PRECISION) * scale  # [M, N] float32
         # Causal: key n only up to the row's own position. Key 0 is always allowed, so
         # after the first step every row's m is finite and alpha below is never nan.
         s = tl.where((n[None, :] <= pos[:, None]) & n_ok[None, :], s, float("-inf"))
@@ -104,7 +112,7 @@ def _paged_prefill_kernel(
         l = l * alpha + tl.sum(p, axis=1)  # noqa: E741
         v_off = slot[:, None] * stride_ks + kv_head * stride_kh + d[None, :]  # [N, D]
         v = tl.load(v_ptr + v_off, mask=n_ok[:, None] & d_ok[None, :], other=0.0)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee")
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision=PRECISION)
         m = m_new
 
     out = acc / l[:, None]
@@ -127,7 +135,9 @@ def paged_prefill_attention(
     max_q_len: int,
     out: torch.Tensor | None = None,
     rows_per_tile: int | None = None,
-    block_n: int = 32,
+    block_n: int | None = None,
+    num_warps: int | None = None,
+    ieee: bool | None = None,
 ) -> torch.Tensor:
     """Attention for R prefilling sequences in one launch, reading k/v from the cache.
 
@@ -145,9 +155,12 @@ def paged_prefill_attention(
         out: ``[T, Hq, D]`` to write into (other rows are left as they are); default a
             new ``empty_like(q)``.
         rows_per_tile: (query, head) rows per program, a power of 2 >= 16 and >= GROUP.
-            Default 64 for 16-bit inputs, 32 for float32, whose tiles take twice the
-            T4's 64 KiB of shared memory per row.
         block_n: keys per inner step, a power of 2 >= 16.
+        num_warps: warps per program (Triton's launch option). These three default to
+            ``DEFAULT_TILE``.
+        ieee: exact float32 dots; default only for float32 inputs. For 16-bit inputs it
+            asked for IEEE dots too until M9 step 8, measured in
+            ``scripts/bench_prefill_kernel.py``.
 
     Returns:
         ``out``.
@@ -155,8 +168,9 @@ def paged_prefill_attention(
     t, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     group = num_q_heads // num_kv_heads
-    if rows_per_tile is None:
-        rows_per_tile = max(32 if q.dtype == torch.float32 else 64, group)
+    rows_per_tile = max(DEFAULT_TILE[0], group) if rows_per_tile is None else rows_per_tile
+    block_n = DEFAULT_TILE[1] if block_n is None else block_n
+    num_warps = DEFAULT_TILE[2] if num_warps is None else num_warps
     if num_q_heads % num_kv_heads or group & (group - 1):
         raise ValueError(f"need a power-of-2 head group, got {num_q_heads} / {num_kv_heads}")
     for name, n in (("block_size", block_size), ("rows_per_tile", rows_per_tile),
@@ -193,5 +207,7 @@ def paged_prefill_attention(
         HEAD_DIM_PAD=max(16, triton.next_power_of_2(head_dim)),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        PRECISION="ieee" if (q.dtype == torch.float32 if ieee is None else ieee) else "tf32",
+        num_warps=num_warps,
     )  # fmt: skip
     return out

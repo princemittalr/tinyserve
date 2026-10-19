@@ -96,16 +96,18 @@ def _qk_norm_rope_store_kernel(
         tl.store(out + i, a.to(q_out_ptr.dtype.element_ty))
         tl.store(out + half + i, b.to(q_out_ptr.dtype.element_ty))
     else:
+        # Names of their own: a variable set in both branches of an ``if`` must have one
+        # type, and these are fp16 when the cache is (the interpreter does not check).
         kh = h - NUM_Q_HEADS
-        a, b = _norm_rope(k_ptr + t * stride_kt + kh * stride_kh, k_w_ptr, cos, sin, i, eps,
-                          HEAD_DIM)  # fmt: skip
+        ka, kb = _norm_rope(k_ptr + t * stride_kt + kh * stride_kh, k_w_ptr, cos, sin, i, eps,
+                            HEAD_DIM)  # fmt: skip
         # rope's cast to k's dtype, then KVCache.write's cast to the cache dtype
-        a = a.to(k_ptr.dtype.element_ty).to(k_cache_ptr.dtype.element_ty)
-        b = b.to(k_ptr.dtype.element_ty).to(k_cache_ptr.dtype.element_ty)
+        k_a = ka.to(k_ptr.dtype.element_ty).to(k_cache_ptr.dtype.element_ty)
+        k_b = kb.to(k_ptr.dtype.element_ty).to(k_cache_ptr.dtype.element_ty)
         slot = tl.load(slots_ptr + t)
         dst = slot * stride_cs + kh * stride_ch
-        tl.store(k_cache_ptr + dst + i, a)
-        tl.store(k_cache_ptr + dst + half + i, b)
+        tl.store(k_cache_ptr + dst + i, k_a)
+        tl.store(k_cache_ptr + dst + half + i, k_b)
         d = tl.arange(0, HEAD_DIM)
         v = tl.load(v_ptr + t * stride_vt + kh * stride_vh + d)
         tl.store(v_cache_ptr + dst + d, v.to(v_cache_ptr.dtype.element_ty))

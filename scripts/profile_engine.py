@@ -252,9 +252,13 @@ def run_prefix(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: to
         fwd = time_ms(forward, dev, iters=args.iters)
         with attention_replaced():
             bare = time_ms(forward, dev, iters=args.iters)
+        # attention_replaced only swaps the per-sequence attention: with batched or
+        # Triton prefill it saves nothing (scripts/bench_prefill_kernel.py times those).
+        share = (fwd - bare) / fwd if args.prefill_attention == "per_seq" else None
         hits.append({"hits": k, "forward_ms": fwd, "no_attention_ms": bare,
-                     "attention_share": (fwd - bare) / fwd})  # fmt: skip
-        print(f"  k={k:>3}: {fwd:7.1f} / {bare:7.1f} ms, attention {(fwd - bare) / fwd:.0%}")
+                     "attention_share": share})  # fmt: skip
+        print(f"  k={k:>3}: {fwd:7.1f} / {bare:7.1f} ms, attention "
+              f"{'n/a' if share is None else f'{share:.0%}'}")  # fmt: skip
     return {"concurrency": c, "runs": runs, "prefill_hits": hits}
 
 

@@ -234,9 +234,10 @@ def test_engine_with_chunks_kernel_and_batched_prefill_matches_m1_greedy(
 ) -> None:
     from tinyserve.cuda_graphs import DecodeGraphs
 
-    m = tiny_model()
-    model = Qwen3(m.cfg, m.w, decode_attention=attention, prefill_attention="batched")  # type: ignore[arg-type]
-    cache = KVCache(CFG, 64, 4, dtype=torch.float32)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"  # the kernels need the GPU there
+    w = {n: t.to(dev) for n, t in tiny_model().w.items()}
+    model = Qwen3(CFG, w, decode_attention=attention, prefill_attention="batched")  # type: ignore[arg-type]
+    cache = KVCache(CFG, 64, 4, dtype=torch.float32, device=dev)
     graphs = DecodeGraphs(model, cache, max_batch=3)  # replays eagerly on a CPU
     e = Engine(
         model, cache, max_num_seqs=3, max_batch_tokens=4, decode_graphs=graphs, chunked_prefill=True

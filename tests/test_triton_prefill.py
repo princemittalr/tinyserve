@@ -189,15 +189,15 @@ def test_rejects_bad_arguments() -> None:
 
 
 def models(decode: str) -> tuple[Qwen3, Qwen3]:
-    m = tiny_model()
-    ref = Qwen3(CFG, m.w, decode_attention=decode)  # type: ignore[arg-type]
-    return ref, Qwen3(CFG, m.w, decode_attention=decode, prefill_attention="triton")  # type: ignore[arg-type]
+    w = {n: t.to(DEVICE) for n, t in tiny_model().w.items()}  # on the GPU when there is one
+    ref = Qwen3(CFG, w, decode_attention=decode)  # type: ignore[arg-type]
+    return ref, Qwen3(CFG, w, decode_attention=decode, prefill_attention="triton")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("decode", ["torch", "triton_grouped"])
 def test_forward_batch_equals_the_per_sequence_path(decode: str) -> None:
     ref, ours = models(decode)
-    cache = KVCache(CFG, 64, 4, dtype=torch.float32)
+    cache = KVCache(CFG, 64, 4, dtype=torch.float32, device=DEVICE)
     alloc = BlockAllocator(64)
     tables = [BlockTable(alloc, 4) for _ in range(4)]
     # 0: a prompt, 1: a decode after 6 cached tokens, 2: 3 new after 9 cached, 3: 1 token.
@@ -209,10 +209,10 @@ def test_forward_batch_equals_the_per_sequence_path(decode: str) -> None:
     items = list(zip(news, tables, strict=True))
     # Fill the cached part of the cache identically for both runs: random k/v there.
     g = torch.Generator().manual_seed(1)
-    cache.k.copy_(torch.randn(cache.k.shape, generator=g))
-    cache.v.copy_(torch.randn(cache.v.shape, generator=g))
+    cache.k.copy_(torch.randn(cache.k.shape, generator=g).to(DEVICE))
+    cache.v.copy_(torch.randn(cache.v.shape, generator=g).to(DEVICE))
     saved = cache.k.clone(), cache.v.clone()
-    want = ref.forward_batch(build_batch(items), cache)
+    want = ref.forward_batch(build_batch(items, DEVICE), cache)
     cache.k.copy_(saved[0])
     cache.v.copy_(saved[1])
     kernel, calls = ours.prefill_kernel, []
@@ -223,7 +223,7 @@ def test_forward_batch_equals_the_per_sequence_path(decode: str) -> None:
         return kernel(*args)
 
     ours.prefill_kernel = counted
-    got = ours.forward_batch(build_batch(items), cache)
+    got = ours.forward_batch(build_batch(items, DEVICE), cache)
     torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
     assert len(calls) == CFG.num_layers  # one launch per layer, for every prefill
 
@@ -234,7 +234,7 @@ def test_forward_batch_equals_the_per_sequence_path(decode: str) -> None:
 )
 def test_engine_matches_m1_greedy(prefix_cache: bool, chunked: bool, num_blocks: int) -> None:
     _, ours = models("triton_grouped")
-    cache = KVCache(CFG, num_blocks, 4, dtype=torch.float32)
+    cache = KVCache(CFG, num_blocks, 4, dtype=torch.float32, device=DEVICE)
     e = Engine(ours, cache, max_num_seqs=4, max_batch_tokens=5 if chunked else 2048,
                prefix_cache=prefix_cache, chunked_prefill=chunked)  # fmt: skip
     prompts = [[7, 3, 9, 1, *p] for p in PROMPTS] if prefix_cache else PROMPTS
