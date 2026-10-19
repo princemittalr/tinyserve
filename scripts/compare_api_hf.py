@@ -108,9 +108,10 @@ def main() -> None:
         "--attention", args.attention, "--kv-gib", "2", "--max-num-seqs", "64",
         "--prefill-attention", args.prefill_attention,
         "--max-batch-tokens", str(args.max_batch_tokens),
+        # Explicit both ways: the server's own defaults differ by device (M9).
+        "--cuda-graphs" if args.cuda_graphs else "--no-cuda-graphs",
+        "--fused-kernels" if args.fused_kernels else "--no-fused-kernels",
     ] + (["--prefix-cache"] if args.prefix_cache else []) + (
-        ["--cuda-graphs"] if args.cuda_graphs else []) + (
-        ["--fused-kernels"] if args.fused_kernels else []) + (
         ["--chunked-prefill"] if args.chunked_prefill else [])  # fmt: skip
     with running_server(serve_args, args.port) as url:
         api = asyncio.run(ask_all(url, prompts, args.max_new_tokens))

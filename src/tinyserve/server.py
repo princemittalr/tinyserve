@@ -1,9 +1,15 @@
 """Serve Qwen3-0.6B over an OpenAI-compatible HTTP API (M6).
 
-Usage: python scripts/serve.py [--device cuda --attention triton --prefix-cache]
-       python scripts/serve.py --device cuda --attention triton_grouped --cuda-graphs \\
-           --prefill-attention batched        (the fastest M8 configuration)
+Usage: python scripts/serve.py                (on a GPU: M9's fastest measured setup)
+       python scripts/serve.py --device cpu   (the plain PyTorch paths)
    or: python -m tinyserve.server [...]       (what tinyserve.client starts)
+
+Defaults (M9 step 9, from the T4 measurements in PROGRESS): on a CUDA device with
+Triton installed, the split-K decode kernel, batched prefill attention, the fused norm /
+RoPE / cache-write kernels and CUDA graphs, which served 1,466 tok/s at C=32 against
+1,259 for M8's setup. Elsewhere, the M6 PyTorch paths. Any of them can be set by hand
+(``--no-cuda-graphs``, ``--no-fused-kernels``, ``--attention``, ``--prefill-attention``).
+Chunked prefill and the prefix cache stay off unless asked for.
 
     curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \\
       -d '{"messages": [{"role": "user", "content": "Hi"}], "stream": true}'
@@ -14,6 +20,7 @@ port can use the GPU.
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -55,6 +62,19 @@ def eos_ids(model_dir: Path) -> frozenset[int]:
     return frozenset(eos if isinstance(eos, list) else [eos])
 
 
+def fill_defaults(args: argparse.Namespace, has_triton: bool) -> None:
+    """Set the options the command line left as None (see the module docstring)."""
+    fast = str(args.device).startswith("cuda") and has_triton
+    if args.attention is None:
+        args.attention = "triton_split" if fast else "torch"
+    if args.prefill_attention is None:
+        args.prefill_attention = "batched" if fast else "per_seq"
+    if args.cuda_graphs is None:
+        args.cuda_graphs = fast and args.attention != "torch"
+    if args.fused_kernels is None:
+        args.fused_kernels = fast
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
@@ -65,12 +85,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
-    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
-    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default="per_seq",
-                        help="per sequence, or one call per layer (M8)")  # fmt: skip
-    parser.add_argument("--cuda-graphs", action="store_true",
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default=None,
+                        help="default: triton_split on cuda, torch on cpu")  # fmt: skip
+    parser.add_argument("--prefill-attention", choices=PREFILL_ATTENTIONS, default=None,
+                        help="default: batched on cuda, per_seq on cpu")  # fmt: skip
+    parser.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=None,
                         help="replay CUDA graphs for decode steps (M8; needs a triton "
-                             "attention)")  # fmt: skip
+                             "attention); default: on on cuda")  # fmt: skip
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--kv-gib", type=float, default=2.0, help="KV cache size")
     parser.add_argument("--block-size", type=int, default=16)
@@ -89,9 +110,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--switch-interval-ms", type=float, default=None,
                         help="profiling: how often Python offers the GIL to another "
                              "thread (default 5 ms)")  # fmt: skip
-    parser.add_argument("--fused-kernels", action="store_true",
-                        help="fused norm / RoPE / cache-write Triton kernels (M9)")  # fmt: skip
+    parser.add_argument("--fused-kernels", action=argparse.BooleanOptionalAction, default=None,
+                        help="fused norm / RoPE / cache-write Triton kernels (M9); default: "
+                             "on on cuda")  # fmt: skip
     args = parser.parse_args(argv)
+    fill_defaults(args, importlib.util.find_spec("triton") is not None)
     if args.cuda_graphs and args.attention == "torch":
         parser.error("--cuda-graphs needs a Triton --attention (triton, triton_grouped, ...)")
 

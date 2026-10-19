@@ -7,10 +7,12 @@ to PTX, and the ptxas Triton ships with reports each kernel's registers and spil
 
 For each kernel, at Qwen3-0.6B's shapes and the launch options its wrapper uses, in
 float16 and float32, this prints registers, bytes spilled to local memory and the
-number of tensor-core (mma) instructions, and fails on a compile error or a spill.
+number of tensor-core (mma) instructions, and fails on a compile error or a spill of
+more than ``MAX_SPILL`` bytes.
 What it found on the T4 (M9 step 8): Triton emits no tensor-core instructions for
 sm_75 (``tl.dot`` becomes FMA loops), and the prefill kernel's first tiles spilled
-about 10 KB per thread, which is why it ran ~6x slower than batched SDPA.
+about 10 KB per thread, which is why it ran ~6x slower than batched SDPA. A small spill
+can be the right trade: the fastest prefill tile on the T4 spills 936 bytes (step 9).
 
 Usage:
     python scripts/check_t4_compile.py          # exit code 1 if any kernel fails
@@ -37,6 +39,7 @@ from tinyserve import triton_prefill as tp
 T4 = GPUTarget("cuda", 75, 32)
 PTXAS = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin", "ptxas")
 HQ, HKV, D, BS = 16, 8, 128, 16  # Qwen3-0.6B; the engine's default block size
+MAX_SPILL = 1024  # bytes per thread
 
 
 def specs(dt: str) -> list[tuple[str, Any, dict[str, str], dict[str, Any], int]]:
@@ -86,7 +89,7 @@ def check(kernel: Any, types: dict[str, str], constexprs: dict[str, Any], warps:
     if regs is None or spills is None:
         raise RuntimeError(f"unexpected ptxas output: {report}")
     line = f"{regs[1]:>3} registers, {spills[1]:>5} bytes spilled, {ptx.count('mma.sync')} mma"
-    if int(spills[1]):
+    if int(spills[1]) > MAX_SPILL:
         raise RuntimeError(line)
     return line
 

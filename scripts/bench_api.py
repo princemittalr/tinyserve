@@ -81,9 +81,10 @@ def main() -> None:
         "--max-num-seqs", str(max(levels)), "--ignore-eos",
         "--prefill-attention", args.prefill_attention,
         "--max-batch-tokens", str(args.max_batch_tokens),
-    ] + (["--cuda-graphs"] if args.cuda_graphs else []) + (
-        ["--chunked-prefill"] if args.chunked_prefill else []) + (
-        ["--fused-kernels"] if args.fused_kernels else [])  # fmt: skip
+        # Explicit both ways: the server's own defaults differ by device (M9).
+        "--cuda-graphs" if args.cuda_graphs else "--no-cuda-graphs",
+        "--fused-kernels" if args.fused_kernels else "--no-fused-kernels",
+    ] + (["--chunked-prefill"] if args.chunked_prefill else [])  # fmt: skip
 
     rows = []
     with running_server(serve_args, args.port) as url:

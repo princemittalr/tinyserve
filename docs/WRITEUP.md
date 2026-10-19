@@ -1,7 +1,7 @@
-# TinyServe on a T4: where the time goes (M7, M8)
+# TinyServe on a T4: where the time goes (M7, M8, M9)
 
 Every number below comes from a logged run on a Kaggle Tesla T4 (2026-10-18 and 2026-10-19),
-fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed. Raw data is in `results/`; each table names its file. Anything not measured is
+fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed and section 7 what M9 changed. Raw data is in `results/`; each table names its file. Anything not measured is
 marked *inferred* or *projected*.
 
 ## 1. The roofline: the fastest a decode step could run
@@ -187,6 +187,64 @@ Over HTTP (one later session, `scripts/bench_api.py`): 85.2 / 566.6 / 1,332.0 / 
 at C = 1 / 8 / 32 / 64, 3.20x HF at C=32 (M6: 723.8). Greedy text through the API (fp32, prefix
 cache on, 120 prompts) is identical to HF `generate()`.
 
+## 7. What M9 changed
+
+M9 closed the items left open after M8. All numbers below are from one Kaggle T4 session
+(fp16, the M3 workload, `scripts/benchmark.py`, output tok/s), except where noted.
+
+| C | A: M8 | D: split-K, Triton prefill, fused | E: D + chunked prefill | F: split-K, batched prefill, fused | F / A | F / vLLM 0.32 |
+|---|---|---|---|---|---|---|
+| 1 | 81.2 | 132.9 | 131.5 | 129.0 | 1.59x | 91% |
+| 8 | 562.6 | 793.4 | 721.8 | 775.0 | 1.38x | 114% |
+| 32 | 1,325.2 | 1,600.8 | 1,624.9 | 1,580.3 | 1.19x | 143% |
+| 64 | 1,722.5 | 1,931.1 | 1,972.3 | 1,969.4 | 1.14x | 142% |
+
+F is now the server's default on a GPU. The vLLM column carries section 4's caveats in full
+(another session, another torch, vLLM's defaults).
+
+**Split-K for the decode kernel** (`_paged_decode_split_kernel`, `_merge_splits_kernel`). At
+batch 1 the grouped kernel ran 8 programs on 40 SMs. Split-K cuts each sequence's blocks into
+up to 16 ranges, one program each, and merges the partial softmaxes the way the online softmax
+merges blocks. The number of ranges depends only on shapes, so CUDA graphs still replay one
+grid per bucket, and from batch 10 up it is 1, the plain grouped kernel. With 2,048-token
+prompts at C=1 it made decoding 1.39x faster (TPOT 20.9 -> 13.6 ms, another session).
+
+**Fused kernels** (`src/tinyserve/triton_fused.py`). Section 6 left ~5.7 ms of small norm,
+RoPE and copy kernels in a C=32 step. One kernel does RMSNorm per row, another the q/k head
+norms, RoPE and the k/v cache write, following the PyTorch path's rounding step by step. A
+C=32 decode step's GPU time fell from 17.3 to 13.8 ms (step 14.8 ms, GEMMs 7.4 ms). With
+split-K, that is +59% at C=1 and +19% at C=32 over M8.
+
+**The Triton prefill kernel** (`src/tinyserve/triton_prefill.py`) reads keys and values
+straight from the cache blocks, without M8's padded gather. Its first version was 6.6x slower
+than batched SDPA. Compiling for sm_75 without a GPU (`scripts/check_t4_compile.py`) showed
+why: Triton emits no tensor-core instructions before sm_80, so `tl.dot` on the T4 is a loop of
+FMAs with its tiles in registers, and that tile spilled 10.6 KB per thread to local memory.
+The best tile measured (`scripts/bench_prefill_kernel.py`) is 15% faster than batched SDPA on
+32 prefix hits (17.6 vs 20.6 ms per layer) and 25% slower on 8 fresh 512-token prompts (9.5
+vs 7.6 ms). In the engine, D and F are within 1.3% on the M3 workload, and F is 3.6% faster on
+the prefix workload, so batched prefill stays the default. *Inferred:* on a GPU where Triton
+uses tensor cores (sm_80 and up) the kernel should win; that was not measured.
+
+**Chunked prefill** caps a step at `--max-batch-tokens` (512 here) by splitting prompts across
+steps. At C=32 it cut the median TTFT from 168 to 55 ms and the longest gap between two tokens
+of a request from 173 to 61 ms, at the same throughput. At C=8 the one run showed a worse tail
+(TTFT p99 430 vs 82 ms), not explained, so it is opt-in.
+
+**Smaller items.** Prefill steps build their cache slots from block lists instead of
+per-token Python lists (on a CPU: 9.0 ms of slot lists became a 1.4 ms `build_batch`). The
+API gained `stop` strings, `n` choices and logprobs. CI runs Python 3.13 too.
+
+Correctness held: fp32 greedy with every M9 option at once (and 64-token chunks) 0 mismatches
+/ 1,920 tokens vs HF; fp16 6 near-tie divergences at HF top-2 margins <= 0.0625 (M8:
+<= 0.0156; 0.0625 is one fp16 step at a logit of 64-128). Greedy text through the API with
+every option and the prefix cache is identical to HF in fp32.
+
+What is left, measured: decode at C=32 is ~15 ms per step against a roofline floor of ~6 ms
+(GEMMs at ~160 GB/s of the T4's 320); vLLM is still faster at C=1 (142.4 vs 129.0 tok/s); and
+TTFT p99 over HTTP at C=32 is 2,755 ms, *inferred* to be mostly section 3's held-back empty
+text.
+
 ## How to reproduce
 
 Kaggle T4, after the repo's notebook cell 1 (clone, `pip install --no-deps -e .`, weights):
@@ -219,3 +277,13 @@ benchmark uses no audio). This needs an NVIDIA driver >= 580 (Kaggle had 580.178
 GPU performance counters (Nsight Compute) are blocked in Kaggle's container
 (CUPTI_ERROR_INSUFFICIENT_PRIVILEGES), and Nsight Systems is not installed, so every GPU
 profile here comes from torch.profiler.
+
+M9 (one session, after cell 1):
+
+```
+!python scripts/check_t4_compile.py
+!python scripts/bench_prefill_kernel.py
+!python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_grouped --prefill-attention batched
+!python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels
+!python scripts/compare_hf.py --engine batched --device cuda --dtype float32 --cuda-graphs --attention triton_split --prefill-attention triton --fused-kernels --chunked-prefill --max-batch-tokens 64
+```

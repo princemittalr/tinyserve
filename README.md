@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M8 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events) with a paged KV cache, continuous batching, a radix prefix cache, Triton decode kernels, CUDA graphs for decode steps and batched prefill attention. On a T4 the engine delivers 1,344 tok/s at 32 concurrent sequences (3.23x HF `generate()`; M7 was 766, 1.84x) and 1,754 tok/s at 64 (3.89x HF). vLLM 0.32, measured in another session, is still faster at 1 and 8 sequences. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8 changed, and the comparison. See [PROGRESS.md](PROGRESS.md).
+> Status: **M9 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events, `stop`, `n`, logprobs) with a paged KV cache, continuous batching with optional chunked prefill, a radix prefix cache, Triton decode, prefill and fused norm / RoPE kernels, and CUDA graphs for decode steps. On a T4 its default GPU setup runs 1,580 tok/s at 32 concurrent sequences (3.80x HF `generate()`; M8 was 1,325 in the same session) and 129 tok/s for a single sequence (M8: 81). Over HTTP: 1,466 tok/s at C=32. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8 and M9 changed, and the comparison with vLLM. See [PROGRESS.md](PROGRESS.md).
 
 ## Features
 
@@ -11,10 +11,14 @@ Target model: Qwen3-0.6B. Written to be read and understood, not to compete with
 2. Paged KV cache with a block allocator
 3. Continuous-batching scheduler with preemption
 4. Radix-tree prefix cache with LRU eviction
-5. Custom Triton paged decode-attention kernels (one per query head, and one that shares each
-   k/v load across a GQA head group)
+5. Custom Triton paged decode-attention kernels (one per query head, one that shares each
+   k/v load across a GQA head group, and a split-K variant for small batches)
 6. CUDA graphs for decode steps (one per batch-size bucket) and batched prefill attention
-7. Batched sampling and an OpenAI-compatible streaming endpoint
+7. A Triton varlen prefill-attention kernel over the cache blocks, and fused Triton kernels
+   for RMSNorm and for q/k norm + RoPE + the KV-cache write
+8. Chunked prefill under a per-step token budget
+9. Batched sampling (temperature, top-p, seeds, logprobs) and an OpenAI-compatible streaming
+   endpoint with `stop` strings and `n` choices
 
 ## Quickstart (development)
 
@@ -28,16 +32,20 @@ ruff check . && ruff format --check . && mypy && pytest
 ## Serving (OpenAI-compatible)
 
 ```bash
-python scripts/serve.py --device cuda --attention triton_grouped --cuda-graphs \
-  --prefill-attention batched --prefix-cache                               # 127.0.0.1:8000
+python scripts/serve.py                     # 127.0.0.1:8000, the fastest T4 setup on a GPU
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hi"}], "stream": true, "temperature": 0}'
 ```
 
-`--cuda-graphs` captures the decode graphs (a few seconds, ~220 MiB on a T4) before the server
-starts listening. Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. Endpoints: `/v1/completions`,
+On a GPU with Triton the server defaults to the split-K decode kernel, batched prefill, the
+fused kernels and CUDA graphs (captured before it listens: a few seconds, ~220 MiB on a T4); on a
+CPU, to the PyTorch paths. `--no-cuda-graphs`, `--no-fused-kernels`, `--attention` and
+`--prefill-attention` override them; `--prefix-cache` and `--chunked-prefill` are opt-in. Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. Endpoints: `/v1/completions`,
 `/v1/chat/completions` (both with `"stream": true`), `/v1/models`, `/health`. Requests are
 limited in body size, prompt length, `max_tokens` and requests in flight (413 / 400 / 429).
+`stop` (up to 4 strings), `n` (up to 8 choices; with a seed, choice i uses seed + i) and
+logprobs (`logprobs: k` for completions, `logprobs` / `top_logprobs` for chat) follow OpenAI's
+formats.
 
 ## Benchmarks
 
@@ -141,6 +149,28 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   (fp32, 120 prompts at once, half streamed) is identical to HF `generate()`. Raw data:
   `results/m8_api_bench_cuda.json` (stayed on Kaggle; numbers transcribed).
 
+- M9 (2026-10-19, Kaggle T4, fp16, the M3 workload, all columns in one session,
+  `scripts/benchmark.py`). A is M8's setup; F is the server's new GPU default:
+
+  | Concurrency | A: M8 | + Triton prefill | D: split-K, Triton prefill, fused | E: D + chunked prefill | F: split-K, batched prefill, fused | F / HF |
+  |---|---|---|---|---|---|---|
+  | 1 | 81.2 | 83.9 | 132.9 | 131.5 | 129.0 | 5.12x |
+  | 8 | 562.6 | 554.5 | 793.4 | 721.8 | 775.0 | 4.01x |
+  | 32 | 1,325.2 | 1,286.8 | 1,600.8 | 1,624.9 | 1,580.3 | 3.80x |
+  | 64 | 1,722.5 | 1,703.8 | 1,931.1 | 1,972.3 | 1,969.4 | 4.36x |
+
+  Split-K and the fused kernels carry the gain: a C=32 decode step went from 17.3 to 13.8 ms of
+  GPU time, and with 2,048-token prompts at C=1 split-K alone gave 1.39x (another session). The
+  Triton prefill kernel gets no tensor cores on the T4 (Triton emits none before sm_80): it is
+  15% faster than batched SDPA on 32 prefix hits and 25% slower on fresh 512-token prompts, so
+  batched prefill stays the default. Chunked prefill cut the C=32 median TTFT from 168 to 55 ms
+  at the same throughput, but at C=8 its TTFT p99 was 430 ms against 82, so it stays opt-in.
+  Prefix workload with the cache on at C=32: A 487.8, F 533.2 tok/s. Over HTTP, A / F: 80.9 /
+  126.8, 534.2 / 730.9, 1,258.9 / 1,465.6 and 1,621.5 / 1,824.8 tok/s at C = 1 / 8 / 32 / 64.
+  fp32 greedy with every M9 option (64-token chunks): 0 mismatches / 1,920 tokens vs HF; fp16: 6
+  near-tie divergences (HF top-2 margin <= 0.0625). Greedy text through the API with every option
+  and the prefix cache (fp32): identical to HF. Numbers transcribed from the printed output.
+
 - Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
   `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
   at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
@@ -174,7 +204,7 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 
 ## How it's tested
 
-- CPU tests run in GitHub Actions on Python 3.11, 3.12 and 3.14 on every push; the job fails if
+- CPU tests run in GitHub Actions on Python 3.11, 3.12, 3.13 and 3.14 on every push; the job fails if
   any test fails. The same lint and type checks run locally as a pre-commit hook.
 - The weight loader is tested on small synthetic checkpoints (missing, unexpected, misshapen
   and fp16-overflowing tensors). `tests/test_real_checkpoint.py` checks the real Qwen3-0.6B
@@ -232,6 +262,16 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   and one-token sequences, and the engine with it matches M1 greedy.
 - The server is run end to end with the grouped kernel, graphs and batched prefill on the tiny
   checkpoint: same greedy text as the offline engine, and its trace shows graph steps.
+- M9: chunked prefill has a Hypothesis test over random workloads (each step within budget,
+  every sequence gets a token, outputs correct, no leaks) and matches M1 greedy with
+  preemptions, the prefix cache, both kernels and the graph path. The varlen prefill kernel,
+  the split-K decode kernel and the fused kernels are checked against the PyTorch references
+  (a Hypothesis test over random batches for the prefill kernel), and the engine with every M9
+  option at once matches M1 greedy. `stop` matching has a Hypothesis test that the streamed
+  result equals cutting the whole text, however it is split; `n` choices equal seeded offline
+  runs; logprobs equal the model's log_softmax per token.
+- `tests/test_t4_compile.py` compiles every Triton kernel for the T4 (sm_75) without a GPU and
+  fails on a compile error or a register spill over 1 KiB, which the interpreter cannot see.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -242,21 +282,20 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - The prefix cache reuses whole blocks only (16 tokens by default), and never a prompt's last
   token; eviction drops whole leaves of the tree.
 - The API has no authentication (it binds to 127.0.0.1), serves one model, and does not
-  implement `n > 1`, `stop`, logprobs, `echo` or penalties (requests using them get a 400).
-  Chat content must be plain text; the chat template turns Qwen3's thinking off.
-- Sampling supports temperature and top-p only (no top-k, repetition penalties or logprobs).
-  Requests without a seed are reproducible per run, not per request.
-- The Triton kernels cover decode only. Batched prefill attention is one PyTorch SDPA call per
-  layer over keys and values gathered out of the cache into a padded tensor, in fp32; it is
-  off by default (`--prefill-attention batched`).
-- The grouped decode kernel needs a power-of-2 head group and is slower than the M4 kernel at
-  batch 1 (fewer programs); neither kernel splits long contexts across programs (no split-K).
-  Tuned only for the T4.
+  implement `echo` or penalties (requests using them get a 400). A logprob token's text is that
+  token decoded alone. Chat content must be plain text; the chat template turns Qwen3's
+  thinking off.
+- Sampling supports temperature and top-p only (no top-k or repetition penalties). Requests
+  without a seed are reproducible per run, not per request.
+- On the T4, Triton uses no tensor cores (none before sm_80), so the Triton prefill kernel is
+  slower than batched SDPA on fresh prompts; batched prefill (fp32 SDPA over a padded gather
+  from the cache) is the default.
+- The kernels are tuned only for the T4; the grouped kernels need a power-of-2 head group.
 - Triton has no Windows wheels: on Windows the kernel tests skip and the PyTorch path is used.
 - CUDA graphs cover pure decode steps only, up to `--max-num-seqs` sequences and a fixed
-  block-table width; prefill and mixed steps run eagerly (a C=32 prefill step is ~175 ms).
-  Graphs are off by default and need a Triton kernel. The graphs replay but do not fuse the
-  small norm, RoPE and copy kernels (~5.7 ms of a 17 ms C=32 step on the GPU).
+  block-table width; prefill and mixed steps run eagerly.
+- Chunked prefill is opt-in: it lowered TTFT at 32 and 64 streams but raised the tail at 8 in
+  the one run measured.
 - Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
   one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
   decodes to empty text gets only at its end.

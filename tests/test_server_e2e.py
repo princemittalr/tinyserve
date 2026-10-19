@@ -2,6 +2,7 @@
 random checkpoint with a real byte-level BPE tokenizer, driven by ``tinyserve.client``,
 the same code the T4 benchmark and parity scripts use."""
 
+import argparse
 import asyncio
 import json
 import socket
@@ -22,6 +23,7 @@ from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
 from tinyserve.model import Qwen3
 from tinyserve.profiling import ttft_segments
+from tinyserve.server import fill_defaults
 from tinyserve.weights import expected_shapes, load_weights
 
 
@@ -91,9 +93,11 @@ def test_server_with_the_m8_configuration(model_dir: Path) -> None:
     # Grouped kernel, CUDA graphs (eager on CPU) and batched prefill: same greedy text.
     pytest.importorskip("triton", reason="Triton is not installed (no Windows wheels)")
     prompts = [byte_level_bpe().encode(t).ids for t in ("the capital of", "one two three")]
-    args = ["--model-dir", str(model_dir), "--device", "cpu", "--kv-gib", "0.01",
-            "--attention", "triton_grouped", "--cuda-graphs", "--prefill-attention", "batched",
-            "--max-num-seqs", "4", "--trace-requests"]  # fmt: skip
+    dev = "cuda" if torch.cuda.is_available() else "cpu"  # the kernels need the GPU there
+    args = ["--model-dir", str(model_dir), "--device", dev, "--dtype", "float32",
+            "--kv-gib", "0.01", "--attention", "triton_grouped", "--cuda-graphs",
+            "--prefill-attention", "batched", "--max-num-seqs", "4",
+            "--trace-requests"]  # fmt: skip
     with running_server(args, free_port(), timeout=120) as url:
 
         async def both() -> list[StreamResult]:
@@ -129,7 +133,7 @@ def test_server_with_chunked_prefill(model_dir: Path) -> None:
 
 def test_server_refuses_cuda_graphs_without_a_kernel(model_dir: Path) -> None:
     cmd = [sys.executable, "-m", "tinyserve.server", "--model-dir", str(model_dir),
-           "--cuda-graphs"]  # fmt: skip
+           "--attention", "torch", "--cuda-graphs"]  # fmt: skip
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     assert r.returncode != 0
     assert "--cuda-graphs needs" in r.stderr
@@ -141,3 +145,22 @@ def test_server_refuses_a_public_host(model_dir: Path) -> None:
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     assert r.returncode != 0
     assert "--allow-remote" in r.stderr
+
+
+def defaults(device: str, has_triton: bool = True, **given: object) -> tuple[object, ...]:
+    args = argparse.Namespace(device=device, attention=None, prefill_attention=None,
+                              cuda_graphs=None, fused_kernels=None)  # fmt: skip
+    vars(args).update(given)
+    fill_defaults(args, has_triton)
+    return args.attention, args.prefill_attention, args.cuda_graphs, args.fused_kernels
+
+
+def test_defaults_are_m9s_fastest_on_cuda_and_pytorch_elsewhere() -> None:
+    assert defaults("cuda") == ("triton_split", "batched", True, True)
+    assert defaults("cuda:1") == ("triton_split", "batched", True, True)
+    assert defaults("cpu") == ("torch", "per_seq", False, False)
+    assert defaults("cuda", has_triton=False) == ("torch", "per_seq", False, False)
+    # What is given is kept; graphs default off with the PyTorch attention.
+    assert defaults("cuda", attention="torch") == ("torch", "batched", False, True)
+    assert defaults("cuda", cuda_graphs=False, fused_kernels=False) == (
+        "triton_split", "batched", False, False)  # fmt: skip

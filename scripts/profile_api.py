@@ -133,6 +133,8 @@ def main() -> None:
             "--attention", args.attention, "--kv-gib", str(args.kv_gib),
             "--max-num-seqs", str(max(levels)), "--ignore-eos", "--trace-requests",
             "--switch-interval-ms", interval,
+            # M7's setup whatever the server's defaults (M9 changed them on cuda).
+            "--prefill-attention", "per_seq", "--no-cuda-graphs", "--no-fused-kernels",
         ]  # fmt: skip
         with running_server(serve_args, args.port) as url:
             asyncio.run(closed_loop(url, prompts[:2], 4, 2))  # warm-up, not reported

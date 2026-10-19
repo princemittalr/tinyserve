@@ -8,7 +8,7 @@ block size 16), with the k/v already in the cache, for two batches:
 
 It prints the median time of one call and the largest difference from the batched
 result, for the batched path and for each kernel tile (rows per tile, keys per step,
-warps). M9 step 8 picks ``triton_prefill.DEFAULT_TILE`` from this.
+warps). M9 step 9 picked ``triton_prefill.DEFAULT_TILE`` from this.
 
 Usage:
     python scripts/bench_prefill_kernel.py              # on the T4
@@ -25,7 +25,7 @@ from tinyserve.profiling import prefill_items, time_ms
 from tinyserve.triton_prefill import DEFAULT_TILE, paged_prefill_attention
 
 HQ, HKV, D, BS = 16, 8, 128, 16
-TILES = [DEFAULT_TILE, (16, 16, 4), (32, 16, 4), (32, 16, 8), (64, 32, 8), (64, 32, 4)]
+TILES = [(32, 32, 8), (16, 16, 4), (32, 16, 4), (32, 16, 8), (64, 32, 8), (64, 32, 4)]
 WORKLOADS = {"prefix": (32, 1024, 64), "prompts": (8, 0, 512)}  # (seqs, cached, new)
 
 

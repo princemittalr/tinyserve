@@ -40,8 +40,9 @@ import triton.language as tl
 # (rows_per_tile, block_n, num_warps). On the T4 Triton turns tl.dot into FMA loops (no
 # tensor cores before sm_80), and every value of a tile lives in registers: M9 step 3's
 # (64, 32, 4) spilled ~10 KB per thread to local memory and ran ~6x slower than batched
-# SDPA. This one compiles with no spill in fp16 and fp32 (scripts/check_t4_compile.py).
-DEFAULT_TILE = (32, 32, 8)
+# SDPA. Of the tiles scripts/bench_prefill_kernel.py timed on the T4 (M9 step 9), this
+# was fastest: 17.6 ms for 32 prefix hits (batched SDPA 20.6), spilling under 1 KB.
+DEFAULT_TILE = (64, 32, 8)
 
 
 @triton.jit
