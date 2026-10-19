@@ -179,8 +179,13 @@ out of a small batch.
 
 What is still open, measured: the eager prefill steps (~175 ms at C=32; chunked prefill would
 cap them), the unfused small kernels (~5.7 ms of GPU time per C=32 step), the grouped kernel
-at batch 1 (split-K over the context would give it more programs), and the HTTP path, which
-has not been re-measured with graphs.
+at batch 1 (split-K over the context would give it more programs), and TTFT p99 over HTTP
+(3,044 ms at C=32 with all three on; M6: 5,607 ms). *Inferred, not re-profiled:* that p99 is
+still mostly the held-back empty text of section 3.
+
+Over HTTP (one later session, `scripts/bench_api.py`): 85.2 / 566.6 / 1,332.0 / 1,724.2 tok/s
+at C = 1 / 8 / 32 / 64, 3.20x HF at C=32 (M6: 723.8). Greedy text through the API (fp32, prefix
+cache on, 120 prompts) is identical to HF `generate()`.
 
 ## How to reproduce
 

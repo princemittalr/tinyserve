@@ -132,6 +132,15 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   PROGRESS.md are transcribed from the printed output, except
   `results/m8_engine_profile_cuda.json` (step 3).
 
+  Over HTTP with the same three on (2026-10-19, `scripts/bench_api.py --attention triton_grouped
+  --cuda-graphs --prefill-attention batched`, the M6 HTTP workload): 85.2 / 566.6 / 1,332.0 /
+  1,724.2 tok/s at C = 1 / 8 / 32 / 64 (M6: 30.0 / 221.7 / 723.8 / 1,124.0), 3.20x HF at C=32.
+  TTFT p50 / p99 300 / 3,044 ms at C=32 and 471 / 4,741 ms at C=64; TPOT 21.9 / 23.4 ms at C=32.
+  The engine-alone numbers above are from another session, so the HTTP cost is not measured
+  here (it was 5.6-6.8% in M6). Greedy text through the API with all three and the prefix cache
+  (fp32, 120 prompts at once, half streamed) is identical to HF `generate()`. Raw data:
+  `results/m8_api_bench_cuda.json` (stayed on Kaggle; numbers transcribed).
+
 - Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
   `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
   at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
@@ -248,7 +257,6 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   block-table width; prefill and mixed steps run eagerly (a C=32 prefill step is ~175 ms).
   Graphs are off by default and need a Triton kernel. The graphs replay but do not fuse the
   small norm, RoPE and copy kernels (~5.7 ms of a 17 ms C=32 step on the GPU).
-- The HTTP benchmarks (M6, M7) predate M8 and have not been re-run with graphs.
 - Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
   one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
   decodes to empty text gets only at its end.
