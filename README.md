@@ -3,7 +3,7 @@
 A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
 Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
 
-> Status: **M9 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events, `stop`, `n`, logprobs) with a paged KV cache, continuous batching with optional chunked prefill, a radix prefix cache, Triton decode, prefill and fused norm / RoPE kernels, and CUDA graphs for decode steps. On a T4 its default GPU setup runs 1,580 tok/s at 32 concurrent sequences (3.80x HF `generate()`; M8 was 1,325 in the same session) and 129 tok/s for a single sequence (M8: 81). Over HTTP: 1,466 tok/s at C=32. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8 and M9 changed, and the comparison with vLLM. See [PROGRESS.md](PROGRESS.md).
+> Status: **M10 done.** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events, `stop`, `n`, logprobs) with a paged KV cache, continuous batching with optional chunked prefill, a radix prefix cache, Triton decode, prefill and fused norm / RoPE kernels, and CUDA graphs for decode steps. On a T4 its default GPU setup runs 1,604 tok/s at 32 concurrent sequences (3.86x HF `generate()`) and 141 tok/s for a single sequence, where vLLM 0.32 ran 136 in the same session. Over HTTP: 1,496 tok/s at C=32. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8, M9 and M10 changed, and the comparison with vLLM. See [PROGRESS.md](PROGRESS.md).
 
 ## Features
 
@@ -173,6 +173,26 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   session): fp32 0 mismatches / 1,920 tokens, fp16 4 near-ties (margin <= 0.0156), and over
   HTTP identical to HF. Numbers transcribed from the printed output.
 
+- M10 (2026-10-19, Kaggle T4, fp16, the M3 workload, `scripts/benchmark.py`): the default
+  setup F before and after merging q/k/v and gate/up into one matrix each, padding the output
+  head to 8 rows and retuning split-K, run before, after, after, before in one session (mean of
+  two runs; every after run beat every before run):
+
+  | Concurrency | before | after | gain | after / HF |
+  |---|---|---|---|---|
+  | 1 | 128.6 | 140.6 | +9.3% | 5.58x |
+  | 8 | 774.8 | 804.3 | +3.8% | 4.16x |
+  | 16 | 1,150.2 | 1,204.6 | +4.7% | not run |
+  | 32 | 1,549.1 | 1,603.9 | +3.5% | 3.86x |
+  | 64 | 1,954.4 | 1,987.0 | +1.7% | 4.40x |
+
+  vLLM 0.32 with CUDA graphs at C=1 in the same session: 135.5 tok/s. Over HTTP: 135.2 /
+  746.5 / 1,495.5 / 1,893.0 tok/s at C = 1 / 8 / 32 / 64. Also in M10: Triton had been
+  compiling kernel variants in the middle of runs (a new block-table width or split count),
+  which stalled a step for up to 1,425 ms; each kernel now compiles once per dtype. fp32 greedy
+  with F: 0 mismatches / 1,920 tokens at batch 32 and at batch 8; fp16: 6 near-ties (HF top-2
+  margin <= 0.0625). Numbers transcribed from the printed output.
+
 - Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
   `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
   at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
@@ -273,7 +293,13 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
   result equals cutting the whole text, however it is split; `n` choices equal seeded offline
   runs; logprobs equal the model's log_softmax per token.
 - `tests/test_t4_compile.py` compiles every Triton kernel for the T4 (sm_75) without a GPU and
-  fails on a compile error or a register spill over 1 KiB, which the interpreter cannot see.
+  fails on a compile error or a register spill over 1 KiB, which the interpreter cannot see, or
+  if a kernel specializes on a value that changes from step to step (M10).
+- M10: every decode kernel at block-table widths 1-32 and every split count, and the prefill
+  kernel at every width, equal the reference; on a GPU each kernel holds at most one compiled
+  variant per dtype after all of them. The merged q/k/v and gate/up matrices hold the original
+  rows, the separate weights are views of them (one copy), and the padded output head returns
+  exactly the given rows' logits.
 - GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
 
 ## Limitations
@@ -296,8 +322,14 @@ Every number here comes from a logged run with date and hardware; see [PROGRESS.
 - Triton has no Windows wheels: on Windows the kernel tests skip and the PyTorch path is used.
 - CUDA graphs cover pure decode steps only, up to `--max-num-seqs` sequences and a fixed
   block-table width; prefill and mixed steps run eagerly.
-- Chunked prefill is opt-in: it lowered TTFT at 32 and 64 streams but raised the tail at 8 in
-  the one run measured.
+- Chunked prefill is opt-in: it lowers the median TTFT (62 vs 184 ms at 32 streams) and the
+  longest gap between tokens at 32 and 64 streams, but costs 1-3% throughput and raises TTFT p99.
+- A decode step at 32 streams is 14.4 ms against a 5.9 ms roofline floor: cuBLAS reaches
+  173 GB/s on the GEMMs and the decode kernel 95 GB/s of the T4's 320. Inside a step with the
+  fused kernels the decode kernel takes ~1 ms longer than without them (they still save ~4.3 ms
+  per step); why was not identified, since GPU performance counters are blocked on Kaggle.
+- The Triton prefill kernel was compiled for sm_80 (tensor cores, no spills) but never run on
+  such a GPU.
 - Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
   one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
   decodes to empty text gets only at its end.

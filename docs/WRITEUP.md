@@ -1,7 +1,7 @@
-# TinyServe on a T4: where the time goes (M7, M8, M9)
+# TinyServe on a T4: where the time goes (M7-M10)
 
 Every number below comes from a logged run on a Kaggle Tesla T4 (2026-10-18 and 2026-10-19),
-fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed and section 7 what M9 changed. Raw data is in `results/`; each table names its file. Anything not measured is
+fp16, Qwen3-0.6B. Sections 1-5 are the M7 analysis, before M8; section 6 is what M8 changed, section 7 what M9 changed and section 8 what M10 answered. Raw data is in `results/`; each table names its file. Anything not measured is
 marked *inferred* or *projected*.
 
 ## 1. The roofline: the fastest a decode step could run
@@ -247,6 +247,81 @@ What is left, measured: decode at C=32 is ~15 ms per step against a roofline flo
 TTFT p99 over HTTP at C=32 is 2,755 ms, *inferred* to be mostly section 3's held-back empty
 text.
 
+## 8. What M10 answered
+
+M10 took the six things M9 measured but did not explain and answered each one on the T4
+(two Kaggle sessions, fp16, the M3 workload).
+
+**The chunked-prefill stall was the Triton compiler.** Triton compiles a kernel once per
+value of each constant argument, and for each int argument once per class: equal to 1, a
+multiple of 16, or neither. The block-table width (the longest sequence's block count) and
+split-K's split count reached the kernels that way. CUDA graphs compile their variants at
+capture, but a step that mixes prefill and decode runs eagerly and can meet a width or split
+count nothing has compiled yet, and then it waits for the compiler. A CPU replay of M9's runs
+through the real scheduler predicted which runs would compile mid-run; on the T4, with a fresh
+Triton cache per configuration, they did exactly there and nowhere else: E's first C=8 run
+compiled three variants and one step took 1,425 ms (TTFT p99 1,458 ms). The fix makes both
+values plain runtime ints (`do_not_specialize`), so each kernel compiles once per dtype, and
+`check_t4_compile.py` fails if a kernel specializes on a per-step value. After it, no run
+compiled anything; F at C=32 went from 1,502 to 1,550 tok/s, with TTFT p99 766 -> 371 ms.
+
+Measured without the stall, chunked prefill (512 tokens per step) is a latency setting:
+
+| C | tok/s, chunked / not | TTFT p50 (ms) | TTFT p99 (ms) | ITL max (ms) |
+|---|---|---|---|---|
+| 8 | 756.6 / 769.2 | 49 / 85 | 126 / 86 | 55 / 11 |
+| 32 | 1,533.8 / 1,550.0 | 62 / 184 | 446 / 371 | 63 / 190 |
+| 64 | 1,892.7 / 1,945.2 | 73 / 190 | 1,012 / 767 | 74 / 195 |
+
+It stays opt-in.
+
+**The decode kernel's slower time in F comes with the fused kernels.** At batch 32 split-K
+launches the plain grouped kernel, so A and F differ only in the fused kernels. Four setups
+alternating in one process: the kernel takes 4.9-5.2 ms per step in A and in F without the
+fused kernels, 5.8-6.3 ms in F and in A with them, while those steps are 4.3 ms shorter
+overall (15.0-15.7 vs 19.3-20.1 ms). Run alone on the same block tables, the kernel takes the
+same time in every setup. Recording the clock answered the first guess: the slower kernel ran
+at the *higher* SM clock, and the memory clock never moved from 5,000 MHz. What in the step
+makes it slower is not identified (*inferred* candidates: what the fused kernel leaves in the
+4 MB L2, or the order of memory traffic); the counters that could show it are blocked on Kaggle.
+
+**C=1 caught up with vLLM.** M9 was at 129.0 tok/s against vLLM's 142.4 (another session).
+The profile showed the GEMMs are most of a C=1 step, and a GEMM benchmark on the real weights
+showed where they lose time: at one row cuBLAS runs the 311 MB output head as a GEMV at 133-138
+GB/s, against ~240 GB/s from two rows up, and the seven per-layer GEMMs take 6-17% longer than
+the four of vLLM's merged layout (q/k/v as one matrix, gate/up as one). M10 merges the weights
+once at load (the separate entries become views, so memory stays 1x) and pads the head to 8
+rows. A sweep of split counts also showed batches 8-16 faster with more splits than M9 picked,
+so split-K now aims at ~1,024 programs below batch 32 (the gain was 7-15% in the second sweep,
+smaller than the first; single points of that sweep vary up to ~25% between sessions).
+
+| C | before | after | gain |
+|---|---|---|---|
+| 1 | 128.6 | 140.6 | +9.3% |
+| 8 | 774.8 | 804.3 | +3.8% |
+| 16 | 1,150.2 | 1,204.6 | +4.7% |
+| 32 | 1,549.1 | 1,603.9 | +3.5% |
+| 64 | 1,954.4 | 1,987.0 | +1.7% |
+
+Means of two runs each, run before, after, after, before in one session; every after run beat
+every before run. vLLM 0.32 with CUDA graphs ran 135.5 tok/s at C=1 in that session. fp32
+greedy vs HF: 0 mismatches / 1,920 tokens (at batch 32 and at batch 8, where split-K uses 16
+ranges); fp16: 6 near-ties at margins <= 0.0625, M9's bound.
+
+**Where a C=32 step goes now** (profiled, F): 14.4 ms, GPU busy 13.4 ms; GEMMs 6.9 ms at 173
+GB/s, the decode kernel 5.3 ms at 95 GB/s, against a roofline floor of 5.9 ms. The decode
+kernel reaches 95 GB/s at every split count, so that is its own ceiling on the T4; the GEMMs
+run at the same speed in isolation. Closing more of the gap needs a different decode kernel or
+GEMMs, which M10 does not attempt.
+
+**TTFT p99 over HTTP is held-back text.** Re-profiled with F at C=32: TTFT p99 2,723 ms, but
+to the first *token* 416 ms. The 3 of 128 requests over 1 s each had one chunk with empty
+text, held until their last token, as section 3 found in M7.
+
+**The Triton prefill kernel on sm_80** compiles to 48 tensor-core `mma` instructions with 174
+registers and no spill (sm_75: no `mma`, 255 registers, 936 bytes spilled). Its speed needs an
+A100-class GPU, which Kaggle and free Colab do not have, so it is out of scope.
+
 ## How to reproduce
 
 Kaggle T4, after the repo's notebook cell 1 (clone, `pip install --no-deps -e .`, weights):
@@ -288,4 +363,15 @@ M9 (one session, after cell 1):
 !python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_grouped --prefill-attention batched
 !python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels
 !python scripts/compare_hf.py --engine batched --device cuda --dtype float32 --cuda-graphs --attention triton_split --prefill-attention triton --fused-kernels --chunked-prefill --max-batch-tokens 64
+```
+
+M10 (one session, after cell 1; `PYTHONPATH=<older checkout>/src` runs the benchmark on older code):
+
+```
+!python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels --concurrency 1,8,16,32,64 --trace-steps
+!python scripts/decode_ab.py
+!python scripts/bench_decode_kernel.py
+!python scripts/bench_gemm.py
+!python scripts/profile_api.py --device cuda --attention triton_split --prefill-attention batched --cuda-graphs --fused-kernels --concurrency 32
+!python scripts/check_t4_compile.py --arch 80
 ```
