@@ -65,32 +65,46 @@ def build_batch(
     The tokens must already be appended to the table (``table.append(len(new_tokens))``),
     so they are the table's LAST ``len(new_tokens)`` positions. Building a batch only
     reads the tables; it never allocates.
+
+    Slots come from block lists (M9): a sequence's slots are its blocks' slot ranges laid
+    end to end, ``block * block_size + [0, 1, ..., block_size - 1]`` per block, cut at
+    its length. That is one small tensor op per sequence instead of one ``table.slot(p)``
+    call per token (M7 measured 13-15 ms per step for ~1,100-token contexts), and all
+    slots reach the device in one copy.
     """
     if not items:
         raise ValueError("a batch needs at least one sequence")
     tokens: list[int] = []
     positions: list[int] = []
-    new_slots: list[int] = []
-    seq_slots: list[torch.Tensor] = []
+    every: list[torch.Tensor] = []  # per sequence, on the host: the slots of all its tokens
+    new_rows: list[torch.Tensor] = []  # per sequence: which of those are the new tokens
     query_lens: list[int] = []
+    totals: list[int] = []
     blocks: list[list[int]] = []
+    offsets = torch.arange(items[0][1].block_size)
+    start = 0  # where this sequence's slots begin in the concatenation of all of them
     for new_tokens, table in items:
         n, total = len(new_tokens), table.num_tokens
         if not 0 < n <= total:
             raise ValueError(f"{n} new tokens but the table holds {total} positions")
-        every = [table.slot(p) for p in range(total)]
+        ids = torch.tensor(table.blocks, dtype=torch.int64)
+        every.append((ids[:, None] * table.block_size + offsets).flatten()[:total])
+        new_rows.append(torch.arange(start + total - n, start + total))
         tokens.extend(new_tokens)
         positions.extend(range(total - n, total))
-        new_slots.extend(every[total - n :])
-        seq_slots.append(torch.tensor(every, device=device))
         query_lens.append(n)
+        totals.append(total)
         blocks.append(table.blocks)
+        start += total
+    all_slots = torch.cat(every)
+    new_slots = all_slots[torch.cat(new_rows)]
+    on_device = all_slots.to(device)
     width = max(len(b) for b in blocks)
     return Batch(
         token_ids=torch.tensor(tokens, device=device),
         positions=torch.tensor(positions, device=device),
-        new_slots=torch.tensor(new_slots, device=device),
-        seq_slots=seq_slots,
+        new_slots=new_slots.to(device),
+        seq_slots=list(torch.split(on_device, totals)),
         query_lens=query_lens,
         block_tables=torch.tensor(
             [b + [0] * (width - len(b)) for b in blocks], dtype=torch.int32, device=device

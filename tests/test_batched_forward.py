@@ -46,6 +46,36 @@ def test_build_batch_flattens_positions_and_slots() -> None:
     assert batch.last_rows.tolist() == [2, 3]
 
 
+@settings(max_examples=60, deadline=None)
+@given(
+    lens=st.lists(st.tuples(st.integers(1, 40), st.integers(1, 40)), min_size=1, max_size=5),
+    block_size=st.sampled_from([1, 2, 4, 16]),
+    seed=st.integers(0, 2**16),
+)
+def test_slots_from_block_lists_equal_the_per_token_slots(
+    lens: list[tuple[int, int]], block_size: int, seed: int
+) -> None:
+    # M9: build_batch lays each table's blocks' slot ranges end to end; it must give
+    # exactly what BlockTable.slot gives per token, for blocks in any order.
+    alloc = BlockAllocator(1000)
+    alloc.allocate(int(torch.randint(0, 50, (1,), generator=torch.Generator().manual_seed(seed))))
+    items = []
+    for cached, new in lens:
+        t = BlockTable(alloc, block_size)
+        t.append(cached)
+        alloc.allocate(1)  # a gap, so the next table's blocks are not contiguous
+        t.append(new)
+        items.append(([1] * new, t))
+    batch = build_batch(items)
+    want_new = []
+    for (toks, t), got in zip(items, batch.seq_slots, strict=True):
+        every = [t.slot(p) for p in range(t.num_tokens)]
+        assert got.tolist() == every
+        want_new += every[t.num_tokens - len(toks) :]
+    assert batch.new_slots.tolist() == want_new
+    assert batch.new_slots.dtype == torch.int64
+
+
 def test_build_batch_does_not_allocate() -> None:
     alloc = BlockAllocator(8)
     t = BlockTable(alloc, 4)
