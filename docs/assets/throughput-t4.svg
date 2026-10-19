@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="418" viewBox="0 0 760 418" role="img" aria-labelledby="t d">
+<title id="t">TinyServe vs Hugging Face generate() throughput on a T4</title>
+<desc id="d">Output tokens per second at concurrency 1, 8, 16, 32 and 64. TinyServe: 144.2, 888.1, 1407.7, 2063.7, 2685.4. HF generate(): 23.9, 183.7, 336.7, 414.0, 450.7. Kaggle T4, fp16, Qwen3-0.6B, one session.</desc>
+<style>
+.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e4e3df}.axis{stroke:#bdbcb6}
+.ts{fill:#2a78d6}.hf{fill:#a3a29b}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+@media (prefers-color-scheme:dark){.bg{fill:#0d1117}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#30302e}.axis{stroke:#55544f}.ts{fill:#3987e5}.hf{fill:#6f6e68}}
+</style>
+<rect class="bg" width="760" height="418" rx="8"/>
+<text class="t1" x="24" y="34" font-size="17" font-weight="600">Output throughput on one free T4 (tok/s, higher is better)</text>
+<text class="t2" x="24" y="56" font-size="12.5">Qwen3-0.6B, fp16, 128-token prompts, 128 output tokens, closed loop. Same session, same prompts (M11 run 3).</text>
+<rect class="ts" x="24" y="68" width="12" height="12" rx="2"/><text class="t1" x="42" y="78.5" font-size="12.5">TinyServe</text>
+<rect class="hf" x="122" y="68" width="12" height="12" rx="2"/><text class="t1" x="140" y="78.5" font-size="12.5">HF generate()</text>
+<line class="grid" x1="110.0" y1="100" x2="110.0" y2="372" stroke-width="1"/>
+<text class="t2" x="110.0" y="390" font-size="11.5" text-anchor="middle">0</text>
+<line class="grid" x1="196.7" y1="100" x2="196.7" y2="372" stroke-width="1"/>
+<text class="t2" x="196.7" y="390" font-size="11.5" text-anchor="middle">500</text>
+<line class="grid" x1="283.3" y1="100" x2="283.3" y2="372" stroke-width="1"/>
+<text class="t2" x="283.3" y="390" font-size="11.5" text-anchor="middle">1,000</text>
+<line class="grid" x1="370.0" y1="100" x2="370.0" y2="372" stroke-width="1"/>
+<text class="t2" x="370.0" y="390" font-size="11.5" text-anchor="middle">1,500</text>
+<line class="grid" x1="456.7" y1="100" x2="456.7" y2="372" stroke-width="1"/>
+<text class="t2" x="456.7" y="390" font-size="11.5" text-anchor="middle">2,000</text>
+<line class="grid" x1="543.3" y1="100" x2="543.3" y2="372" stroke-width="1"/>
+<text class="t2" x="543.3" y="390" font-size="11.5" text-anchor="middle">2,500</text>
+<line class="grid" x1="630.0" y1="100" x2="630.0" y2="372" stroke-width="1"/>
+<text class="t2" x="630.0" y="390" font-size="11.5" text-anchor="middle">3,000</text>
+<line class="axis" x1="110" y1="100" x2="110" y2="372" stroke-width="1"/>
+<text class="t2" x="370" y="410" font-size="11.5" text-anchor="middle">output tokens / s</text>
+<text class="t1" x="96" y="129" font-size="13" text-anchor="end">C = 1</text>
+<path class="ts" d="M110,108 h21.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-21.0 z"/>
+<text class="t1" x="143.0" y="120.5" font-size="12" font-weight="600">144.2  (6.03x HF)</text>
+<path class="hf" d="M110,126 h0.1 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-0.1 z"/>
+<text class="t2" x="122.1" y="138.5" font-size="12">23.9</text>
+<text class="t1" x="96" y="185" font-size="13" text-anchor="end">C = 8</text>
+<path class="ts" d="M110,164 h149.9 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-149.9 z"/>
+<text class="t1" x="271.9" y="176.5" font-size="12" font-weight="600">888.1  (4.83x HF)</text>
+<path class="hf" d="M110,182 h27.8 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-27.8 z"/>
+<text class="t2" x="149.8" y="194.5" font-size="12">183.7</text>
+<text class="t1" x="96" y="241" font-size="13" text-anchor="end">C = 16</text>
+<path class="ts" d="M110,220 h240.0 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-240.0 z"/>
+<text class="t1" x="362.0" y="232.5" font-size="12" font-weight="600">1,407.7  (4.18x HF)</text>
+<path class="hf" d="M110,238 h54.4 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-54.4 z"/>
+<text class="t2" x="176.4" y="250.5" font-size="12">336.7</text>
+<text class="t1" x="96" y="297" font-size="13" text-anchor="end">C = 32</text>
+<path class="ts" d="M110,276 h353.7 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-353.7 z"/>
+<text class="t1" x="475.7" y="288.5" font-size="12" font-weight="600">2,063.7  (4.98x HF)</text>
+<path class="hf" d="M110,294 h67.8 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-67.8 z"/>
+<text class="t2" x="189.8" y="306.5" font-size="12">414.0</text>
+<text class="t1" x="96" y="353" font-size="13" text-anchor="end">C = 64</text>
+<path class="ts" d="M110,332 h461.5 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-461.5 z"/>
+<text class="t1" x="583.5" y="344.5" font-size="12" font-weight="600">2,685.4  (5.96x HF)</text>
+<path class="hf" d="M110,350 h74.1 a4,4 0 0 1 4,4 v8 a4,4 0 0 1 -4,4 h-74.1 z"/>
+<text class="t2" x="196.1" y="362.5" font-size="12">450.7</text>
+</svg>

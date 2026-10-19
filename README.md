@@ -1,365 +1,247 @@
+<div align="center">
+
 # TinyServe
 
-A from-scratch LLM inference engine for a single small GPU (NVIDIA T4, 16 GB, Turing).
-Target model: Qwen3-0.6B. Written to be read and understood, not to compete with vLLM.
+**A from-scratch LLM inference engine for one free NVIDIA T4.**
 
-> Status: **done (M0-M11).** TinyServe serves Qwen3-0.6B over an OpenAI-compatible HTTP API (`/v1/completions`, `/v1/chat/completions`, streaming with Server-Sent Events, `stop`, `n`, logprobs) with a paged KV cache, continuous batching with optional chunked prefill, a radix prefix cache, Triton decode, prefill and fused norm / RoPE kernels, and CUDA graphs for decode steps. On a T4 its default GPU setup runs 2,064 tok/s at 32 concurrent sequences (4.98x HF `generate()` in the same session) and 144 tok/s for a single sequence (vLLM 0.32 ran 136 in an M10 session, against TinyServe's 141 then). Over HTTP: 1,915 tok/s at C=32. [docs/WRITEUP.md](docs/WRITEUP.md) has the roofline argument, where the time goes, what M8 to M11 changed, and the comparison with vLLM. See [PROGRESS.md](PROGRESS.md).
+Paged KV cache · continuous batching · radix prefix cache · custom Triton attention kernels · CUDA graphs · OpenAI-compatible streaming API
 
-## Features
+[![CI](https://github.com/princemittalr/tinyserve/actions/workflows/ci.yml/badge.svg)](https://github.com/princemittalr/tinyserve/actions/workflows/ci.yml)
+![Python 3.11–3.14](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)
+![GPU: Tesla T4 (sm_75)](https://img.shields.io/badge/GPU-Tesla%20T4%20%28sm__75%29-76b900)
 
-1. Model forward pass loaded from safetensors (Hugging Face used only as a test reference)
-2. Paged KV cache with a block allocator
-3. Continuous-batching scheduler with preemption
-4. Radix-tree prefix cache with LRU eviction
-5. Custom Triton paged decode-attention kernels (one per query head, one that shares each
-   k/v load across a GQA head group, and a split-K variant for small batches)
-6. CUDA graphs for decode steps (one per batch-size bucket) and batched prefill attention
-7. A Triton varlen prefill-attention kernel over the cache blocks, and fused Triton kernels
-   for RMSNorm and for q/k norm + RoPE + the KV-cache write
-8. Chunked prefill under a per-step token budget
-9. Batched sampling (temperature, top-p, seeds, logprobs) and an OpenAI-compatible streaming
-   endpoint with `stop` strings and `n` choices
+[Results](#results) · [Quickstart](#quickstart) · [How it works](#how-it-works) · [What I learned](#what-the-measurements-taught-me) · [Testing](#how-its-tested) · [Limitations](#limitations) · [Write-up](docs/WRITEUP.md) · [Lab notebook](PROGRESS.md)
 
-## Quickstart (development)
+</div>
+
+---
+
+TinyServe serves [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) on a 16 GB Turing GPU, the kind Kaggle and Colab give away for free. It is about 5,300 lines of Python and Triton, built in twelve milestones (M0–M11), each one measured on a real T4 before the next began.
+
+- **5.0x the throughput of Hugging Face `generate()`** at 32 concurrent sequences (2,064 vs 414 tok/s), and 6.0x for a single sequence (144 vs 24 tok/s), same session, same prompts.
+- **Token-identical to Hugging Face in fp32:** 0 mismatches over 1,920 greedy tokens, batched, with the default GPU setup (every kernel and CUDA graphs on).
+- **Its own Triton kernels:** paged decode attention (per head, GQA-grouped, split-K), varlen prefill attention, and fused RMSNorm / q-k norm + RoPE + KV-write.
+- **Honest numbers:** every figure below comes from a logged run with its date, hardware and script in [PROGRESS.md](PROGRESS.md). Anything not measured is labelled *inferred*.
+
+It is written to be read and understood, not to compete with vLLM. It does not do tensor parallelism, quantization or multi-model serving.
+
+## Results
+
+<p align="center">
+  <img src="docs/assets/throughput-t4.svg" alt="Bar chart: TinyServe vs HF generate() output tok/s on a T4. C=1: 144.2 vs 23.9. C=8: 888.1 vs 183.7. C=16: 1,407.7 vs 336.7. C=32: 2,063.7 vs 414.0. C=64: 2,685.4 vs 450.7." width="760">
+</p>
+
+Kaggle Tesla T4, fp16, Qwen3-0.6B. The workload: seeded random 128-token prompts, 128 greedy output tokens each, EOS ignored, closed loop at concurrency C (HF runs static batches of C). TinyServe and HF ran in the same session on the same prompts (2026-10-19, M11 run 3).
+
+| Concurrency | TinyServe engine | TinyServe over HTTP | HF `generate()` | TinyServe / HF |
+|---:|---:|---:|---:|---:|
+| 1 | 144.2 | 139.5 | 23.9 | **6.03x** |
+| 8 | 888.1 | 825.6 | 183.7 | **4.83x** |
+| 16 | 1,407.7 | — | 336.7 | **4.18x** |
+| 32 | 2,063.7 | 1,914.5 | 414.0 | **4.98x** |
+| 64 | 2,685.4 | 2,379.5 | 450.7 | **5.96x** |
+
+<sub>Output tokens per second. HTTP: streaming `/v1/completions`, client on the same machine. TPOT p50 at C=32: 14.2 ms.</sub>
+
+**Correctness.** In fp32, greedy output matches HF `generate()` exactly: 0 mismatches over 120 prompts × 16 tokens, run batched at batch 32 and at batch 8 with every kernel and CUDA graphs on. Greedy text served over HTTP is identical to HF's too (checked with the default setup in M9). In fp16, 5 of the 120 prompts diverge, every one at a near-tie where HF's top two logits differ by at most 0.0625, so the flips are fp16 rounding rather than kernel bugs.
+
+**Against vLLM.** In an M10 session, vLLM 0.32 with CUDA graphs ran 135.5 tok/s at C=1 and TinyServe 140.6. That is the only same-session comparison. Earlier vLLM runs at higher concurrency came from a different session and torch version, so [the write-up](docs/WRITEUP.md#4-comparison-with-hf-generate-and-vllm) keeps them with their caveats rather than quoting them here as a headline.
+
+### How it got there
+
+Throughput at C=32 after each milestone. These rows come from different Kaggle sessions, and the same code varied up to ~6% between sessions, so from M8 on each change was also measured against the code before it in one session ([PROGRESS.md](PROGRESS.md#benchmark-results)).
+
+| Milestone | What changed | tok/s at C=32 |
+|---|---|---:|
+| M3 | Continuous batching, attention in PyTorch one sequence at a time | 88.0 |
+| M4 | Triton paged decode-attention kernel: one launch per layer for the whole batch | 716.0 |
+| M8 | CUDA graphs, batched prefill, GQA-grouped decode kernel | 1,343.8 |
+| M9 | Split-K decode, fused norm / RoPE / KV-write kernels | 1,580.3 |
+| M10 | Merged q/k/v and gate/up weights, padded output head, compile-once kernels | 1,603.9 |
+| M11 | Decode kernels at 1 warp per program instead of 4 | **2,063.7** |
+| | HF `generate()`, for reference | 414.0 |
+
+## Quickstart
+
+TinyServe needs Python 3.11+ and PyTorch 2.9+. Triton (bundled with PyTorch on Linux) enables the GPU kernels; without it, or on a CPU, the plain PyTorch reference paths run instead.
 
 ```bash
+git clone https://github.com/princemittalr/tinyserve.git && cd tinyserve
 python -m venv .venv && source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-pre-commit install          # run ruff and mypy on every commit
-ruff check . && ruff format --check . && mypy && pytest
+
+python scripts/inspect_weights.py     # downloads Qwen3-0.6B (~1.5 GB) to checkpoints/ and loads it strictly
 ```
 
-## Serving (OpenAI-compatible)
+**Generate** with TinyServe's own forward pass:
 
 ```bash
-python scripts/serve.py                     # 127.0.0.1:8000, the fastest T4 setup on a GPU
+python scripts/generate.py --prompt "The capital of France is" --max-new-tokens 20
+```
+
+**Serve** an OpenAI-compatible API (binds to 127.0.0.1:8000):
+
+```bash
+python scripts/serve.py
+```
+
+```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hi"}], "stream": true, "temperature": 0}'
 ```
 
-On a GPU with Triton the server defaults to the split-K decode kernel, batched prefill, the
-fused kernels and CUDA graphs (captured before it listens: a few seconds, ~220 MiB on a T4); on a
-CPU, to the PyTorch paths. `--no-cuda-graphs`, `--no-fused-kernels`, `--attention` and
-`--prefill-attention` override them; `--prefix-cache` and `--chunked-prefill` are opt-in. Any OpenAI client works with `base_url="http://127.0.0.1:8000/v1"`. Endpoints: `/v1/completions`,
-`/v1/chat/completions` (both with `"stream": true`), `/v1/models`, `/health`. Requests are
-limited in body size, prompt length, `max_tokens` and requests in flight (413 / 400 / 429).
-`stop` (up to 4 strings), `n` (up to 8 choices; with a seed, choice i uses seed + i) and
-logprobs (`logprobs: k` for completions, `logprobs` / `top_logprobs` for chat) follow OpenAI's
-formats.
+Any OpenAI client works:
 
-## Benchmarks
+```python
+from openai import OpenAI
 
-Every number here comes from a logged run with date and hardware; see [PROGRESS.md](PROGRESS.md).
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+stream = client.chat.completions.create(
+    model="Qwen3-0.6B",
+    messages=[{"role": "user", "content": "Explain paged attention in one sentence."}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
 
-- Correctness (2026-10-18, laptop CPU, fp32): 0 greedy mismatches vs HF over 120 prompts x 16 tokens,
-  without a KV cache (M1), with the paged KV cache (M2), and with all 120 prompts batched
-  through the continuous-batching engine (M3).
-- Correctness on the T4 (2026-10-18, fp16, same 120 prompts, batched engine): 7 prompts diverge
-  from HF fp16 with the Triton kernel and 6 without it (the same 6 plus one). Every divergence is a
-  near-tie: HF's top two logits differ by at most 0.0156, one fp16 rounding step.
-- Exactness of the kernel on the T4 (2026-10-18, fp32, same 120 prompts, batched engine with the
-  Triton kernel): 0 greedy mismatches / 1,920 tokens; max prefill logit difference 9.7e-05.
-- Throughput (2026-10-18, Kaggle T4, fp16, Qwen3-0.6B, 128-token random prompts, 128 output
-  tokens each, same prompts for both):
+<details>
+<summary><b>Server options</b></summary>
 
-  | Concurrency | M4 (Triton kernel) tok/s | M3 (PyTorch attention) tok/s | HF `generate()` tok/s | M4 / HF | M4 TTFT p50 / p99 | M4 TPOT p50 / p99 |
-  |---|---|---|---|---|---|---|
-  | 1 | 28.7 | 25.5 | 25.2 | 1.14x | 44 / 70 ms | 34.8 / 36.3 ms |
-  | 8 | 216.1 | 70.6 | 193.3 | 1.12x | 134 / 142 ms | 36.4 / 36.8 ms |
-  | 32 | 716.0 | 88.0 | 415.6 | 1.72x | 330 / 602 ms | 42.4 / 44.7 ms |
-  | 64 | 1168.2 | 90.4 | 451.3 | 2.59x | 337 / 1294 ms | 52.5 / 54.5 ms |
+On a GPU with Triton the server picks the fastest setup measured on the T4: split-K decode attention, batched prefill, fused kernels and CUDA graphs (captured before it starts listening, which takes a few seconds and ~220 MiB). On a CPU it uses the PyTorch reference paths.
 
-  M3 ran attention one sequence at a time: profiled at 64 sequences, that was 94% of a decode
-  step and ~30,600 kernel launches, with the GPU idle 82% of the time. The M4 kernel does all
-  sequences in one launch per layer (decode step 740 -> 40 ms). What is left is mostly launch
-  overhead of the small non-attention kernels (GPU busy 44% of a step). HF uses static batches,
-  so it reports no TTFT or TPOT. Raw data: `results/m4_bench_cuda.json`,
-  `results/m3_bench_cuda.json`, `results/m3_bench_hf_cuda.json`, `results/m4_profile*_cuda.json`.
-- Prefix cache (2026-10-18, Kaggle T4, fp16, Triton kernel): 4 random 1,024-token prefixes, each
-  request one of them plus its own 64-token suffix, 64 output tokens, closed loop, cache off vs on
-  on the same prompts (`scripts/bench_prefix.py`):
+| Flag | Effect |
+|---|---|
+| `--attention`, `--prefill-attention` | Pick the decode and prefill attention implementation |
+| `--no-cuda-graphs`, `--no-fused-kernels` | Turn off graphs or fused kernels |
+| `--prefix-cache` | Reuse KV blocks across requests that share a prompt prefix (opt-in) |
+| `--chunked-prefill` | Split long prompts across steps under `--max-batch-tokens` (opt-in) |
+| `--kv-gib`, `--block-size`, `--max-num-seqs` | KV-cache size, tokens per block, batch limit |
+| `--allow-remote` | Required to bind to anything but loopback; there is no authentication |
 
-  | Concurrency | tok/s off / on | TTFT p50 off / on | TTFT p99 off / on | TPOT p50 off / on | prompt tokens from cache |
-  |---|---|---|---|---|---|
-  | 1 | 27.6 / 29.5 | 232 / 42 ms | 234 / 236 ms | 33.1 / 32.9 ms | 71% |
-  | 8 | 121.4 / 188.0 | 266 / 111 ms | 1,944 / 1,138 ms | 61.7 / 37.9 ms | 82% |
-  | 32 | 149.4 / 335.1 | 346 / 704 ms | 8,928 / 1,994 ms | 207.3 / 81.7 ms | 91% |
+Endpoints: `/v1/completions` and `/v1/chat/completions` (both with `"stream": true`), `/v1/models`, `/health`. Supported: `temperature`, `top_p`, `seed`, `stop` (up to 4 strings), `n` (up to 8; with a seed, choice *i* uses seed + *i*) and logprobs, in OpenAI's formats. Oversized bodies, prompts, `max_tokens` and too many requests in flight get 413 / 400 / 429. Unsupported options such as `echo` or penalties get a 400 instead of being silently ignored.
 
-  Only the first request of each prefix misses. p99 at C=1 is one of those misses. At C=32 the
-  median TTFT got worse. Profiled in M7: hits arrive in waves of up to 25 prefills in one step
-  (645-685 ms), and 77% of such a step is prefill attention over the 1,024 cached tokens, run one
-  sequence at a time in PyTorch.
-  fp32 greedy parity with the cache on 24 chat prompts sharing a system prompt: 0 mismatches /
-  384 tokens. In fp32, outputs with the cache on and off are identical for 128 / 128 requests at
-  C=32 (fp16: 124 / 128, rounding). Raw data: `results/m5_prefix_bench_cuda.json`,
-  `results/m5_hf_compare_fp32_cuda.json`, `results/m5_prefix_bench_fp32_cuda.json`.
+</details>
 
-- HTTP API (2026-10-18, Kaggle T4, fp16, Triton kernel): the M3/M4 workload sent to
-  `scripts/serve.py` as streaming `/v1/completions` requests (128-token prompts, 128 output tokens,
-  closed loop, client on the same machine), next to the engine alone in the same session
-  (`scripts/bench_api.py`, `scripts/benchmark.py`):
+<details>
+<summary><b>Running on a free Kaggle or Colab T4</b></summary>
 
-  | Concurrency | tok/s engine / HTTP | HTTP cost | TTFT p50 engine / HTTP | TTFT p99 engine / HTTP | TPOT p50 engine / HTTP |
-  |---|---|---|---|---|---|
-  | 1 | 30.7 / 30.0 | 2.3% | 41 / 44 ms | 102 / 104 ms | 32.4 / 33.2 ms |
-  | 8 | 231.1 / 221.7 | 4.1% | 121 / 203 ms | 124 / 261 ms | 33.9 / 34.6 ms |
-  | 32 | 766.4 / 723.8 | 5.6% | 315 / 498 ms | 586 / 5,607 ms | 39.5 / 40.5 ms |
-  | 64 | 1,205.9 / 1,124.0 | 6.8% | 326 / 667 ms | 1,242 / 7,294 ms | 50.4 / 52.2 ms |
+```python
+%cd /kaggle/working
+!git clone -q https://github.com/princemittalr/tinyserve.git
+%cd /kaggle/working/tinyserve
+!pip install -q --no-deps -e . && pip install -q hypothesis fastapi uvicorn httpx
+!python scripts/inspect_weights.py
 
-  Streaming adds about 1 ms per token. Time to first token is the weak spot under load. Profiled
-  in M7 (`scripts/profile_api.py`), it is not the GIL: the event loop is never more than 9 ms
-  late. The median gap is requests arriving mid-step and waiting for it to end (~100 ms at 32
-  streams). The p99 is a few requests on random-token prompts whose whole output decodes to empty
-  text, so their only chunk arrives with their last token (confirmed: 3 of 128 at 32 streams,
-  1 chunk each, empty text). Measured to the first token instead, TTFT p99 is 731 ms at 32
-  streams and 1,426 ms at 64. Greedy text through the API (fp32, kernel, prefix cache, 120 prompts at once, half
-  streamed) is identical to HF `generate()`, and the chat template is identical to Qwen3's own.
-  Raw data: `results/m6_api_bench_cuda.json`, `results/m6_engine_bench_cuda.json`,
-  `results/m6_api_hf_compare_float32_cuda.json`.
+# The headline benchmark (default GPU setup) and the HF baseline on the same prompts
+!python scripts/benchmark.py --device cuda --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels --concurrency 1,8,16,32,64
+!python scripts/bench_hf.py --device cuda --concurrency 1,8,16,32,64
 
-- M8: CUDA graphs, batched prefill, grouped decode kernel (2026-10-18/19, Kaggle T4, fp16, the M3
-  workload above, `scripts/benchmark.py`). Each column adds one change, and each change was
-  measured against the configuration before it in one session (three sessions in all):
+# fp32 greedy parity against HF generate(), batched
+!python scripts/compare_hf.py --engine batched --device cuda --dtype float32 --cuda-graphs --attention triton_split --prefill-attention batched --fused-kernels
+```
 
-  | Concurrency | M4 kernel, eager | + CUDA graphs | + batched prefill | + grouped kernel | HF `generate()` | final / HF |
-  |---|---|---|---|---|---|---|
-  | 1 | 30.4 | 87.4 | 87.5 | 84.3 | 25.2 | 3.35x |
-  | 8 | 231.2 | 545.8 | 548.8 | 571.0 | 193.3 | 2.95x |
-  | 32 | 763.0 | 1,142.3 | 1,206.5 | 1,343.8 | 415.6 | 3.23x |
-  | 64 | 1,213.9 | 1,419.8 | 1,493.8 | 1,753.7 | 451.3 | 3.89x |
+Every milestone's exact commands are in [docs/WRITEUP.md § How to reproduce](docs/WRITEUP.md#how-to-reproduce).
 
-  The same-session pairs are 763.0 / 1,142.3 (graphs), 1,148.0 / 1,206.5 (batched prefill) and
-  1,213.8 / 1,343.8 (grouped kernel) at C=32. The same configuration differs by up to ~6% between
-  sessions, so read each gain from its pair, not from neighbouring columns. With all three at
-  C=32: TTFT p50 / p99 233 / 465 ms, TPOT 22.1 / 23.5 ms (M7: 39.5 ms). The grouped kernel is
-  2.7% slower at C=1 (inferred cause: 8 programs on 40 SMs at batch 1). fp32 greedy with all
-  three on: 0 mismatches / 1,920 tokens vs HF; fp16: 7 divergences, all near-ties (HF top-2
-  margin <= 0.0156). A graph replay equals the eager pass bit for bit (GPU test). Step trace at
-  C=32: a decode step takes 20.0 ms, the GPU is busy 89% of it, and the roofline floor is 31% of
-  the forward's time (M7: 17%). The JSON files of these runs stayed on Kaggle; the numbers in
-  PROGRESS.md are transcribed from the printed output, except
-  `results/m8_engine_profile_cuda.json` (step 3).
+</details>
 
-  Over HTTP with the same three on (2026-10-19, `scripts/bench_api.py --attention triton_grouped
-  --cuda-graphs --prefill-attention batched`, the M6 HTTP workload): 85.2 / 566.6 / 1,332.0 /
-  1,724.2 tok/s at C = 1 / 8 / 32 / 64 (M6: 30.0 / 221.7 / 723.8 / 1,124.0), 3.20x HF at C=32.
-  TTFT p50 / p99 300 / 3,044 ms at C=32 and 471 / 4,741 ms at C=64; TPOT 21.9 / 23.4 ms at C=32.
-  The engine-alone numbers above are from another session, so the HTTP cost is not measured
-  here (it was 5.6-6.8% in M6). Greedy text through the API with all three and the prefix cache
-  (fp32, 120 prompts at once, half streamed) is identical to HF `generate()`. Raw data:
-  `results/m8_api_bench_cuda.json` (stayed on Kaggle; numbers transcribed).
+## How it works
 
-- M9 (2026-10-19, Kaggle T4, fp16, the M3 workload, all columns in one session,
-  `scripts/benchmark.py`). A is M8's setup; F is the server's new GPU default:
+```mermaid
+flowchart TB
+    C["<b>HTTP clients</b><br/>OpenAI API, streamed over SSE"] --> A["<b>api.py · serving.py</b><br/>asyncio front end ⇄ one engine thread"]
+    A --> S["<b>scheduler.py</b><br/>admit · preempt · token budget"]
+    S --> B["<b>batch.py</b><br/>flatten every new token, no padding"]
+    B --> M["<b>model.py</b><br/>Qwen3 forward"]
+    M --> P["<b>sampling.py</b><br/>greedy · top-p · per-request seeds"]
+    P --> D["<b>detokenize.py</b><br/>incremental text, streamed back to clients"]
+    R["<b>radix_cache.py</b><br/>shared prefixes, LRU eviction"] <--> S
+    S <--> K["<b>block_allocator.py · block_table.py</b><br/>ref-counted 16-token KV blocks"]
+    T["<b>triton_*.py · cuda_graphs.py · kv_cache.py</b><br/>paged attention, fused norm / RoPE, graph replay"] <--> M
+```
 
-  | Concurrency | A: M8 | + Triton prefill | D: split-K, Triton prefill, fused | E: D + chunked prefill | F: split-K, batched prefill, fused | F / HF |
-  |---|---|---|---|---|---|---|
-  | 1 | 81.2 | 83.9 | 132.9 | 131.5 | 129.0 | 5.12x |
-  | 8 | 562.6 | 554.5 | 793.4 | 721.8 | 775.0 | 4.01x |
-  | 32 | 1,325.2 | 1,286.8 | 1,600.8 | 1,624.9 | 1,580.3 | 3.80x |
-  | 64 | 1,722.5 | 1,703.8 | 1,931.1 | 1,972.3 | 1,969.4 | 4.36x |
+`engine.py` runs the middle of this chain once per step, for as long as there is work. Every step, the **scheduler** re-plans the batch (continuous batching, as in Orca): finished sequences leave, waiting ones join if there are free KV blocks and token budget, and when the cache is full the newest running sequence is preempted and later recomputed, so the oldest always makes progress. The **batch** flattens every sequence's new tokens into one `[T]` tensor with no padding, so the linear layers run once for everyone. The **model** writes the new keys and values into the paged cache, then attends over each sequence's blocks through its block table.
 
-  Split-K and the fused kernels carry the gain: a C=32 decode step went from 17.3 to 13.8 ms of
-  GPU time, and with 2,048-token prompts at C=1 split-K alone gave 1.39x (another session). The
-  Triton prefill kernel gets no tensor cores on the T4 (Triton emits none before sm_80): it is
-  15% faster than batched SDPA on 32 prefix hits and 25% slower on fresh 512-token prompts, so
-  batched prefill stays the default. Chunked prefill cut the C=32 median TTFT from 168 to 55 ms
-  at the same throughput, but at C=8 its TTFT p99 was 430 ms against 82, so it stays opt-in.
-  Prefix workload with the cache on at C=32: A 487.8, F 533.2 tok/s. Over HTTP, A / F: 80.9 /
-  126.8, 534.2 / 730.9, 1,258.9 / 1,465.6 and 1,621.5 / 1,824.8 tok/s at C = 1 / 8 / 32 / 64.
-  fp32 greedy with every M9 option (64-token chunks): 0 mismatches / 1,920 tokens vs HF; fp16: 6
-  near-tie divergences (HF top-2 margin <= 0.0625). Greedy text through the API with every option
-  and the prefix cache (fp32): identical to HF. The default setup F on its own (another
-  session): fp32 0 mismatches / 1,920 tokens, fp16 4 near-ties (margin <= 0.0156), and over
-  HTTP identical to HF. Numbers transcribed from the printed output.
+### The pieces
 
-- M10 (2026-10-19, Kaggle T4, fp16, the M3 workload, `scripts/benchmark.py`): the default
-  setup F before and after merging q/k/v and gate/up into one matrix each, padding the output
-  head to 8 rows and retuning split-K, run before, after, after, before in one session (mean of
-  two runs; every after run beat every before run):
+| Component | File | Lines | Idea |
+|---|---|---:|---|
+| Paged KV cache | `kv_cache.py`, `block_table.py`, `block_allocator.py` | 260 | KV memory in fixed 16-token blocks, as in vLLM's PagedAttention. A sequence's block table maps position *p* to slot `blocks[p // 16] * 16 + p % 16`. Blocks are reference-counted so sequences and the prefix cache can share them. |
+| Scheduler | `scheduler.py`, `sequence.py` | 347 | FCFS admission under a sequence limit, a token budget and free blocks; preemption by recompute; optional chunked prefill. |
+| Radix prefix cache | `radix_cache.py` | 196 | A radix tree over token blocks, as in SGLang's RadixAttention. A new request adopts the longest cached whole-block prefix; unused leaves are evicted LRU before anyone is preempted. |
+| Decode attention | `triton_attention.py` | 586 | Three Triton kernels: one program per (sequence, query head); one per KV head that shares each k/v load across the GQA group; and a split-K variant that cuts long contexts into up to 16 ranges for small batches and merges the partial softmaxes. All read the block table in place with an online softmax. |
+| Prefill attention | `triton_prefill.py`, `attention.py` | 436 | A varlen Triton prefill kernel over cache blocks, and batched SDPA (the T4 default, see below). |
+| Fused kernels | `triton_fused.py` | 177 | RMSNorm, and q/k head norm + RoPE + KV-cache write in one kernel, matching the PyTorch path's rounding step by step. |
+| CUDA graphs | `cuda_graphs.py` | 173 | One captured decode step per batch-size bucket (1, 2, 4, 8, then multiples of 8); padding rows write to a block nobody owns. |
+| Model | `model.py`, `layers.py`, `weights.py`, `config.py` | 741 | Qwen3 from safetensors with a strict loader. No `transformers` at runtime; HF is used only as a test reference. |
+| Sampling | `sampling.py` | 128 | Batched temperature / top-p via the exponential race (argmax of *p / E*, *E* ~ Exp(1)); a seeded request gives the same tokens whatever batch it lands in. |
+| Serving | `serving.py`, `api.py`, `server.py`, `detokenize.py` | 1,057 | One engine thread, many asyncio clients. Disconnected clients are aborted and their blocks freed. Text is detokenized incrementally without splitting UTF-8 characters. |
+| Measurement | `bench.py`, `profiling.py`, `roofline.py` | 552 | Closed-loop benchmark (tok/s, TTFT, TPOT p50/p99), a per-step trace, and a roofline model checked against the real checkpoint's 596,049,920 parameters. |
 
-  | Concurrency | before | after | gain | after / HF |
-  |---|---|---|---|---|
-  | 1 | 128.6 | 140.6 | +9.3% | 5.58x |
-  | 8 | 774.8 | 804.3 | +3.8% | 4.16x |
-  | 16 | 1,150.2 | 1,204.6 | +4.7% | not run |
-  | 32 | 1,549.1 | 1,603.9 | +3.5% | 3.86x |
-  | 64 | 1,954.4 | 1,987.0 | +1.7% | 4.40x |
+## What the measurements taught me
 
-  vLLM 0.32 with CUDA graphs at C=1 in the same session: 135.5 tok/s. Over HTTP: 135.2 /
-  746.5 / 1,495.5 / 1,893.0 tok/s at C = 1 / 8 / 32 / 64. Also in M10: Triton had been
-  compiling kernel variants in the middle of runs (a new block-table width or split count),
-  which stalled a step for up to 1,425 ms; each kernel now compiles once per dtype. fp32 greedy
-  with F: 0 mismatches / 1,920 tokens at batch 32 and at batch 8; fp16: 6 near-ties (HF top-2
-  margin <= 0.0625). Numbers transcribed from the printed output.
+The full analysis, with profiles and tables, is in [docs/WRITEUP.md](docs/WRITEUP.md). The short version:
 
-- M11 (2026-10-19, Kaggle T4, fp16, the M3 workload, `scripts/benchmark.py`): the decode
-  kernels at one warp per program instead of four. Run 2 compared the tiles on the same code
-  (`--decode-tile`), 1x4, 1x2, 1x1, 1x1, 1x2, 1x4 in one session (mean of two runs each; every
-  1x1 run beat every other run); run 3 is the new default next to HF in one session:
-
-  | Concurrency | 1x4 (M10's kernel) | 1x1 | gain | run 3 | run 3 / HF |
-  |---|---|---|---|---|---|
-  | 1 | 141.9 | 144.2 | +1.6% | 144.2 | 6.03x |
-  | 8 | 813.9 | 894.6 | +9.9% | 888.1 | 4.83x |
-  | 16 | 1,216.9 | 1,421.1 | +16.8% | 1,407.7 | 4.18x |
-  | 32 | 1,638.9 | 2,090.8 | +27.6% | 2,063.7 | 4.98x |
-  | 64 | 2,068.1 | 2,705.6 | +30.8% | 2,685.4 | 5.96x |
-
-  At C=32 the decode kernel now takes 2.4 ms of a 12.5 ms step (M10: 5.3 of 14.4), 212 GB/s
-  (M10: 95). Over HTTP: 139.5 / 825.6 / 1,914.5 / 2,379.5 tok/s at C = 1 / 8 / 32 / 64. fp32
-  greedy: 0 mismatches / 1,920 tokens at batch 32 and at batch 8; fp16: 5 near-ties (HF top-2
-  margin <= 0.0625). The T4 reads 275 GB/s at best on a plain 512 MiB read (copy: 233-235), not
-  its 320 GB/s spec. Numbers transcribed from the printed output.
-
-- Where a decode step's time goes (M7, before M8; 2026-10-18, Kaggle T4, fp16, Triton kernel, M3 workload,
-  `scripts/profile_engine.py`): the step is nearly flat in batch size, 33.4 / 34.4 / 37.8 / 43.4 ms
-  at C = 1 / 8 / 32 / 64, while the roofline floor (reading 1.19 GB of weights plus the k/v at
-  320 GB/s) is 3.8 / 4.3 / 5.9 / 8.1 ms. At C=32 the GPU runs kernels for 16.7 ms of a 34.2 ms
-  forward pass (1,851 kernel launches per step), so about half the time it waits for Python to
-  launch the next one; `build_batch` adds 3.2 ms. The GEMMs reach 176 GB/s (55% of the T4's
-  spec), the decode kernel 89 GB/s (it loads each k/v twice). Raw data:
-  `results/m7_engine_profile_cuda.json`, `results/m7_prefix_steps_cuda.json`.
-
-- Comparison with HF `generate()` and vLLM (M7, before M8; 2026-10-18, Kaggle T4, fp16, the M3 workload: the
-  same seeded 128-token random prompts, 128 greedy output tokens, EOS ignored; closed loop at
-  C, HF in static batches of C; output tok/s; `scripts/bench_vllm.py`):
-
-  | Concurrency | HF `generate()` | TinyServe engine | TinyServe over HTTP | vLLM 0.32 eager | vLLM 0.32 (CUDA graphs) | TinyServe / vLLM |
-  |---|---|---|---|---|---|---|
-  | 1 | 25.2 | 30.7 | 30.0 | not run | 142.4 | 22% |
-  | 8 | 193.3 | 231.1 | 221.7 | not run | 682.0 | 34% |
-  | 32 | 415.6 | 766.4 | 723.8 | 814.3 | 1,103.2 | 69% |
-  | 64 | 451.3 | 1,205.9 | 1,124.0 | not run | 1,384.5 | 87% |
-
-  vLLM without CUDA graphs is within session noise of TinyServe at C=32 (814 vs 766 tok/s;
-  TinyServe's own C=32 result varied 716-766 over three sessions), and CUDA graphs make vLLM
-  1.35x faster than its eager mode: the gap is mostly kernel-launch overhead. The runs were in
-  different Kaggle sessions, vLLM on torch 2.13.0+cu130 and the rest on 2.11.0+cu128. Raw data:
-  `results/m7_vllm_bench_cuda.json`, `results/m3_bench_hf_cuda.json`,
-  `results/m6_engine_bench_cuda.json`, `results/m6_api_bench_cuda.json`.
-  After M8 the engine reaches 59% / 84% / 122% / 127% of vLLM 0.32 at C = 1 / 8 / 32 / 64. The
-  runs were in different sessions on different torch versions, and vLLM ran with default
-  settings, so read this as "on par or ahead at 32 and 64 on this workload", not as a general
-  claim. [docs/WRITEUP.md](docs/WRITEUP.md#6-what-m8-changed) has the caveats.
+1. **Decode is memory-bound, but the first bottleneck was Python.** A decode step reads all 1.19 GB of weights plus the KV cache, at an arithmetic intensity far below the T4's ridge point, so bytes set the floor. In M7, though, a C=32 forward pass took 34 ms against a 5.9 ms floor, and the GPU was idle about half of it, waiting for Python to issue the next of 1,851 kernel launches. CUDA graphs alone gave +50% at C=32.
+2. **Measure the ceiling instead of trusting the spec.** The T4's datasheet says 320 GB/s, but a plain 512 MiB read reaches 275 GB/s (a copy, 233–235). At 275 GB/s the C=32 floor is 6.9 ms, and TinyServe's step is 12.5 ms: the GEMMs take 6.8 ms (cuBLAS, 174 GB/s) and the decode kernel 2.4 ms (212 GB/s).
+3. **Fewer warps beat wider tiles.** Loading several KV blocks per loop iteration was slower at every batch above 1. Dropping from 4 warps per program to 1 made the decode kernel 2.0–2.45x faster on its own and gave +27.6% end to end at C=32. *Inferred* from register counts, since Kaggle blocks GPU counters: at 1 warp, 15 programs fit per SM instead of 6, so C=32's 256 programs run in one wave instead of two.
+4. **Triton compiles one variant per argument value class.** A per-step value (the block-table width, the split count) reaching a kernel as a specialized argument made Triton compile mid-run, stalling one step for 1,425 ms. Each kernel now compiles once per dtype, and a CPU test fails if a kernel specializes on a per-step value.
+5. **No tensor cores for Triton before sm_80.** On the T4, `tl.dot` becomes FMA loops with tiles in registers. The Triton prefill kernel is 15% faster than batched SDPA on prefix-cache hits but 25% slower on fresh 512-token prompts, so SDPA stays the default. Compiled for sm_80, the same kernel emits 48 tensor-core `mma` instructions, but no free GPU can run it.
+6. **The slow-TTFT tail was not the GIL.** HTTP TTFT p99 was seconds while the event loop was never more than 11 ms late. The slow requests were random-token outputs that decode to empty text, so their first visible chunk arrived only with their last token. Measured to the first token, p99 at C=32 is 416 ms (M10).
 
 ## How it's tested
 
-- CPU tests run in GitHub Actions on Python 3.11, 3.12, 3.13 and 3.14 on every push; the job fails if
-  any test fails. The same lint and type checks run locally as a pre-commit hook.
-- The weight loader is tested on small synthetic checkpoints (missing, unexpected, misshapen
-  and fp16-overflowing tensors). `tests/test_real_checkpoint.py` checks the real Qwen3-0.6B
-  files when `TINYSERVE_MODEL_DIR` is set.
-- `tests/test_hf_parity.py` builds a tiny random Qwen3 with Hugging Face transformers, saves it,
-  loads it through TinyServe's own loader, and checks logits and greedy tokens match (runs in CI).
-- `scripts/compare_hf.py` compares greedy tokens with HF `generate()` on the real Qwen3-0.6B over
-  120 prompts (`benchmarks/prompts/m1_greedy.txt`).
-- The block allocator and block tables have Hypothesis property tests: random allocate/free
-  traffic must never hand out a block twice, must reject double frees, and must not leak blocks.
-  With sharing (M5), every block's reference count must equal the number of owners holding it.
-- The radix prefix cache has a Hypothesis test that plays the scheduler with colliding random
-  prompts and random eviction: every match must return blocks computed for exactly the query's
-  prefix, blocks a running sequence uses are never evicted, and no block leaks.
-- With the prefix cache on, the scheduler and engine must give exactly the same outputs as without
-  it (fake model, and M1 greedy on the tiny Qwen3, incl. tight caches with eviction and
-  preemption and the Triton kernel path), and run fewer prompt tokens.
-- Paged attention and the cached model are checked against the no-cache M1 path (logits and
-  greedy tokens), including blocks scattered in random order and blocks reused with stale data.
-- The continuous-batching scheduler has a Hypothesis test over random workloads (every request
-  finishes with the right output, no leaked blocks, no livelock), and the engine's greedy output
-  matches the single-sequence path with and without preemptions.
-- `tests/test_devices.py` runs the model on PyTorch's `meta` device, so a tensor created on the
-  wrong device fails on CPU instead of on the GPU.
-- The Triton decode kernel is compared with the PyTorch reference (within 1e-5 in fp32, 1e-3 in
-  fp16) across head groupings, block sizes, sequence lengths and scattered blocks; every cache slot
-  no sequence owns holds NaN, so any out-of-range read fails. Without a GPU (CI) the kernel runs in
-  Triton's interpreter; on the T4 the compiled kernel runs. The engine with the kernel matches the
-  PyTorch path's greedy tokens, with and without preemptions.
-- Sampling is checked statistically: over 100,000 draws, token frequencies must match
-  softmax(logits / temperature) and the renormalised top-p nucleus, a Hypothesis test checks the
-  top-p set is the smallest most likely one, and a seeded request must give the same tokens
-  alone, in a mixed batch, and when it is preempted and recomputed.
-- The serving loop runs real asyncio clients against the engine thread: streamed tokens equal
-  greedy output, concurrent clients share steps, a client that disconnects (or is still queued)
-  is aborted and every block comes back, and a crashed engine fails every open request.
-  Streamed text must equal the full decode for random UTF-8 cut into random byte tokens.
-- The HTTP API is tested end to end on the tiny model: greedy text through both endpoints,
-  streamed and not, equals the engine's; every limit returns OpenAI's error shape with the right
-  status; a client that disconnects mid-stream or before its answer frees every block.
-- `tests/test_server_e2e.py` starts the real server process on a tiny checkpoint and checks,
-  over a socket, that streamed and plain answers equal the offline engine's greedy text.
-- The roofline model's byte counts are checked against the real checkpoint's 596,049,920
-  parameters and against every tensor of the tiny test checkpoint; the engine's step trace must
-  not change any output.
-- Both decode kernels run every kernel test against the same PyTorch reference, and a
-  non-power-of-2 head group is rejected.
-- CUDA graphs (M8): the padded fixed-shape decode step equals `forward_batch` and writes only the
-  new tokens' slots and the padding block; padding rows never change real rows; on the GPU a
-  graph replay equals the eager pass bit for bit, capture touches only the padding block, and the
-  step runs with `torch.cuda.set_sync_debug_mode("error")`. The engine takes the graph path
-  exactly on pure-decode steps, falls back past the largest bucket or block-table width, and
-  matches M1 greedy with preemptions and the prefix cache.
-- Batched prefill attention equals the per-sequence path for plain prompts, prefix-cache hits
-  and one-token sequences, and the engine with it matches M1 greedy.
-- The server is run end to end with the grouped kernel, graphs and batched prefill on the tiny
-  checkpoint: same greedy text as the offline engine, and its trace shows graph steps.
-- M9: chunked prefill has a Hypothesis test over random workloads (each step within budget,
-  every sequence gets a token, outputs correct, no leaks) and matches M1 greedy with
-  preemptions, the prefix cache, both kernels and the graph path. The varlen prefill kernel,
-  the split-K decode kernel and the fused kernels are checked against the PyTorch references
-  (a Hypothesis test over random batches for the prefill kernel), and the engine with every M9
-  option at once matches M1 greedy. `stop` matching has a Hypothesis test that the streamed
-  result equals cutting the whole text, however it is split; `n` choices equal seeded offline
-  runs; logprobs equal the model's log_softmax per token.
-- `tests/test_t4_compile.py` compiles every Triton kernel for the T4 (sm_75) without a GPU and
-  fails on a compile error or a register spill over 1 KiB, which the interpreter cannot see, or
-  if a kernel specializes on a value that changes from step to step (M10).
-- M10: every decode kernel at block-table widths 1-32 and every split count, and the prefill
-  kernel at every width, equal the reference; on a GPU each kernel holds at most one compiled
-  variant per dtype after all of them. The merged q/k/v and gate/up matrices hold the original
-  rows, the separate weights are views of them (one copy), and the padded output head returns
-  exactly the given rows' logits.
-- M11: the decode kernels at every tile of 1-8 blocks per loop iteration, with ranges and
-  sequences that end mid-tile, equal the reference, and the default tile gives M10's result.
-- GPU tests are marked `@pytest.mark.gpu` and run on a Kaggle/Colab T4.
+**598 tests pass on the T4** (2 skipped: the real-checkpoint tests). On every push, GitHub Actions runs the suite on CPU for Python 3.11, 3.12, 3.13 and 3.14, with ruff and strict mypy; Triton kernels run there in Triton's CPU interpreter. Highlights:
+
+- **Parity with Hugging Face.** A tiny random Qwen3 built with `transformers` is loaded through TinyServe's own loader in CI, and its logits and greedy tokens must match. `scripts/compare_hf.py` runs the same check on the real model over 120 prompts.
+- **Property tests (Hypothesis).** The block allocator never hands out a block twice and never leaks; reference counts always equal owners; every radix-cache match returns blocks computed for exactly that prefix; the scheduler finishes every request without livelock; chunked prefill stays within budget.
+- **Kernels against references.** Every Triton kernel is compared with a PyTorch reference across head groupings, block sizes, lengths, tiles and split counts. Cache slots no sequence owns hold NaN, so any out-of-range read fails.
+- **Compile checks for the T4 without a T4.** `tests/test_t4_compile.py` compiles every kernel for sm_75 and fails on register spills over 1 KiB, which the interpreter cannot see.
+- **Device bugs on a laptop.** The model also runs on PyTorch's `meta` device, so a tensor created without `device=` fails on CPU instead of on the GPU.
+- **CUDA graphs.** On the GPU, a graph replay equals the eager pass bit for bit, and the step runs under `torch.cuda.set_sync_debug_mode("error")`.
+- **End to end.** The real server process is started on a tiny checkpoint and must stream the same text as the offline engine. Disconnecting clients free every block.
+
+```bash
+ruff check . && ruff format --check . && mypy && pytest     # GPU tests (@pytest.mark.gpu) skip without CUDA
+```
 
 ## Limitations
 
-- Single GPU only. No tensor parallelism, no quantization, not for deployment.
-- Only Qwen3 dense checkpoints are supported; other architectures are rejected at load time.
-- Weights are loaded in fp16 (the T4 has no fast bf16), not the checkpoint's native bf16.
-- The prefix cache reuses whole blocks only (16 tokens by default), and never a prompt's last
-  token; eviction drops whole leaves of the tree.
-- The API has no authentication (it binds to 127.0.0.1), serves one model, and does not
-  implement `echo` or penalties (requests using them get a 400). A logprob token's text is that
-  token decoded alone. Chat content must be plain text; the chat template turns Qwen3's
-  thinking off.
-- Sampling supports temperature and top-p only (no top-k or repetition penalties). Requests
-  without a seed are reproducible per run, not per request.
-- On the T4, Triton uses no tensor cores (none before sm_80), so the Triton prefill kernel is
-  slower than batched SDPA on fresh prompts; batched prefill (fp32 SDPA over a padded gather
-  from the cache) is the default.
-- The kernels are tuned only for the T4; the grouped kernels need a power-of-2 head group.
-- Triton has no Windows wheels: on Windows the kernel tests skip and the PyTorch path is used.
-- CUDA graphs cover pure decode steps only, up to `--max-num-seqs` sequences and a fixed
-  block-table width; prefill and mixed steps run eagerly.
-- Chunked prefill is opt-in: it lowers the median TTFT (62 vs 184 ms at 32 streams) and the
-  longest gap between tokens at 32 and 64 streams, but costs 1-3% throughput and raises TTFT p99.
-- A decode step at 32 streams is 12.5 ms against a roofline floor of 6.9 ms at the 275 GB/s a
-  plain read reaches on the T4 (5.9 ms at the 320 GB/s spec). The GEMMs take 6.8 ms at 174 GB/s
-  with cuBLAS, and cuBLASLt is no better overall (-4.6% at 32 rows, +2% at 64); a Triton GEMM
-  was not tried, since at 32 rows without tensor cores (none in Triton before sm_80) it would
-  need ~9.6 TFLOPS of fp32 FMA, above the T4's 8.1. The decode kernel takes 2.4 ms at 212 GB/s.
-- Final, not measurable on free hardware (Kaggle blocks GPU performance counters): in M10, with
-  the 4-warp decode kernel, the fused kernels made it ~1 ms slower inside a step while saving
-  ~4.3 ms; why was not identified. Why one warp per program is fastest is inferred from
-  register counts (programs per SM), not measured.
-- Final: the Triton prefill kernel was compiled for sm_80 (tensor cores, no spills) but never
-  run on such a GPU; Kaggle and free Colab have none.
-- Benchmarked on one synthetic workload (random-token prompts, fixed lengths, EOS ignored) on
-  one GPU type. TTFT over HTTP is measured to the first text chunk, which a request whose output
-  decodes to empty text gets only at its end.
+- **One GPU, one model family.** No tensor parallelism and no quantization. Only dense Qwen3 checkpoints load; anything else is rejected at load time.
+- **Tuned for the T4 only.** Warps, split counts and default paths were chosen from T4 measurements. Weights load in fp16, because the T4 has no fast bf16.
+- **One benchmark workload.** Random-token prompts, fixed lengths, EOS ignored, on one GPU type. Real traffic and other GPUs may behave differently.
+- **Not production-ready.** The API has no authentication (it binds to 127.0.0.1 by default) and no `echo`, top-k or penalties. Requests without a seed are reproducible per run, not per request.
+- **The prefix cache reuses whole 16-token blocks only.** It is opt-in, and so is chunked prefill, which lowers median TTFT but costs 1–3% throughput and raises TTFT p99.
+- **CUDA graphs cover pure decode steps only.** Prefill and mixed steps run eagerly.
+- **Triton has no Windows wheels.** On Windows the kernel tests skip and the PyTorch paths run.
+- **Questions free hardware cannot answer:** why the fused kernels slowed the 4-warp decode kernel by ~1 ms inside a step (M10), and the mechanism behind the 1-warp speed-up, need GPU performance counters, which Kaggle blocks. The Triton prefill kernel on sm_80+ is compile-checked only.
 
-## Prior art
+## Repository layout
 
-vLLM (PagedAttention, SOSP 2023), nano-vllm, Mini-SGLang.
+```
+src/tinyserve/      the engine: model, cache, scheduler, kernels, server (~5,300 lines)
+tests/              37 test modules: unit, property, parity, kernel, compile and end-to-end tests
+scripts/            serve, generate, benchmark, profile and HF / vLLM comparison scripts
+benchmarks/prompts/ the 120 parity prompts and the shared-prefix chat prompts
+results/            raw JSON from the runs through M8 (later runs are transcribed in PROGRESS.md)
+docs/WRITEUP.md     roofline, where the time goes, comparison with vLLM, how to reproduce
+PROGRESS.md         milestone log, design decisions and every benchmark with date and hardware
+```
+
+## Prior art and acknowledgements
+
+TinyServe re-implements ideas from these projects at a size one person can read:
+
+- **vLLM** — PagedAttention (Kwon et al., SOSP 2023), the paged KV cache and block tables.
+- **SGLang** — RadixAttention, the radix-tree prefix cache.
+- **Orca** (Yu et al., OSDI 2022) — iteration-level scheduling, i.e. continuous batching.
+- **nano-vllm** and **Mini-SGLang** — proof that a readable serving engine can be small.
+- **FlashAttention** and **FlashDecoding** — the online softmax and split-K decoding.
+
+What TinyServe adds is a T4-first focus: its own Triton kernels tuned for Turing, and a benchmark suite where every number can be traced to a logged run.
+
+TinyServe was built step by step with an AI mentor. [PROGRESS.md](PROGRESS.md) records, step by step, which parts the mentor wrote and which I filled in.
+
+## License
+
+MIT, as declared in [`pyproject.toml`](pyproject.toml).
