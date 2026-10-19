@@ -53,7 +53,7 @@ from tinyserve.config import ModelConfig
 from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine, StepRecord
 from tinyserve.kv_cache import KVCache
-from tinyserve.model import Qwen3
+from tinyserve.model import DECODE_ATTENTIONS, Qwen3
 from tinyserve.profiling import (
     attention_replaced,
     fill_to_decode,
@@ -159,7 +159,8 @@ def run_m3(args: argparse.Namespace, cfg: ModelConfig, model: Qwen3, dev: torch.
     attn_ms = gpu_time_ms(prof, lambda name: "paged_decode" in name) / k
     w_bytes = weight_bytes(cfg, elem)
     kv_min = context / k * kv_bytes_per_token(cfg, elem)
-    group = cfg.num_heads // cfg.num_kv_heads
+    # The M4 kernel loads each k/v once per query head; the M8 grouped one once per kv head.
+    group = cfg.num_heads // cfg.num_kv_heads if args.attention == "triton" else 1
     prof_out: dict[str, Any] = {
         "concurrency": pc, "steps": k, "gpu_busy": s["gpu_busy"], **per_step,
         "gemm_ms": gemm_ms, "gemm_gbps": w_bytes / gemm_ms / 1e6 if gemm_ms else None,
@@ -262,7 +263,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
-    parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
     parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
                         help="per sequence, or one call per layer (M8)")  # fmt: skip
     parser.add_argument("--workload", choices=["m3", "prefix"], default="m3")

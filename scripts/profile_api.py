@@ -35,6 +35,7 @@ from tinyserve.bench import num_requests_for, percentile, synthetic_prompts
 from tinyserve.client import closed_loop, running_server
 from tinyserve.config import ModelConfig
 from tinyserve.engine import StepRecord
+from tinyserve.model import DECODE_ATTENTIONS
 from tinyserve.profiling import TTFT_SEGMENTS, summarize_steps, ttft_segments
 
 
@@ -106,7 +107,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
     parser.add_argument("--concurrency", default="32,64")
     parser.add_argument("--switch-intervals", default="5",
                         help="GIL switch intervals to run, ms (Python's default is 5)")  # fmt: skip

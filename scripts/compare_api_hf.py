@@ -26,6 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tinyserve.api import ChatMessage, qwen3_chat_prompt
 from tinyserve.client import running_server, stream_completion
+from tinyserve.model import DECODE_ATTENTIONS
 from tinyserve.server import eos_ids
 
 CONVERSATIONS: list[list[dict[str, str]]] = [
@@ -81,7 +82,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["float32", "float16"], default="float32")
-    parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--out", type=Path, default=None)

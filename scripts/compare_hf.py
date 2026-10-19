@@ -36,7 +36,7 @@ from tinyserve.config import ModelConfig
 from tinyserve.cuda_graphs import DecodeGraphs
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
-from tinyserve.model import Qwen3, greedy_generate, greedy_generate_paged
+from tinyserve.model import DECODE_ATTENTIONS, Qwen3, greedy_generate, greedy_generate_paged
 from tinyserve.weights import load_weights
 
 
@@ -73,7 +73,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float32 on cpu, float16 on cuda")  # fmt: skip
-    parser.add_argument("--attention", choices=["torch", "triton"], default="torch",
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch",
                         help="batched engine's decode attention (M4 kernel: triton)")  # fmt: skip
     parser.add_argument("--prefill-attention", choices=["per_seq", "batched"], default="per_seq",
                         help="per sequence, or one call per layer (M8)")  # fmt: skip
@@ -87,7 +87,7 @@ def main() -> None:
     dtype = getattr(torch, args.dtype or ("float32" if device.type == "cpu" else "float16"))
     if args.out is None:
         milestone = {"m1": "m1", "paged": "m2", "batched": "m3"}[args.engine]
-        milestone = "m4" if args.attention == "triton" else milestone
+        milestone = "m4" if args.attention != "torch" else milestone
         milestone = "m5" if args.prefix_cache else milestone
         milestone = "m8" if args.cuda_graphs else milestone
         suffix = "" if device.type == "cpu" else f"_{device.type}"

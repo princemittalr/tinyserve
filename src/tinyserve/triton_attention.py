@@ -20,6 +20,10 @@ order and keeps a running ("online") softmax, so it never holds all the scores a
 When a block raises the maximum from m to m_new, everything summed so far was scaled by
 exp(-m) and must be rescaled by alpha = exp(m - m_new). At the end, out = acc / sum_exp,
 which equals softmax(scores) @ v exactly (up to rounding).
+
+M8 adds ``paged_decode_attention_grouped``: the same math with one program per
+(sequence, kv head), so the query heads of a GQA group share each k/v load. M7 measured
+the per-head kernel loading every k/v twice for Qwen3-0.6B (16 query heads, 8 kv heads).
 """
 
 import torch
@@ -92,6 +96,70 @@ def _paged_decode_kernel(
     # TODO(you) 10: normalise: softmax weights must sum to 1.
     out = acc / sum_exp
     tl.store(out_ptr + seq * stride_ob + head * stride_oh + d, out.to(out_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _paged_decode_grouped_kernel(
+    q_ptr,  # [B, Hq, D]
+    k_ptr,  # [num_slots, Hkv, D], one layer of the cache
+    v_ptr,  # [num_slots, Hkv, D]
+    out_ptr,  # [B, Hq, D]
+    block_tables_ptr,  # [B, max_blocks] int32
+    context_lens_ptr,  # [B] int32
+    scale,
+    stride_qb,
+    stride_qh,
+    stride_ob,
+    stride_oh,
+    stride_ks,
+    stride_kh,
+    stride_bt,
+    GROUP: tl.constexpr,  # query heads per kv head (a power of 2)
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """M8: the same online softmax, one program per (sequence, KV head) instead of per
+    query head. The GROUP query heads that share a kv head are handled together: each
+    block of k/v is loaded once and used for all of them, where ``_paged_decode_kernel``
+    loads it GROUP times (once per query-head program). Everything per head (m, sum_exp,
+    acc, the scores) gains a leading [GROUP] axis."""
+    seq = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    ctx_len = tl.load(context_lens_ptr + seq)
+
+    g = tl.arange(0, GROUP)
+    heads = kv_head * GROUP + g  # [GROUP]: the query heads that read this kv head
+    d = tl.arange(0, HEAD_DIM)
+    t = tl.arange(0, BLOCK_SIZE)
+    q_off = seq * stride_qb + heads[:, None] * stride_qh + d[None, :]  # [GROUP, D]
+    q = tl.load(q_ptr + q_off).to(tl.float32)
+
+    m = tl.full([GROUP], float("-inf"), tl.float32)
+    sum_exp = tl.zeros([GROUP], tl.float32)
+    acc = tl.zeros([GROUP, HEAD_DIM], tl.float32)
+
+    num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
+    for j in range(0, num_blocks):
+        block = tl.load(block_tables_ptr + seq * stride_bt + j)
+        valid = j * BLOCK_SIZE + t < ctx_len
+        slot = block * BLOCK_SIZE + t
+        off = slot[:, None] * stride_ks + kv_head * stride_kh + d[None, :]  # [BLOCK_SIZE, D]
+        k = tl.load(k_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_ptr + off, mask=valid[:, None], other=0.0).to(tl.float32)
+
+        # [GROUP, BLOCK_SIZE]: each query head's dot product with each key of the block.
+        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
+        s = tl.where(valid[None, :], s, float("-inf"))
+        m_new = tl.maximum(m, tl.max(s, axis=1))
+        alpha = tl.exp(m - m_new)  # [GROUP]
+        p = tl.exp(s - m_new[:, None])  # [GROUP, BLOCK_SIZE]
+        sum_exp = sum_exp * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
+        m = m_new
+
+    out = acc / sum_exp[:, None]
+    o_off = seq * stride_ob + heads[:, None] * stride_oh + d[None, :]
+    tl.store(out_ptr + o_off, out.to(out_ptr.dtype.element_ty))
 
 
 def paged_decode_attention(
@@ -182,6 +250,56 @@ def launch_paged_decode(
         k_cache.stride(0), k_cache.stride(1),
         block_tables.stride(0),
         GROUP=num_q_heads // k_cache.shape[1],
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=head_dim,
+    )  # fmt: skip
+    return out
+
+
+def paged_decode_attention_grouped(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """``paged_decode_attention`` with the grouped kernel (M8): same arguments, same result.
+
+    One program per (sequence, kv head), so each k/v block is loaded once per head group
+    instead of once per query head. Needs ``Hq / Hkv`` to be a power of 2 (for tl.arange).
+    """
+    check_decode_args(q, k_cache, v_cache, block_tables, context_lens, block_size)
+    group = q.shape[1] // k_cache.shape[1]
+    if group & (group - 1):
+        raise ValueError(f"the grouped kernel needs a power-of-2 head group, got {group}")
+    return launch_paged_decode_grouped(
+        q, k_cache, v_cache, block_tables, context_lens, scale, block_size
+    )
+
+
+def launch_paged_decode_grouped(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """The grouped kernel's launch alone: no checks, no host sync (CUDA-graph safe)."""
+    b, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    out = torch.empty_like(q)
+    _paged_decode_grouped_kernel[(b, num_kv_heads)](
+        q, k_cache, v_cache, out, block_tables, context_lens,
+        scale,
+        q.stride(0), q.stride(1),
+        out.stride(0), out.stride(1),
+        k_cache.stride(0), k_cache.stride(1),
+        block_tables.stride(0),
+        GROUP=num_q_heads // num_kv_heads,
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
     )  # fmt: skip

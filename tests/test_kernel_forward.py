@@ -22,9 +22,11 @@ from tinyserve.model import Qwen3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def models() -> tuple[Qwen3, Qwen3]:
+def models(kernel: str = "triton") -> tuple[Qwen3, Qwen3]:
+    """The PyTorch-path model and one with a Triton decode kernel ("triton" is M4's,
+    "triton_grouped" M8's)."""
     w = {n: t.to(DEVICE) for n, t in tiny_model().w.items()}
-    return Qwen3(CFG, w), Qwen3(CFG, w, decode_attention="triton")
+    return Qwen3(CFG, w), Qwen3(CFG, w, decode_attention=kernel)  # type: ignore[arg-type]
 
 
 def tables(alloc: BlockAllocator, cached: list[int], new: list[int]) -> list[BlockTable]:
@@ -45,8 +47,9 @@ def tables(alloc: BlockAllocator, cached: list[int], new: list[int]) -> list[Blo
         ([0, 0], [3, 5]),  # all prefill: the kernel is never called
     ],
 )
-def test_forward_batch_matches_torch_path(cached: list[int], new: list[int]) -> None:
-    torch_model, triton_model = models()
+@pytest.mark.parametrize("kernel", ["triton", "triton_grouped"])
+def test_forward_batch_matches_torch_path(cached: list[int], new: list[int], kernel: str) -> None:
+    torch_model, triton_model = models(kernel)
     cache = KVCache(CFG, 64, 4, dtype=torch.float32, device=DEVICE)
     alloc = BlockAllocator(cache.num_blocks)
     g = torch.Generator().manual_seed(0)
@@ -64,8 +67,11 @@ def test_forward_batch_matches_torch_path(cached: list[int], new: list[int]) -> 
     ("num_blocks", "max_num_seqs"),
     [(64, 8), (64, 1), (7, 8)],  # roomy; one at a time; tight cache (preemptions)
 )
-def test_engine_with_kernel_matches_m1_greedy(num_blocks: int, max_num_seqs: int) -> None:
-    _, triton_model = models()
+@pytest.mark.parametrize("kernel", ["triton", "triton_grouped"])
+def test_engine_with_kernel_matches_m1_greedy(
+    num_blocks: int, max_num_seqs: int, kernel: str
+) -> None:
+    _, triton_model = models(kernel)
     cache = KVCache(CFG, num_blocks, 4, dtype=torch.float32, device=DEVICE)
     e = Engine(triton_model, cache, max_num_seqs=max_num_seqs)
     assert e.generate(PROMPTS, 10) == [expected(p, 10) for p in PROMPTS]
@@ -88,5 +94,5 @@ def test_engine_with_kernel_and_prefix_cache_matches_m1_greedy(num_blocks: int) 
 
 
 def test_unknown_decode_attention_is_rejected() -> None:
-    with pytest.raises(ValueError, match="torch' or 'triton"):
+    with pytest.raises(ValueError, match="'torch', 'triton' or 'triton_grouped'"):
         Qwen3(CFG, tiny_model().w, decode_attention="flash")  # type: ignore[arg-type]

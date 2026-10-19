@@ -35,6 +35,8 @@ from tinyserve.config import ModelConfig
 from tinyserve.kv_cache import KVCache
 from tinyserve.layers import apply_rope, rms_norm, rope_cos_sin, swiglu_mlp
 
+# decode_attention choices: per-sequence PyTorch, the M4 kernel, the M8 grouped kernel.
+DECODE_ATTENTIONS = ("torch", "triton", "triton_grouped")
 # (layer index, q [T, Hq, D], k [T, Hkv, D], v [T, Hkv, D]) -> attention output [T, Hq, D]
 AttentionFn = Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 # paged_decode_attention's signature (triton_attention.py); kept here so the model does
@@ -50,12 +52,13 @@ class Qwen3:
         self,
         cfg: ModelConfig,
         weights: dict[str, torch.Tensor],
-        decode_attention: Literal["torch", "triton"] = "torch",
+        decode_attention: Literal["torch", "triton", "triton_grouped"] = "torch",
         prefill_attention: Literal["per_seq", "batched"] = "per_seq",
     ) -> None:
         """``decode_attention`` picks how ``forward_batch`` attends for one-token sequences:
         "torch" runs ``paged_gqa_attention`` per sequence, "triton" runs the M4 kernel once
-        for all of them. Triton is imported only when chosen (it has no Windows wheels).
+        for all of them, "triton_grouped" the M8 kernel that shares k/v loads across a
+        head group. Triton is imported only when chosen (it has no Windows wheels).
         ``prefill_attention`` picks how the other sequences attend: "per_seq" runs
         ``paged_gqa_attention`` for each, "batched" (M8) runs ``batched_prefill_attention``
         once for all of them."""
@@ -68,8 +71,16 @@ class Qwen3:
 
             self.decode_kernel = paged_decode_attention
             self.decode_launch = launch_paged_decode
+        elif decode_attention == "triton_grouped":  # M8: one program per kv head
+            from tinyserve import triton_attention as ta
+
+            self.decode_kernel = ta.paged_decode_attention_grouped
+            self.decode_launch = ta.launch_paged_decode_grouped
         elif decode_attention != "torch":
-            raise ValueError(f"decode_attention must be 'torch' or 'triton': {decode_attention!r}")
+            raise ValueError(
+                "decode_attention must be 'torch', 'triton' or 'triton_grouped': "
+                f"{decode_attention!r}"
+            )
         if prefill_attention not in ("per_seq", "batched"):
             raise ValueError(
                 f"prefill_attention must be 'per_seq' or 'batched': {prefill_attention!r}"
@@ -229,7 +240,7 @@ class Qwen3:
         """
         launch = self.decode_launch
         if launch is None:
-            raise ValueError('forward_decode needs decode_attention="triton"')
+            raise ValueError('forward_decode needs a Triton decode kernel ("triton..." attention)')
         scale = self.cfg.head_dim**-0.5
 
         def attend(i: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

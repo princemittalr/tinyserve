@@ -182,3 +182,12 @@ def test_engine_with_captured_graphs_matches_m1_greedy(num_blocks: int, max_num_
     assert e.decode_graphs is not None and e.decode_graphs.graphs
     assert e.generate(PROMPTS, 10) == [expected(p, 10) for p in PROMPTS]
     assert e.step_records is not None and any(r.graph for r in e.step_records)
+
+
+@pytest.mark.parametrize("num_blocks", [64, 7])
+def test_engine_with_graphs_of_the_grouped_kernel_matches_m1_greedy(num_blocks: int) -> None:
+    # M8 step 5: the grouped kernel in the graphs (captured on a GPU, eager on CPU).
+    _, model = models("triton_grouped")
+    cache = KVCache(CFG, num_blocks, 4, dtype=torch.float32, device=DEVICE)
+    e = Engine(model, cache, max_num_seqs=8, decode_graphs=DecodeGraphs(model, cache, 8))
+    assert e.generate(PROMPTS, 10) == [expected(p, 10) for p in PROMPTS]

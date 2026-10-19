@@ -71,7 +71,9 @@ class DecodeGraphs:
             capture: default True on CUDA, False elsewhere.
         """
         if model.decode_launch is None:
-            raise ValueError('CUDA graphs need decode_attention="triton"')
+            raise ValueError(
+                'CUDA graphs need a Triton decode kernel ("triton" or "triton_grouped")'
+            )
         self.model = model
         self.cache = cache
         self.buckets = sorted(set(buckets or default_buckets(max_batch)))

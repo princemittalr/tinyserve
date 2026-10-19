@@ -15,6 +15,7 @@ a NaN block. A kernel that reads one slot too many returns NaN and fails the tes
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import pytest
@@ -25,10 +26,13 @@ from hypothesis import strategies as st
 pytest.importorskip("triton", reason="Triton is not installed (no Windows wheels)")
 
 from tinyserve.attention import paged_decode_attention_ref, paged_gqa_attention
-from tinyserve.triton_attention import paged_decode_attention
+from tinyserve.triton_attention import paged_decode_attention, paged_decode_attention_grouped
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TOL = {torch.float32: 1e-5, torch.float16: 1e-3}
+# The M4 kernel (one program per query head) and the M8 grouped one (one per kv head):
+# every check below runs both against the same reference.
+KERNELS = [paged_decode_attention, paged_decode_attention_grouped]
 
 
 @dataclass
@@ -84,14 +88,15 @@ def make_case(
 
 
 def check(case: Case) -> torch.Tensor:
-    out = paged_decode_attention(*case.args(), case.scale, case.block_size)
     ref = paged_decode_attention_ref(*case.args(), case.scale, case.block_size)
-    assert out.shape == ref.shape
-    assert out.dtype == case.q.dtype
-    assert torch.isfinite(out).all(), "read a slot outside the sequence (NaN leaked in)"
-    tol = TOL[case.q.dtype]
-    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
-    return out
+    for kernel in KERNELS:
+        out = kernel(*case.args(), case.scale, case.block_size)
+        assert out.shape == ref.shape
+        assert out.dtype == case.q.dtype
+        assert torch.isfinite(out).all(), "read a slot outside the sequence (NaN leaked in)"
+        tol = TOL[case.q.dtype]
+        torch.testing.assert_close(out, ref, atol=tol, rtol=tol, msg=kernel.__name__)
+    return ref
 
 
 # --- the reference itself ---------------------------------------------------------------
@@ -147,12 +152,13 @@ def test_large_scores_do_not_overflow() -> None:
     check(c)
 
 
-def test_each_sequence_only_sees_its_own_blocks() -> None:
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_each_sequence_only_sees_its_own_blocks(kernel: Callable[..., torch.Tensor]) -> None:
     # Running sequences together or alone must give the same rows.
     c = make_case([7, 30, 2], 4, 2, head_dim=32, block_size=4)
-    together = paged_decode_attention(*c.args(), c.scale, c.block_size)
+    together = kernel(*c.args(), c.scale, c.block_size)
     for b in range(3):
-        alone = paged_decode_attention(
+        alone = kernel(
             c.q[b : b + 1],
             c.k_cache,
             c.v_cache,
@@ -206,6 +212,13 @@ def test_rejects_heads_that_do_not_group() -> None:
     c = make_case([3], 6, 4, head_dim=32)
     with pytest.raises(ValueError, match="groups"):
         paged_decode_attention(*c.args(), c.scale, c.block_size)
+
+
+def test_grouped_kernel_rejects_a_group_that_is_not_a_power_of_2() -> None:
+    c = make_case([3], 12, 4, head_dim=32)  # 3 query heads per kv head
+    paged_decode_attention(*c.args(), c.scale, c.block_size)  # the per-head kernel is fine
+    with pytest.raises(ValueError, match="power-of-2 head group"):
+        paged_decode_attention_grouped(*c.args(), c.scale, c.block_size)
 
 
 @pytest.mark.gpu

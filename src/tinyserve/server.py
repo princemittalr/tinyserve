@@ -24,7 +24,7 @@ from tinyserve.api import Limits, create_app, is_loopback
 from tinyserve.config import ModelConfig
 from tinyserve.engine import Engine
 from tinyserve.kv_cache import KVCache
-from tinyserve.model import Qwen3
+from tinyserve.model import DECODE_ATTENTIONS, Qwen3
 from tinyserve.serving import AsyncEngine
 from tinyserve.weights import load_weights
 
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["float32", "float16"], default=None,
                         help="default: float16 on cuda, float32 on cpu")  # fmt: skip
-    parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--kv-gib", type=float, default=2.0, help="KV cache size")
     parser.add_argument("--block-size", type=int, default=16)

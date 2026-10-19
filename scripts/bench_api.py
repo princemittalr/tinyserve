@@ -25,6 +25,7 @@ import torch
 from tinyserve.bench import num_requests_for, percentile, synthetic_prompts
 from tinyserve.client import StreamResult, closed_loop, running_server
 from tinyserve.config import ModelConfig
+from tinyserve.model import DECODE_ATTENTIONS
 
 
 def summarise(results: list[StreamResult], seconds: float, concurrency: int) -> dict[str, Any]:
@@ -49,7 +50,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=Path, default=Path("checkpoints/Qwen3-0.6B"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--attention", choices=["torch", "triton"], default="torch")
+    parser.add_argument("--attention", choices=DECODE_ATTENTIONS, default="torch")
     parser.add_argument("--concurrency", default="1,8,32,64")
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--input-len", type=int, default=128)
